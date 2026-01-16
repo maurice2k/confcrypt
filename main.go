@@ -28,6 +28,7 @@ func main() {
 	configPath := flag.String("config", "", "Path to .confcrypt.yml config file (overrides -path)")
 	filePath := flag.String("file", "", "Process a specific file only")
 	stdout := flag.Bool("stdout", false, "Output to stdout instead of modifying files in-place")
+	force := flag.Bool("force", false, "Continue decryption even if MAC verification fails")
 	showVersion := flag.Bool("version", false, "Show version")
 	help := flag.Bool("help", false, "Show help")
 
@@ -144,7 +145,7 @@ func main() {
 		exitCode := runEncrypt(proc, cfg, files, *stdout)
 		os.Exit(exitCode)
 	case "decrypt":
-		exitCode := runDecrypt(proc, cfg, files, *stdout)
+		exitCode := runDecrypt(proc, cfg, files, *stdout, *force)
 		os.Exit(exitCode)
 	case "check":
 		exitCode := runCheck(proc, files)
@@ -153,6 +154,9 @@ func main() {
 }
 
 func runEncrypt(proc *processor.Processor, cfg *config.Config, files []string, toStdout bool) int {
+	// Check if secrets already exist (we'll reuse the key, no need to re-save secrets)
+	hadSecrets := cfg.HasSecrets()
+
 	if err := proc.SetupEncryption(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error setting up encryption: %v\n", err)
 		return 1
@@ -192,18 +196,27 @@ func runEncrypt(proc *processor.Processor, cfg *config.Config, files []string, t
 		}
 	}
 
-	// Save encrypted secrets and MACs to config if anything was modified
+	// Save config if anything was modified
 	if anyModified && !toStdout {
-		if err := proc.SaveEncryptedSecrets(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
-			return 1
+		if hadSecrets {
+			// Secrets already existed, just save config (for MACs)
+			if err := cfg.Save(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
+				return 1
+			}
+		} else {
+			// New encryption, save encrypted secrets for all recipients
+			if err := proc.SaveEncryptedSecrets(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
+				return 1
+			}
 		}
 	}
 
 	return 0
 }
 
-func runDecrypt(proc *processor.Processor, cfg *config.Config, files []string, toStdout bool) int {
+func runDecrypt(proc *processor.Processor, cfg *config.Config, files []string, toStdout bool, force bool) int {
 	// Load identities
 	identities, err := loadIdentities()
 	if err != nil {
@@ -233,7 +246,13 @@ func runDecrypt(proc *processor.Processor, cfg *config.Config, files []string, t
 		// Only verify MAC if file has encrypted values
 		if proc.HasEncryptedValues(content, file) {
 			if err := proc.VerifyMAC(file, content); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: %s: %v\n", relPath, err)
+				if force {
+					fmt.Fprintf(os.Stderr, "Warning: %s: %v (continuing due to --force)\n", relPath, err)
+				} else {
+					fmt.Fprintf(os.Stderr, "Error: %s: %v\n", relPath, err)
+					fmt.Fprintf(os.Stderr, "Use --force to decrypt anyway\n")
+					return 1
+				}
 			}
 		}
 

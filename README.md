@@ -2,7 +2,7 @@
 
 A command-line tool for encrypting sensitive values in YAML and JSON configuration files using [age](https://github.com/FiloSottile/age) public-key cryptography.
 
-Similar to [sops](https://github.com/getsops/sops), confcrypt encrypts only specific keys in your config files while leaving the structure readable. It supports multiple recipients, allowing team members to decrypt files with their own private keys.
+Similar to [sops](https://github.com/getsops/sops), *confcrypt* encrypts only specific keys in your config files while leaving the structure readable. It supports multiple recipients, allowing team members to decrypt files with their own private keys.
 
 ## Features
 
@@ -11,82 +11,8 @@ Similar to [sops](https://github.com/getsops/sops), confcrypt encrypts only spec
 - **Format preservation**: Maintains YAML/JSON structure and comments
 - **Flexible key matching**: Exact names, regex patterns, or JSON paths
 - **Idempotent**: Re-running encryption leaves already-encrypted values unchanged
-- **CI-friendly**: `check` command returns exit code 1 if unencrypted secrets found
+- **CI-friendly**: `check` command returns exit code 1 if unencrypted secrets found (also usable as pre-commit hook)
 - **Key rotation**: `rekey` command to rotate the encryption key
-
-## How It Works
-
-confcrypt uses a two-layer encryption scheme:
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Config Values                            │
-│  password: "secret123"  api_key: "sk_live_..."  token: "..."   │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼ Encrypt with AES-256-GCM
-┌─────────────────────────────────────────────────────────────────┐
-│                     Encrypted Values                            │
-│  password: ENC[AES256_GCM,data:...,iv:...,tag:...,type:str]    │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-            ┌─────────────────┼─────────────────┐
-            ▼                 ▼                 ▼
-      ┌──────────┐      ┌──────────┐      ┌──────────┐
-      │ Alice's  │      │  Bob's   │      │ Carol's  │
-      │ age key  │      │ age key  │      │ age key  │
-      └──────────┘      └──────────┘      └──────────┘
-            │                 │                 │
-            ▼                 ▼                 ▼
-      ┌──────────┐      ┌──────────┐      ┌──────────┐
-      │ AES key  │      │ AES key  │      │ AES key  │
-      │encrypted │      │encrypted │      │encrypted │
-      │for Alice │      │ for Bob  │      │for Carol │
-      └──────────┘      └──────────┘      └──────────┘
-```
-
-### Key Hierarchy
-
-1. **AES-256 Key**: A random 256-bit key is generated once per project. This key encrypts all sensitive values using AES-256-GCM.
-
-2. **Age Public Keys**: Each recipient's age public key encrypts a copy of the AES key. These encrypted copies are stored in `.confcrypt.yml`.
-
-### Encryption Flow
-
-1. Generate a random AES-256 key (or reuse existing one)
-2. Encrypt each matching value with AES-GCM (produces ciphertext + IV + auth tag)
-3. Encrypt the AES key separately for each recipient using their age public key
-4. Store encrypted AES keys in `.confcrypt.store`
-
-### Decryption Flow
-
-1. Use your age private key to decrypt your copy of the AES key
-2. Use the AES key to decrypt all encrypted values
-
-### Why This Design?
-
-This approach allows **multiple recipients to both decrypt AND encrypt** the same files without sharing a master secret in plaintext:
-
-- Any recipient can decrypt existing secrets (they have the AES key)
-- Any recipient can encrypt new secrets (same AES key)
-- Adding a recipient only requires encrypting the AES key for them (no re-encryption of values)
-- Removing a recipient with `rekey` generates a new AES key they don't have access to
-
-## Installation
-
-### From source
-
-```bash
-go install github.com/maurice2k/confcrypt@latest
-```
-
-### Build from source
-
-```bash
-git clone https://github.com/maurice2k/confcrypt.git
-cd confcrypt
-go build -o confcrypt .
-```
 
 ## Quick Start
 
@@ -116,7 +42,27 @@ confcrypt
 ### 4. Decrypt when needed
 
 ```bash
+# Decrypt a single file
 confcrypt decrypt config.yml
+
+# Decrypt all matching files
+confcrypt decrypt
+```
+
+## Installation
+
+### From source
+
+```bash
+go install github.com/maurice2k/confcrypt@latest
+```
+
+### Build from source
+
+```bash
+git clone https://github.com/maurice2k/confcrypt.git
+cd confcrypt
+go build -o confcrypt .
 ```
 
 ### Manual Configuration
@@ -160,7 +106,7 @@ Commands:
   encrypt        Encrypt matching keys (default)
   decrypt        Decrypt encrypted values
   check          Check for unencrypted keys (exit 1 if found)
-  rekey          Rotate the AES key and re-encrypt all values
+  rekey          Rotate the AES-256 key and re-encrypt all values
   recipient-add  Add a recipient (age key required, --name optional)
   recipient-rm   Remove a recipient by age key (rekeys by default)
 
@@ -169,6 +115,7 @@ Options:
   -config string    Path to .confcrypt.yml config file (overrides -path)
   -file string      Process a specific file only
   -stdout           Output to stdout instead of modifying files in-place
+  -force            Continue decryption even if MAC verification fails
   -version          Show version
   -help             Show help
 ```
@@ -272,15 +219,15 @@ confcrypt recipient-add age1lggyhqrw2nlhcxprm67z43rta597azn8gknawjehu9d9dl0jq3yq
 
 **What happens:**
 1. The new recipient is added to the `recipients` list in `.confcrypt.yml`
-2. If encrypted secrets exist, the existing AES key is encrypted for the new recipient
+2. If encrypted secrets exist, the existing AES-256 key is encrypted for the new recipient
 3. The new team member can now decrypt all config files with their private key
 
-**Note:** No rekeying occurs - the same AES key is used, just encrypted for an additional recipient.
+**Note:** No rekeying occurs - the same AES-256 key is used, just encrypted for an additional recipient.
 
 ### Remove a team member (`recipient-rm`)
 
 ```bash
-# Default: rekeys (generates new AES key, re-encrypts everything)
+# Default: rekeys (generates new AES-256 key, re-encrypts everything)
 confcrypt recipient-rm age1lggyhqrw2nlhcxprm67z43rta597azn8gknawjehu9d9dl0jq3yqqvfafg
 
 # Skip rekeying (just remove their access to current key)
@@ -289,15 +236,15 @@ confcrypt recipient-rm --no-rekey age1lggyhqrw2nlhcxprm67z43rta597azn8gknawjehu9
 
 **Default behavior (with rekey):**
 1. The recipient is removed from the `recipients` list
-2. A new AES key is generated
+2. A new AES-256 key is generated
 3. All encrypted values are decrypted and re-encrypted with the new key
 4. The new key is encrypted for remaining recipients only
-5. The removed team member cannot decrypt any files (even if they had a copy of the old AES key)
+5. The removed team member cannot decrypt any files (even if they had a copy of the old AES-256 key)
 
 **With `--no-rekey`:**
 1. The recipient is removed from the `recipients` list
-2. The existing AES key is re-encrypted for remaining recipients only
-3. The removed team member loses access, but if they had a copy of the old AES key, they could still decrypt
+2. The existing AES-256 key is re-encrypted for remaining recipients only
+3. The removed team member loses access, but if they had a copy of the old AES-256 key, they could still decrypt
 
 **Note:** You cannot remove the last recipient - at least one must remain.
 
@@ -310,8 +257,8 @@ confcrypt rekey
 ```
 
 **What happens:**
-1. All encrypted values are decrypted using the current AES key
-2. A new random AES key is generated
+1. All encrypted values are decrypted using the current AES-256 key
+2. A new random AES-256 key is generated
 3. All values are re-encrypted with the new key
 4. The new key is encrypted for all current recipients
 5. MACs are updated for all files
@@ -343,7 +290,7 @@ ENC[AES256_GCM,data:<base64>,iv:<base64>,tag:<base64>,type:<type>]
 - `tag`: 16-byte authentication tag (base64)
 - `type`: Original value type (`str`, `int`, `float`, `bool`, `null`)
 
-The AES key is randomly generated per config and encrypted for each recipient using their age public key.
+The AES-256 key is randomly generated per config and encrypted for each recipient using their age public key.
 
 ## Config File Structure
 
@@ -364,22 +311,100 @@ After encryption, confcrypt adds a `.confcrypt` section to your `.confcrypt.yml`
 
 - `version`: Config format version
 - `updated_at`: Last encryption timestamp (UTC)
-- `store`: AES key encrypted for each recipient
+- `store`: AES-256 key encrypted for each recipient
 - `macs`: Per-file Message Authentication Codes (SHA256 hash of encrypted values, encrypted)
 
 ## Tamper Detection
 
-confcrypt computes a MAC (Message Authentication Code) for each encrypted file. The MAC is a SHA256 hash of all encrypted values, which is then encrypted with the same AES key.
+*confcrypt* computes a MAC (Message Authentication Code) for each encrypted file. The MAC is a SHA256 hash of all encrypted values, which is then encrypted with the same AES-256 key.
 
-On decryption, confcrypt verifies the MAC before decrypting. If the encrypted values have been tampered with, decryption will fail with an error:
+On decryption, *confcrypt* verifies the MAC before decrypting. If the encrypted values have been tampered with, decryption fails:
 
 ```
-Error verifying config.yml: MAC verification failed - file may have been tampered with
+Error: config.yml: MAC verification failed - file may have been tampered with
+Use --force to decrypt anyway
+```
+
+To proceed despite tampering detection:
+
+```bash
+confcrypt decrypt --force
 ```
 
 This protects against:
 - Modification of encrypted ciphertext
 - Swapping encrypted values between fields
+
+## How It Works
+
+*confcrypt* uses a two-layer encryption scheme:
+
+### Layer 1: AES-256-GCM encryption
+
+The AES-256-GCM encryption is used to encrypt the values that require encryption according to the rules in the config file.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│             Config values that should be encrypted              │
+│  api_key: "sk_live_..."                                         │
+│  password: "secret123"                                          │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              | generate or reuse an AES-256 key ("secret") and
+                              | and encrypt the values with it using AES-256-GCM
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     Encrypted values                            │
+│  api_key: ENC[AES256_GCM,data:...,iv:...,tag:...,type:str]      │
+│  password: ENC[AES256_GCM,data:...,iv:...,tag:...,type:str]     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Layer 2: Age public-key encryption
+
+The Age public-key encryption is used to then encrypt the AES-256 key ("secret") for each recipient using their age public key.
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     AES-256 key ("secret")                      │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              | encrypt the secret with the age public keys
+                              │
+            ┌─────────────────┼─────────────────┐
+            ▼                 ▼                 ▼
+      ┌──────────┐      ┌──────────┐      ┌──────────┐
+      │ Alice's  │      │  Bob's   │      │ Carol's  │
+      │ age key  │      │ age key  │      │ age key  │
+      └──────────┘      └──────────┘      └──────────┘
+            │                 │                 │
+            ▼                 ▼                 ▼
+      ┌──────────┐      ┌──────────┐      ┌──────────┐
+      │  Secret  │      │  Secret  │      │  Secret  │
+      │encrypted │      │encrypted │      │encrypted │
+      │for Alice │      │ for Bob  │      │for Carol │
+      └──────────┘      └──────────┘      └──────────┘
+```
+
+### Encryption Flow
+
+1. Generate a random AES-256 key ("secret") or reuse existing one
+2. Encrypt each matching value with AES-256-GCM (produces ciphertext + IV + auth tag)
+3. Encrypt the AES-256 key ("secret") separately for each recipient using their age public key
+4. Store encrypted AES-256 keys in `.confcrypt.store` inside the .confcrypt.yml file
+
+### Decryption Flow
+
+1. Use your age private key to decrypt your copy of the AES-256 key ("secret")
+2. Use the AES-256 key ("secret") from step 1 to decrypt all encrypted values
+
+### Why This Design?
+
+This approach allows **multiple recipients to both decrypt AND encrypt** the same files without sharing a master secret in plaintext:
+
+- Any recipient can decrypt existing secrets (they have the AES-256 key)
+- Any recipient can encrypt new secrets (same AES-256 key)
+- Adding a recipient only requires encrypting the AES-256 key for them (no re-encryption of values)
+- Removing a recipient with `rekey` generates a new AES-256 key they don't have access to
 
 ## License
 

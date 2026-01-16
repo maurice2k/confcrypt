@@ -689,3 +689,90 @@ func TestHasEncryptedValues(t *testing.T) {
 		t.Error("Should detect encrypted values in encrypted content")
 	}
 }
+
+func TestStoreNotChangedWhenAddingNewValues(t *testing.T) {
+	dir := t.TempDir()
+
+	identity, _ := crypto.GenerateAgeKeypair()
+	cfg := createTestConfig(t, dir, []config.RecipientConfig{
+		{Name: "test", Age: identity.Recipient().String()},
+	})
+
+	// Create initial file with one secret
+	testFile := filepath.Join(dir, "test.yml")
+	initialContent := `password: secret123`
+	os.WriteFile(testFile, []byte(initialContent), 0644)
+
+	// First encryption
+	proc, _ := NewProcessor(cfg, nil)
+	proc.SetupEncryption()
+	output1, _, _ := proc.ProcessFile(testFile, true)
+	os.WriteFile(testFile, output1, 0644)
+	proc.SaveEncryptedSecrets()
+
+	// Reload config and capture the store
+	cfg, _ = config.Load(cfg.ConfigPath())
+	originalStore := make([]config.SecretEntry, len(cfg.Confcrypt.Store))
+	copy(originalStore, cfg.Confcrypt.Store)
+
+	// Add a new unencrypted value to the file
+	content, _ := os.ReadFile(testFile)
+	newContent := string(content) + "\napi_key: newkey123\n"
+	os.WriteFile(testFile, []byte(newContent), 0644)
+
+	// Second encryption - should NOT change the store
+	identityLoader := func() ([]age.Identity, error) {
+		return []age.Identity{identity}, nil
+	}
+	proc2, _ := NewProcessor(cfg, identityLoader)
+	proc2.SetupEncryption()
+	output2, modified, _ := proc2.ProcessFile(testFile, true)
+
+	if !modified {
+		t.Error("Expected file to be modified (new secret added)")
+	}
+
+	os.WriteFile(testFile, output2, 0644)
+
+	// Simulate what main.go does: if hadSecrets, just save config, don't call SaveEncryptedSecrets
+	// Since cfg.HasSecrets() was true before SetupEncryption, we should just save config
+	cfg.Save()
+
+	// Reload and verify store hasn't changed
+	cfg, _ = config.Load(cfg.ConfigPath())
+
+	if len(cfg.Confcrypt.Store) != len(originalStore) {
+		t.Errorf("Store length changed: was %d, now %d", len(originalStore), len(cfg.Confcrypt.Store))
+	}
+
+	for i, entry := range cfg.Confcrypt.Store {
+		if entry.Recipient != originalStore[i].Recipient {
+			t.Errorf("Store recipient changed at index %d", i)
+		}
+		if entry.Secret != originalStore[i].Secret {
+			t.Errorf("Store secret changed at index %d - store should not be re-encrypted when adding new values", i)
+		}
+	}
+
+	// Verify both values are now encrypted in the file
+	finalContent, _ := os.ReadFile(testFile)
+	encCount := strings.Count(string(finalContent), "ENC[AES256_GCM,")
+	if encCount != 2 {
+		t.Errorf("Expected 2 encrypted values, got %d", encCount)
+	}
+
+	// Verify we can still decrypt with the same key
+	proc3, _ := NewProcessor(cfg, identityLoader)
+	proc3.SetupDecryption([]age.Identity{identity})
+	decrypted, _, err := proc3.ProcessFile(testFile, false)
+	if err != nil {
+		t.Fatalf("Failed to decrypt: %v", err)
+	}
+
+	if !strings.Contains(string(decrypted), "secret123") {
+		t.Error("Original password not found after decryption")
+	}
+	if !strings.Contains(string(decrypted), "newkey123") {
+		t.Error("New api_key not found after decryption")
+	}
+}
