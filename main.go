@@ -15,7 +15,12 @@ import (
 	"github.com/maurice2k/confcrypt/internal/processor"
 )
 
-const version = "1.0.0"
+const version = "1.1.0"
+
+func init() {
+	// Set the version in the config package
+	config.Version = version
+}
 
 func main() {
 	// Global flags
@@ -35,8 +40,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  encrypt        Encrypt matching keys (default)\n")
 		fmt.Fprintf(os.Stderr, "  decrypt        Decrypt encrypted values\n")
 		fmt.Fprintf(os.Stderr, "  check          Check for unencrypted keys (exit 1 if found)\n")
+		fmt.Fprintf(os.Stderr, "  rekey          Rotate the AES key and re-encrypt all values\n")
 		fmt.Fprintf(os.Stderr, "  recipient-add  Add a recipient (age key required, --name optional)\n")
-		fmt.Fprintf(os.Stderr, "  recipient-rm   Remove a recipient by age key\n\n")
+		fmt.Fprintf(os.Stderr, "  recipient-rm   Remove a recipient by age key (rekeys by default)\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 	}
@@ -58,7 +64,7 @@ func main() {
 	args := flag.Args()
 	if len(args) > 0 {
 		switch args[0] {
-		case "init", "encrypt", "decrypt", "check", "recipient-add", "recipient-rm":
+		case "init", "encrypt", "decrypt", "check", "rekey", "recipient-add", "recipient-rm":
 			command = args[0]
 		default:
 			// Treat as file path if not a command
@@ -87,6 +93,12 @@ func main() {
 	}
 	if command == "recipient-rm" {
 		exitCode := runRecipientRemove(resolvedConfigPath, args[1:])
+		os.Exit(exitCode)
+	}
+
+	// Handle rekey command
+	if command == "rekey" {
+		exitCode := runRekey(resolvedConfigPath)
 		os.Exit(exitCode)
 	}
 
@@ -504,12 +516,18 @@ func runRecipientAdd(configPath string, args []string) int {
 
 // runRecipientRemove removes a recipient from the config
 func runRecipientRemove(configPath string, args []string) int {
-	if len(args) < 1 {
-		fmt.Fprintf(os.Stderr, "Usage: confcrypt recipient-rm <age-public-key>\n")
+	// Parse subcommand flags
+	fs := flag.NewFlagSet("recipient-rm", flag.ExitOnError)
+	noRekey := fs.Bool("no-rekey", false, "Don't rekey (just remove recipient's access to current key)")
+	fs.Parse(args)
+
+	remaining := fs.Args()
+	if len(remaining) < 1 {
+		fmt.Fprintf(os.Stderr, "Usage: confcrypt recipient-rm [--no-rekey] <age-public-key>\n")
 		return 1
 	}
 
-	ageKey := args[0]
+	ageKey := remaining[0]
 
 	// Load config
 	cfg, err := config.Load(configPath)
@@ -543,28 +561,116 @@ func runRecipientRemove(configPath string, args []string) int {
 
 	cfg.Recipients = newRecipients
 
-	// If there are existing encrypted secrets, re-encrypt for remaining recipients
+	// If there are existing encrypted secrets, handle rekey
 	if cfg.HasSecrets() {
 		identities, err := loadIdentities()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: cannot re-encrypt secrets: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error: cannot decrypt secrets: %v\n", err)
 			return 1
 		}
 
-		proc, err := processor.NewProcessor(cfg, loadIdentities)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			return 1
-		}
+		if *noRekey {
+			// Just re-encrypt the existing AES key for remaining recipients (no rekey)
+			proc, err := processor.NewProcessor(cfg, loadIdentities)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				return 1
+			}
 
-		if err := proc.SetupEncryptionWithIdentities(identities); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			return 1
-		}
+			if err := proc.SetupEncryptionWithIdentities(identities); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				return 1
+			}
 
-		if err := proc.SaveEncryptedSecrets(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error saving secrets: %v\n", err)
-			return 1
+			if err := proc.SaveEncryptedSecrets(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error saving secrets: %v\n", err)
+				return 1
+			}
+		} else {
+			// Rekey: decrypt all, generate new key, re-encrypt all
+			proc, err := processor.NewProcessor(cfg, loadIdentities)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				return 1
+			}
+
+			if err := proc.SetupDecryption(identities); err != nil {
+				fmt.Fprintf(os.Stderr, "Error setting up decryption: %v\n", err)
+				return 1
+			}
+
+			// Get all files
+			files, err := cfg.GetMatchingFiles()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				return 1
+			}
+
+			// Decrypt all files first
+			decryptedFiles := make(map[string][]byte)
+			for _, file := range files {
+				content, err := os.ReadFile(file)
+				if err != nil {
+					continue // Skip files that can't be read
+				}
+
+				if proc.HasEncryptedValues(content, file) {
+					output, _, err := proc.ProcessFile(file, false) // decrypt
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "Error decrypting %s: %v\n", file, err)
+						return 1
+					}
+					decryptedFiles[file] = output
+				}
+			}
+
+			// Clear existing secrets to force new key generation
+			cfg.Confcrypt.Store = nil
+
+			// Create new processor with fresh key
+			proc2, err := processor.NewProcessor(cfg, loadIdentities)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				return 1
+			}
+
+			if err := proc2.SetupEncryption(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error setting up encryption with new key: %v\n", err)
+				return 1
+			}
+
+			// Re-encrypt all files with new key
+			for file, content := range decryptedFiles {
+				if err := os.WriteFile(file, content, 0644); err != nil {
+					fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", file, err)
+					return 1
+				}
+
+				output, _, err := proc2.ProcessFile(file, true) // encrypt
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error re-encrypting %s: %v\n", file, err)
+					return 1
+				}
+
+				if err := os.WriteFile(file, output, 0644); err != nil {
+					fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", file, err)
+					return 1
+				}
+
+				if err := proc2.UpdateMAC(file, output); err != nil {
+					fmt.Fprintf(os.Stderr, "Error updating MAC for %s: %v\n", file, err)
+					return 1
+				}
+			}
+
+			if err := proc2.SaveEncryptedSecrets(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
+				return 1
+			}
+
+			if len(decryptedFiles) > 0 {
+				fmt.Printf("Rekeyed %d file(s) with new AES key\n", len(decryptedFiles))
+			}
 		}
 	} else {
 		// No secrets yet, just save the config
@@ -580,5 +686,127 @@ func runRecipientRemove(configPath string, args []string) int {
 		fmt.Printf("Removed recipient: %s\n", ageKey)
 	}
 
+	return 0
+}
+
+// runRekey rotates the AES key and re-encrypts all values
+func runRekey(configPath string) int {
+	// Load config
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+
+	if !cfg.HasSecrets() {
+		fmt.Fprintf(os.Stderr, "Error: no encrypted secrets found - nothing to rekey\n")
+		return 1
+	}
+
+	// Load identities to decrypt current values
+	identities, err := loadIdentities()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading age identities: %v\n", err)
+		return 1
+	}
+
+	// Create processor and setup decryption with old key
+	proc, err := processor.NewProcessor(cfg, loadIdentities)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+
+	if err := proc.SetupDecryption(identities); err != nil {
+		fmt.Fprintf(os.Stderr, "Error setting up decryption: %v\n", err)
+		return 1
+	}
+
+	// Get all files
+	files, err := cfg.GetMatchingFiles()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+
+	// Decrypt all files first
+	decryptedFiles := make(map[string][]byte)
+	for _, file := range files {
+		content, err := os.ReadFile(file)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading %s: %v\n", file, err)
+			return 1
+		}
+
+		if proc.HasEncryptedValues(content, file) {
+			output, _, err := proc.ProcessFile(file, false) // decrypt
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error decrypting %s: %v\n", file, err)
+				return 1
+			}
+			decryptedFiles[file] = output
+		}
+	}
+
+	if len(decryptedFiles) == 0 {
+		fmt.Println("No encrypted files found - nothing to rekey")
+		return 0
+	}
+
+	// Clear existing secrets to force new key generation
+	cfg.Confcrypt.Store = nil
+
+	// Create new processor with fresh key
+	proc2, err := processor.NewProcessor(cfg, loadIdentities)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+
+	if err := proc2.SetupEncryption(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error setting up encryption with new key: %v\n", err)
+		return 1
+	}
+
+	// Write decrypted content temporarily, then re-encrypt with new key
+	for file, content := range decryptedFiles {
+		// Write decrypted content
+		if err := os.WriteFile(file, content, 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", file, err)
+			return 1
+		}
+
+		// Re-encrypt with new key
+		output, _, err := proc2.ProcessFile(file, true) // encrypt
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error re-encrypting %s: %v\n", file, err)
+			return 1
+		}
+
+		if err := os.WriteFile(file, output, 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", file, err)
+			return 1
+		}
+
+		// Update MAC
+		if err := proc2.UpdateMAC(file, output); err != nil {
+			fmt.Fprintf(os.Stderr, "Error updating MAC for %s: %v\n", file, err)
+			return 1
+		}
+
+		relPath, _ := filepath.Rel(cfg.ConfigDir(), file)
+		if relPath == "" {
+			relPath = file
+		}
+		fmt.Printf("Rekeyed: %s\n", relPath)
+	}
+
+	// Save new encrypted secrets
+	if err := proc2.SaveEncryptedSecrets(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
+		return 1
+	}
+
+	fmt.Printf("\nSuccessfully rekeyed %d file(s) with new AES key\n", len(decryptedFiles))
 	return 0
 }

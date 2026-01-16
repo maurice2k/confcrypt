@@ -12,8 +12,8 @@ import (
 	"github.com/maurice2k/confcrypt/internal/crypto"
 )
 
-// Version is the config format version
-const Version = "1.0.0"
+// Version is the current tool/config format version
+var Version = "1.0.0" // Set by main package at startup
 
 // Config represents the .confcrypt.yml configuration file
 type Config struct {
@@ -225,10 +225,9 @@ func (c *Config) GetSecretForRecipient(pubKey string) (string, bool) {
 // SetSecrets updates the encrypted secrets for all recipients
 func (c *Config) SetSecrets(secrets map[string]string) {
 	if c.Confcrypt == nil {
-		c.Confcrypt = &ConfcryptSection{
-			Version: Version,
-		}
+		c.Confcrypt = &ConfcryptSection{}
 	}
+	c.Confcrypt.Version = Version
 	c.Confcrypt.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	c.Confcrypt.Store = nil
 	for pubKey, secret := range secrets {
@@ -251,10 +250,9 @@ func (c *Config) GetMAC(filePath string) (string, bool) {
 // SetMAC sets the MAC for a specific file
 func (c *Config) SetMAC(filePath, mac string) {
 	if c.Confcrypt == nil {
-		c.Confcrypt = &ConfcryptSection{
-			Version: Version,
-		}
+		c.Confcrypt = &ConfcryptSection{}
 	}
+	c.Confcrypt.Version = Version
 	if c.Confcrypt.MACs == nil {
 		c.Confcrypt.MACs = make(map[string]string)
 	}

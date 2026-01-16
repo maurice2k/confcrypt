@@ -12,6 +12,65 @@ Similar to [sops](https://github.com/getsops/sops), confcrypt encrypts only spec
 - **Flexible key matching**: Exact names, regex patterns, or JSON paths
 - **Idempotent**: Re-running encryption leaves already-encrypted values unchanged
 - **CI-friendly**: `check` command returns exit code 1 if unencrypted secrets found
+- **Key rotation**: `rekey` command to rotate the encryption key
+
+## How It Works
+
+confcrypt uses a two-layer encryption scheme:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Config Values                            │
+│  password: "secret123"  api_key: "sk_live_..."  token: "..."   │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼ Encrypt with AES-256-GCM
+┌─────────────────────────────────────────────────────────────────┐
+│                     Encrypted Values                            │
+│  password: ENC[AES256_GCM,data:...,iv:...,tag:...,type:str]    │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+            ┌─────────────────┼─────────────────┐
+            ▼                 ▼                 ▼
+      ┌──────────┐      ┌──────────┐      ┌──────────┐
+      │ Alice's  │      │  Bob's   │      │ Carol's  │
+      │ age key  │      │ age key  │      │ age key  │
+      └──────────┘      └──────────┘      └──────────┘
+            │                 │                 │
+            ▼                 ▼                 ▼
+      ┌──────────┐      ┌──────────┐      ┌──────────┐
+      │ AES key  │      │ AES key  │      │ AES key  │
+      │encrypted │      │encrypted │      │encrypted │
+      │for Alice │      │ for Bob  │      │for Carol │
+      └──────────┘      └──────────┘      └──────────┘
+```
+
+### Key Hierarchy
+
+1. **AES-256 Key**: A random 256-bit key is generated once per project. This key encrypts all sensitive values using AES-256-GCM.
+
+2. **Age Public Keys**: Each recipient's age public key encrypts a copy of the AES key. These encrypted copies are stored in `.confcrypt.yml`.
+
+### Encryption Flow
+
+1. Generate a random AES-256 key (or reuse existing one)
+2. Encrypt each matching value with AES-GCM (produces ciphertext + IV + auth tag)
+3. Encrypt the AES key separately for each recipient using their age public key
+4. Store encrypted AES keys in `.confcrypt.store`
+
+### Decryption Flow
+
+1. Use your age private key to decrypt your copy of the AES key
+2. Use the AES key to decrypt all encrypted values
+
+### Why This Design?
+
+This approach allows **multiple recipients to both decrypt AND encrypt** the same files without sharing a master secret in plaintext:
+
+- Any recipient can decrypt existing secrets (they have the AES key)
+- Any recipient can encrypt new secrets (same AES key)
+- Adding a recipient only requires encrypting the AES key for them (no re-encryption of values)
+- Removing a recipient with `rekey` generates a new AES key they don't have access to
 
 ## Installation
 
@@ -46,7 +105,7 @@ confcrypt init
 This creates a `.confcrypt.yml` with:
 - Your age public key as the first recipient (auto-detected from your local key)
 - Default file patterns: `*.yml`, `*.yaml`, `*.json`
-- Common sensitive key patterns: `password`, `/api_key$/`, `/secret$/`, `/token$/`
+- Default sensitive key patterns: `/password$/`, `/api_key$/`, `/secret$/`, `/token$/`
 
 ### 3. Encrypt your config files
 
@@ -101,8 +160,9 @@ Commands:
   encrypt        Encrypt matching keys (default)
   decrypt        Decrypt encrypted values
   check          Check for unencrypted keys (exit 1 if found)
+  rekey          Rotate the AES key and re-encrypt all values
   recipient-add  Add a recipient (age key required, --name optional)
-  recipient-rm   Remove a recipient by age key
+  recipient-rm   Remove a recipient by age key (rekeys by default)
 
 Options:
   -path string      Base path where .confcrypt.yml is located (default: current directory)
@@ -198,7 +258,7 @@ confcrypt decrypt --stdout config.yml
 
 ## Managing Recipients
 
-confcrypt supports adding and removing recipients dynamically. When you modify recipients and encrypted secrets already exist, confcrypt automatically re-encrypts the AES key for all current recipients.
+confcrypt supports adding and removing recipients dynamically.
 
 ### Add a new team member (`recipient-add`)
 
@@ -212,21 +272,54 @@ confcrypt recipient-add age1lggyhqrw2nlhcxprm67z43rta597azn8gknawjehu9d9dl0jq3yq
 
 **What happens:**
 1. The new recipient is added to the `recipients` list in `.confcrypt.yml`
-2. If encrypted secrets exist (`.confcrypt.store`), the AES key is re-encrypted for all recipients including the new one
+2. If encrypted secrets exist, the existing AES key is encrypted for the new recipient
 3. The new team member can now decrypt all config files with their private key
+
+**Note:** No rekeying occurs - the same AES key is used, just encrypted for an additional recipient.
 
 ### Remove a team member (`recipient-rm`)
 
 ```bash
+# Default: rekeys (generates new AES key, re-encrypts everything)
 confcrypt recipient-rm age1lggyhqrw2nlhcxprm67z43rta597azn8gknawjehu9d9dl0jq3yqqvfafg
+
+# Skip rekeying (just remove their access to current key)
+confcrypt recipient-rm --no-rekey age1lggyhqrw2nlhcxprm67z43rta597azn8gknawjehu9d9dl0jq3yqqvfafg
+```
+
+**Default behavior (with rekey):**
+1. The recipient is removed from the `recipients` list
+2. A new AES key is generated
+3. All encrypted values are decrypted and re-encrypted with the new key
+4. The new key is encrypted for remaining recipients only
+5. The removed team member cannot decrypt any files (even if they had a copy of the old AES key)
+
+**With `--no-rekey`:**
+1. The recipient is removed from the `recipients` list
+2. The existing AES key is re-encrypted for remaining recipients only
+3. The removed team member loses access, but if they had a copy of the old AES key, they could still decrypt
+
+**Note:** You cannot remove the last recipient - at least one must remain.
+
+## Key Rotation (`rekey`)
+
+Rotate the AES encryption key and re-encrypt all values:
+
+```bash
+confcrypt rekey
 ```
 
 **What happens:**
-1. The recipient is removed from the `recipients` list
-2. If encrypted secrets exist, the AES key is re-encrypted for the remaining recipients only
-3. The removed team member can no longer decrypt the files (their encrypted copy of the AES key is removed)
+1. All encrypted values are decrypted using the current AES key
+2. A new random AES key is generated
+3. All values are re-encrypted with the new key
+4. The new key is encrypted for all current recipients
+5. MACs are updated for all files
 
-**Note:** You cannot remove the last recipient - at least one must remain.
+**Use cases:**
+- Regular key rotation policy
+- After a security incident
+- After removing a recipient (done automatically by default)
 
 ## Private Key Configuration
 
