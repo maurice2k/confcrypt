@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -24,17 +25,17 @@ var recipientCmd = &cobra.Command{
 }
 
 var recipientAddCmd = &cobra.Command{
-	Use:   "add <age-public-key>",
+	Use:   "add <public-key>",
 	Short: "Add a recipient",
-	Long:  `Add a new recipient who can decrypt the files.`,
+	Long:  `Add a new recipient who can decrypt the files. Supports both age keys and SSH keys (ed25519, RSA).`,
 	Args:  cobra.ExactArgs(1),
 	Run:   runRecipientAdd,
 }
 
 var recipientRmCmd = &cobra.Command{
-	Use:   "rm <age-public-key>",
+	Use:   "rm <public-key>",
 	Short: "Remove a recipient",
-	Long:  `Remove a recipient. By default, this will rekey all encrypted values.`,
+	Long:  `Remove a recipient. By default, this will rekey all encrypted values. Supports both age keys and SSH keys.`,
 	Args:  cobra.ExactArgs(1),
 	Run:   runRecipientRm,
 }
@@ -70,20 +71,31 @@ func runRecipientList(cmd *cobra.Command, args []string) {
 	}
 
 	for _, r := range cfg.Recipients {
+		pubKey := r.GetPublicKey()
+		keyType := r.GetKeyType()
+		displayKey := truncateKey(pubKey)
+
 		if r.Name != "" {
-			fmt.Printf("%s (%s)\n", r.Name, r.Age)
+			fmt.Printf("%s [%s] (%s)\n", r.Name, keyType, displayKey)
 		} else {
-			fmt.Println(r.Age)
+			fmt.Printf("[%s] %s\n", keyType, displayKey)
 		}
 	}
 }
 
 func runRecipientAdd(cmd *cobra.Command, args []string) {
-	ageKey := args[0]
+	pubKey := strings.TrimSpace(args[0])
 
-	// Validate age key format
-	if _, err := crypto.ParseAgeRecipient(ageKey); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: invalid age public key: %v\n", err)
+	// Check for empty key first
+	if pubKey == "" {
+		fmt.Fprintf(os.Stderr, "Error: public key cannot be empty\n")
+		os.Exit(1)
+	}
+
+	// Validate key format (supports both age and SSH keys)
+	if _, err := crypto.ParseRecipient(pubKey); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: invalid public key format\n")
+		fmt.Fprintf(os.Stderr, "  Expected: age1... (age key) or ssh-ed25519/ssh-rsa... (SSH key)\n")
 		os.Exit(1)
 	}
 
@@ -94,18 +106,28 @@ func runRecipientAdd(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Check if recipient already exists
+	// Check if recipient already exists (use matchesKey to ignore SSH key comments)
 	for _, r := range cfg.Recipients {
-		if r.Age == ageKey {
-			fmt.Fprintf(os.Stderr, "Error: recipient %s already exists\n", ageKey)
+		if matchesKey(r.Age, pubKey) || matchesKey(r.SSH, pubKey) {
+			fmt.Fprintf(os.Stderr, "Error: recipient %s already exists\n", truncateKey(pubKey))
 			os.Exit(1)
 		}
 	}
 
-	// Add recipient
+	// Add recipient with appropriate field based on key type
 	newRecipient := config.RecipientConfig{
-		Age:  ageKey,
 		Name: recipientName,
+	}
+	if crypto.IsSSHKey(pubKey) {
+		newRecipient.SSH = pubKey
+		// If no name provided, use SSH key comment as name
+		if newRecipient.Name == "" {
+			if comment := extractSSHComment(pubKey); comment != "" {
+				newRecipient.Name = comment
+			}
+		}
+	} else {
+		newRecipient.Age = pubKey
 	}
 	cfg.Recipients = append(cfg.Recipients, newRecipient)
 
@@ -141,14 +163,74 @@ func runRecipientAdd(cmd *cobra.Command, args []string) {
 	}
 
 	if recipientName != "" {
-		fmt.Printf("Added recipient: %s (%s)\n", recipientName, ageKey)
+		fmt.Printf("Added recipient: %s (%s)\n", recipientName, truncateKey(pubKey))
 	} else {
-		fmt.Printf("Added recipient: %s\n", ageKey)
+		fmt.Printf("Added recipient: %s\n", truncateKey(pubKey))
 	}
 }
 
+// truncateKey truncates long SSH keys for display
+func truncateKey(key string) string {
+	if len(key) > 60 && (len(key) > 4 && key[:4] == "ssh-" || len(key) > 5 && key[:5] == "ecdsa") {
+		return key[:50] + "..."
+	}
+	return key
+}
+
+// matchesKey checks if storedKey matches the search key.
+// For SSH keys, it matches by prefix (type + key data) ignoring the comment.
+// For age keys, it requires an exact match.
+func matchesKey(storedKey, searchKey string) bool {
+	if storedKey == "" {
+		return false
+	}
+	// Exact match
+	if storedKey == searchKey {
+		return true
+	}
+	// For SSH keys, try prefix match (ignore comment)
+	if crypto.IsSSHKey(storedKey) && crypto.IsSSHKey(searchKey) {
+		storedParts := splitSSHKey(storedKey)
+		searchParts := splitSSHKey(searchKey)
+		// Match if type and key data are the same
+		if len(storedParts) >= 2 && len(searchParts) >= 2 {
+			return storedParts[0] == searchParts[0] && storedParts[1] == searchParts[1]
+		}
+	}
+	return false
+}
+
+// splitSSHKey splits an SSH public key into parts: [type, key-data, comment (optional)]
+func splitSSHKey(key string) []string {
+	parts := make([]string, 0, 3)
+	key = strings.TrimSpace(key)
+	// Split by spaces, but only first 2 splits (type, key, rest is comment)
+	for i := 0; i < 2 && len(key) > 0; i++ {
+		idx := strings.Index(key, " ")
+		if idx == -1 {
+			parts = append(parts, key)
+			return parts
+		}
+		parts = append(parts, key[:idx])
+		key = strings.TrimSpace(key[idx+1:])
+	}
+	if len(key) > 0 {
+		parts = append(parts, key) // comment
+	}
+	return parts
+}
+
+// extractSSHComment extracts the comment from an SSH public key (if present)
+func extractSSHComment(key string) string {
+	parts := splitSSHKey(key)
+	if len(parts) >= 3 {
+		return parts[2]
+	}
+	return ""
+}
+
 func runRecipientRm(cmd *cobra.Command, args []string) {
-	ageKey := args[0]
+	pubKey := args[0]
 
 	// Load config
 	cfg, err := config.Load(resolvedConfigPath)
@@ -157,12 +239,13 @@ func runRecipientRm(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Find and remove recipient
+	// Find and remove recipient (check both age and ssh fields)
+	// For SSH keys, match by prefix (ignoring comment) to make removal easier
 	found := false
 	var removedName string
 	newRecipients := make([]config.RecipientConfig, 0, len(cfg.Recipients))
 	for _, r := range cfg.Recipients {
-		if r.Age == ageKey {
+		if matchesKey(r.Age, pubKey) || matchesKey(r.SSH, pubKey) {
 			found = true
 			removedName = r.Name
 		} else {
@@ -171,7 +254,7 @@ func runRecipientRm(cmd *cobra.Command, args []string) {
 	}
 
 	if !found {
-		fmt.Fprintf(os.Stderr, "Error: recipient %s not found\n", ageKey)
+		fmt.Fprintf(os.Stderr, "Error: recipient %s not found\n", truncateKey(pubKey))
 		os.Exit(1)
 	}
 
@@ -215,7 +298,7 @@ func runRecipientRm(cmd *cobra.Command, args []string) {
 				os.Exit(1)
 			}
 
-			if err := proc.SetupDecryption(identities); err != nil {
+			if _, err := proc.SetupDecryption(identities); err != nil {
 				fmt.Fprintf(os.Stderr, "Error setting up decryption: %v\n", err)
 				os.Exit(1)
 			}
@@ -310,8 +393,8 @@ func runRecipientRm(cmd *cobra.Command, args []string) {
 	}
 
 	if removedName != "" {
-		fmt.Printf("Removed recipient: %s (%s)\n", removedName, ageKey)
+		fmt.Printf("Removed recipient: %s (%s)\n", removedName, truncateKey(pubKey))
 	} else {
-		fmt.Printf("Removed recipient: %s\n", ageKey)
+		fmt.Printf("Removed recipient: %s\n", truncateKey(pubKey))
 	}
 }

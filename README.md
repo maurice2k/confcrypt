@@ -1,13 +1,14 @@
 # confcrypt
 
-A command-line tool for encrypting sensitive values in YAML and JSON configuration files using [age](https://github.com/FiloSottile/age) public-key cryptography.
+A command-line tool for encrypting sensitive values in YAML and JSON configuration files using [age](https://github.com/FiloSottile/age) or SSH public-key cryptography.
 
-Similar to [sops](https://github.com/getsops/sops), *confcrypt* encrypts only specific keys in your config files while leaving the structure readable. It supports multiple recipients, allowing team members to decrypt files with their own private keys.
+*confcrypt* encrypts only values matching configured patterns while keeping the file structure readable. Internal state is stored separately in `.confcrypt.yml`, and a `check` command detects unencrypted secrets (useful as a pre-commit hook). Supports multiple recipients, allowing team members to decrypt with their own keys. Similar to [sops](https://github.com/getsops/sops), but more straightforward.
 
 ## Features
 
 - **Selective encryption**: Only encrypts values matching your defined key patterns
-- **Multiple recipients**: Encrypt for multiple team members using age public keys
+- **Multiple recipients**: Encrypt for multiple team members using age or SSH public keys
+- **SSH key support**: Use existing SSH keys (ed25519, RSA) alongside native age keys
 - **Format preservation**: Maintains YAML/JSON structure and comments
 - **Flexible key matching**: Exact names, regex patterns, or JSON paths
 - **Idempotent**: Re-running encryption leaves already-encrypted values unchanged
@@ -16,11 +17,11 @@ Similar to [sops](https://github.com/getsops/sops), *confcrypt* encrypts only sp
 
 ## Quick Start
 
-### 1. Generate an age keypair (if you don't have one)
+### 1. Have a keypair ready
 
-```bash
-age-keygen -o ~/.config/age/key.txt
-```
+You can use either:
+- **Native age key**: `age-keygen -o ~/.config/age/key.txt`
+- **Existing SSH key**: `~/.ssh/id_ed25519` (ed25519 or RSA)
 
 ### 2. Initialize confcrypt
 
@@ -29,9 +30,19 @@ confcrypt init
 ```
 
 This creates a `.confcrypt.yml` with:
-- Your age public key as the first recipient (auto-detected from your local key)
+- Your public key as the first recipient (auto-detected from age key or SSH key)
 - Default file patterns: `*.yml`, `*.yaml`, `*.json`
 - Default sensitive key patterns: `/password$/`, `/api_key$/`, `/secret$/`, `/token$/`
+
+You can also specify a particular key file:
+
+```bash
+# Use specific age key
+confcrypt init --age-key ~/.age/key.txt
+
+# Use specific SSH public key
+confcrypt init --ssh-key ~/.ssh/id_ed25519.pub
+```
 
 ### 3. Encrypt your config files
 
@@ -71,11 +82,14 @@ You can also create `.confcrypt.yml` manually:
 
 ```yaml
 # Recipients who can decrypt the files
+# Supports both native age keys (age:) and SSH keys (ssh:)
 recipients:
   - name: "Alice"
     age: age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
   - name: "Bob"
-    age: age1lggyhqrw2nlhcxprm67z43rta597azn8gknawjehu9d9dl0jq3yqqvfafg
+    ssh: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... bob@example.com
+  - name: "Carol"
+    ssh: ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAB... carol@example.com
 
 # Files to process (glob patterns)
 files:
@@ -107,8 +121,8 @@ Commands:
   decrypt        Decrypt encrypted values
   check          Check for unencrypted keys (exit 1 if found)
   rekey          Rotate the AES-256 key and re-encrypt all values
-  recipient-add  Add a recipient (age key required, --name optional)
-  recipient-rm   Remove a recipient by age key (rekeys by default)
+  recipient-add  Add a recipient (public key required, --name optional)
+  recipient-rm   Remove a recipient by public key (rekeys by default)
 
 Options:
   -path string      Base path where .confcrypt.yml is located (default: current directory)
@@ -210,11 +224,14 @@ confcrypt supports adding and removing recipients dynamically.
 ### Add a new team member (`recipient-add`)
 
 ```bash
-# Add with a descriptive name
-confcrypt recipient-add --name "Bob" age1lggyhqrw2nlhcxprm67z43rta597azn8gknawjehu9d9dl0jq3yqqvfafg
+# Add with age key
+confcrypt recipient add --name "Bob" age1lggyhqrw2nlhcxprm67z43rta597azn8gknawjehu9d9dl0jq3yqqvfafg
 
-# Add without name (just the age public key)
-confcrypt recipient-add age1lggyhqrw2nlhcxprm67z43rta597azn8gknawjehu9d9dl0jq3yqqvfafg
+# Add with SSH key
+confcrypt recipient add --name "Carol" "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... carol@example.com"
+
+# Add without name
+confcrypt recipient add age1lggyhqrw2nlhcxprm67z43rta597azn8gknawjehu9d9dl0jq3yqqvfafg
 ```
 
 **What happens:**
@@ -270,12 +287,26 @@ confcrypt rekey
 
 ## Private Key Configuration
 
-confcrypt looks for your age private key in this order:
+confcrypt looks for your private key in this order (age keys take precedence over SSH keys):
 
 1. `SOPS_AGE_KEY_FILE` environment variable (for sops compatibility)
 2. `CONFCRYPT_AGE_KEY_FILE` environment variable
 3. `CONFCRYPT_AGE_KEY` environment variable (key content directly)
-4. `~/.config/age/key.txt` (default age location)
+4. `CONFCRYPT_SSH_KEY_FILE` environment variable (SSH private key file)
+5. `~/.config/age/key.txt` (default age location)
+6. `~/.ssh/id_ed25519` (SSH ed25519 key)
+7. `~/.ssh/id_rsa` (SSH RSA key)
+
+### Supported Key Types
+
+| Key Type | Recipient (encryption) | Identity (decryption) |
+|----------|------------------------|----------------------|
+| Native age (X25519) | `age:` field | age key file |
+| SSH ed25519 | `ssh:` field | `~/.ssh/id_ed25519` |
+| SSH RSA | `ssh:` field | `~/.ssh/id_rsa` |
+| SSH sk-ed25519 (FIDO) | Not supported | Not supported |
+
+**Note**: SSH sk-ed25519 (hardware-backed FIDO keys) are not supported because the private key material cannot be exported from the hardware token.
 
 ## Encrypted Value Format
 
@@ -290,7 +321,7 @@ ENC[AES256_GCM,data:<base64>,iv:<base64>,tag:<base64>,type:<type>]
 - `tag`: 16-byte authentication tag (base64)
 - `type`: Original value type (`str`, `int`, `float`, `bool`, `null`)
 
-The AES-256 key is randomly generated per config and encrypted for each recipient using their age public key.
+The AES-256 key is randomly generated per config and encrypted for each recipient using their public key (age or SSH).
 
 ## Config File Structure
 
@@ -360,21 +391,21 @@ The AES-256-GCM encryption is used to encrypt the values that require encryption
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Layer 2: Age public-key encryption
+### Layer 2: Public-key encryption
 
-The Age public-key encryption is used to then encrypt the AES-256 key ("secret") for each recipient using their age public key.
+The public-key encryption (age or SSH) is used to encrypt the AES-256 key ("secret") for each recipient using their public key.
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                     AES-256 key ("secret")                      │
 └─────────────────────────────────────────────────────────────────┘
                               │
-                              | encrypt the secret with the age public keys
+                              | encrypt the secret with each recipient's public key
                               │
             ┌─────────────────┼─────────────────┐
             ▼                 ▼                 ▼
       ┌──────────┐      ┌──────────┐      ┌──────────┐
       │ Alice's  │      │  Bob's   │      │ Carol's  │
-      │ age key  │      │ age key  │      │ age key  │
+      │ pub key  │      │ pub key  │      │ pub key  │
       └──────────┘      └──────────┘      └──────────┘
             │                 │                 │
             ▼                 ▼                 ▼
@@ -389,12 +420,12 @@ The Age public-key encryption is used to then encrypt the AES-256 key ("secret")
 
 1. Generate a random AES-256 key ("secret") or reuse existing one
 2. Encrypt each matching value with AES-256-GCM (produces ciphertext + IV + auth tag)
-3. Encrypt the AES-256 key ("secret") separately for each recipient using their age public key
+3. Encrypt the AES-256 key ("secret") separately for each recipient using their public key
 4. Store encrypted AES-256 keys in `.confcrypt.store` inside the .confcrypt.yml file
 
 ### Decryption Flow
 
-1. Use your age private key to decrypt your copy of the AES-256 key ("secret")
+1. Use your private key to decrypt your copy of the AES-256 key ("secret")
 2. Use the AES-256 key ("secret") from step 1 to decrypt all encrypted values
 
 ### Why This Design?

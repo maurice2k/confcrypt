@@ -5,11 +5,19 @@ import (
 	"os"
 	"path/filepath"
 
+	"filippo.io/age"
 	"github.com/spf13/cobra"
 
 	"github.com/maurice2k/confcrypt/internal/config"
 	"github.com/maurice2k/confcrypt/internal/processor"
 )
+
+var (
+	rekeyAgeKeyFile string
+	rekeySSHKeyFile string
+)
+
+const rekeyAutoDetectMarker = "auto"
 
 var rekeyCmd = &cobra.Command{
 	Use:   "rekey",
@@ -19,6 +27,11 @@ var rekeyCmd = &cobra.Command{
 }
 
 func init() {
+	rekeyCmd.Flags().StringVar(&rekeyAgeKeyFile, "age-key", "", "Path to age private key file (use without value to force age auto-detect)")
+	rekeyCmd.Flags().StringVar(&rekeySSHKeyFile, "ssh-key", "", "Path to SSH private key file (use without value to force SSH auto-detect)")
+	// Allow --age-key and --ssh-key without a value (sets to "auto")
+	rekeyCmd.Flags().Lookup("age-key").NoOptDefVal = rekeyAutoDetectMarker
+	rekeyCmd.Flags().Lookup("ssh-key").NoOptDefVal = rekeyAutoDetectMarker
 	rootCmd.AddCommand(rekeyCmd)
 }
 
@@ -36,9 +49,9 @@ func runRekey(cmd *cobra.Command, args []string) {
 	}
 
 	// Load identities to decrypt current values
-	identities, err := LoadIdentities()
+	identities, err := loadRekeyIdentities()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading age identities: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error loading identities: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -49,7 +62,7 @@ func runRekey(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	if err := proc.SetupDecryption(identities); err != nil {
+	if _, err := proc.SetupDecryption(identities); err != nil {
 		fmt.Fprintf(os.Stderr, "Error setting up decryption: %v\n", err)
 		os.Exit(1)
 	}
@@ -140,4 +153,30 @@ func runRekey(cmd *cobra.Command, args []string) {
 	}
 
 	fmt.Printf("\nSuccessfully rekeyed %d file(s) with new AES key\n", len(decryptedFiles))
+}
+
+// loadRekeyIdentities loads identities based on rekey command flags
+func loadRekeyIdentities() ([]age.Identity, error) {
+	// --age-key with specific path
+	if rekeyAgeKeyFile != "" && rekeyAgeKeyFile != rekeyAutoDetectMarker {
+		return LoadIdentitiesWithOptions(rekeyAgeKeyFile, "")
+	}
+
+	// --ssh-key with specific path
+	if rekeySSHKeyFile != "" && rekeySSHKeyFile != rekeyAutoDetectMarker {
+		return LoadIdentitiesWithOptions("", rekeySSHKeyFile)
+	}
+
+	// --age-key without value (auto-detect age only)
+	if rekeyAgeKeyFile == rekeyAutoDetectMarker {
+		return autoDetectAgeIdentities()
+	}
+
+	// --ssh-key without value (auto-detect SSH only)
+	if rekeySSHKeyFile == rekeyAutoDetectMarker {
+		return autoDetectSSHIdentities()
+	}
+
+	// No flags - load all available identities
+	return LoadIdentities()
 }

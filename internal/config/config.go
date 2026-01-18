@@ -39,7 +39,8 @@ type ConfcryptSection struct {
 // RecipientConfig represents a recipient in the config
 type RecipientConfig struct {
 	Name string `yaml:"name,omitempty"`
-	Age  string `yaml:"age"`
+	Age  string `yaml:"age,omitempty"` // Native age X25519 public key
+	SSH  string `yaml:"ssh,omitempty"` // SSH public key (ed25519, RSA)
 }
 
 // SecretEntry represents an encrypted secret for a recipient
@@ -126,11 +127,15 @@ func (c *Config) Save() error {
 	return nil
 }
 
-// GetRecipients returns parsed age recipients
+// GetRecipients returns parsed recipients (age or SSH keys)
 func (c *Config) GetRecipients() ([]age.Recipient, error) {
 	var recipients []age.Recipient
 	for _, r := range c.Recipients {
-		recipient, err := crypto.ParseAgeRecipient(r.Age)
+		pubKey := r.GetPublicKey()
+		if pubKey == "" {
+			return nil, fmt.Errorf("recipient %q has no public key (age or ssh)", r.Name)
+		}
+		recipient, err := crypto.ParseRecipient(pubKey)
 		if err != nil {
 			return nil, err
 		}
@@ -140,6 +145,25 @@ func (c *Config) GetRecipients() ([]age.Recipient, error) {
 		return nil, fmt.Errorf("no recipients configured")
 	}
 	return recipients, nil
+}
+
+// GetPublicKey returns the public key from either Age or SSH field
+func (r *RecipientConfig) GetPublicKey() string {
+	if r.Age != "" {
+		return r.Age
+	}
+	return r.SSH
+}
+
+// GetKeyType returns the type of key configured for this recipient
+func (r *RecipientConfig) GetKeyType() crypto.KeyType {
+	if r.Age != "" {
+		return crypto.KeyTypeAge
+	}
+	if r.SSH != "" {
+		return crypto.DetectKeyType(r.SSH)
+	}
+	return crypto.KeyTypeUnknown
 }
 
 // GetMatchingFiles returns all files matching the configured patterns
@@ -220,6 +244,16 @@ func (c *Config) GetSecretForRecipient(pubKey string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// FindRecipientByKey finds a recipient config by their public key (age or ssh)
+func (c *Config) FindRecipientByKey(pubKey string) *RecipientConfig {
+	for i := range c.Recipients {
+		if c.Recipients[i].Age == pubKey || c.Recipients[i].SSH == pubKey {
+			return &c.Recipients[i]
+		}
+	}
+	return nil
 }
 
 // SetSecrets updates the encrypted secrets for all recipients

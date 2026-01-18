@@ -4,15 +4,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"filippo.io/age"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 
 	"github.com/maurice2k/confcrypt/internal/config"
 	"github.com/maurice2k/confcrypt/internal/crypto"
 )
 
-const version = "1.3.0"
+const version = "1.4.0"
 
 var (
 	// Global flags
@@ -61,43 +63,123 @@ func Execute() {
 	}
 }
 
-// LoadIdentities loads age identities from environment or default location
+// LoadIdentities loads ALL available identities from environment and default locations.
+// Supports both native age keys and SSH keys (ed25519, RSA).
+// Returns all found identities so SetupDecryption can try each one.
 func LoadIdentities() ([]age.Identity, error) {
-	// Try SOPS_AGE_KEY_FILE first
-	if keyFile := os.Getenv("SOPS_AGE_KEY_FILE"); keyFile != "" {
-		return loadIdentitiesFromFile(keyFile)
-	}
+	return LoadIdentitiesWithOptions("", "")
+}
 
-	// Try CONFCRYPT_AGE_KEY_FILE
-	if keyFile := os.Getenv("CONFCRYPT_AGE_KEY_FILE"); keyFile != "" {
-		return loadIdentitiesFromFile(keyFile)
-	}
-
-	// Try CONFCRYPT_AGE_KEY (direct key content)
-	if keyContent := os.Getenv("CONFCRYPT_AGE_KEY"); keyContent != "" {
-		return crypto.ParseAgeIdentities(keyContent)
-	}
-
-	// Try default age key location
+// LoadIdentitiesWithOptions loads identities with optional explicit key file paths.
+// If ageKeyFile is set, only load from that age key file.
+// If sshKeyFile is set, only load from that SSH key file.
+// If both are empty, collect ALL available identities.
+func LoadIdentitiesWithOptions(ageKeyFile, sshKeyFile string) ([]age.Identity, error) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("could not determine home directory: %w", err)
 	}
 
-	defaultKeyFile := filepath.Join(homeDir, ".config", "age", "key.txt")
-	if _, err := os.Stat(defaultKeyFile); err == nil {
-		return loadIdentitiesFromFile(defaultKeyFile)
+	// If explicit age key file is specified, use only that
+	if ageKeyFile != "" {
+		return loadIdentitiesFromFile(ageKeyFile)
 	}
 
-	return nil, fmt.Errorf("no age identity found. Set SOPS_AGE_KEY_FILE, CONFCRYPT_AGE_KEY_FILE, CONFCRYPT_AGE_KEY, or create %s", defaultKeyFile)
+	// If explicit SSH key file is specified, use only that
+	if sshKeyFile != "" {
+		return loadIdentitiesFromFile(sshKeyFile)
+	}
+
+	// Collect ALL available identities
+	var allIdentities []age.Identity
+
+	// Try SOPS_AGE_KEY_FILE
+	if keyFile := os.Getenv("SOPS_AGE_KEY_FILE"); keyFile != "" {
+		if ids, err := loadIdentitiesFromFile(keyFile); err == nil {
+			allIdentities = append(allIdentities, ids...)
+		}
+	}
+
+	// Try CONFCRYPT_AGE_KEY_FILE
+	if keyFile := os.Getenv("CONFCRYPT_AGE_KEY_FILE"); keyFile != "" {
+		if ids, err := loadIdentitiesFromFile(keyFile); err == nil {
+			allIdentities = append(allIdentities, ids...)
+		}
+	}
+
+	// Try CONFCRYPT_AGE_KEY (direct key content)
+	if keyContent := os.Getenv("CONFCRYPT_AGE_KEY"); keyContent != "" {
+		if ids, err := crypto.ParseIdentities(keyContent); err == nil {
+			allIdentities = append(allIdentities, ids...)
+		}
+	}
+
+	// Try CONFCRYPT_SSH_KEY_FILE (SSH private key file)
+	if keyFile := os.Getenv("CONFCRYPT_SSH_KEY_FILE"); keyFile != "" {
+		if ids, err := loadIdentitiesFromFile(keyFile); err == nil {
+			allIdentities = append(allIdentities, ids...)
+		}
+	}
+
+	// Try default age key location
+	defaultKeyFile := filepath.Join(homeDir, ".config", "age", "key.txt")
+	if _, err := os.Stat(defaultKeyFile); err == nil {
+		if ids, err := loadIdentitiesFromFile(defaultKeyFile); err == nil {
+			allIdentities = append(allIdentities, ids...)
+		}
+	}
+
+	// Try default SSH key locations
+	// Use passphrase callback - agessh.EncryptedSSHIdentity has lazy evaluation,
+	// so passphrase is only prompted when the identity is actually used for decryption
+	sshKeyPaths := []string{
+		filepath.Join(homeDir, ".ssh", "id_ed25519"),
+		filepath.Join(homeDir, ".ssh", "id_rsa"),
+	}
+	for _, sshKeyPath := range sshKeyPaths {
+		if _, err := os.Stat(sshKeyPath); err == nil {
+			if ids, err := loadIdentitiesFromFile(sshKeyPath); err == nil {
+				allIdentities = append(allIdentities, ids...)
+			}
+		}
+	}
+
+	if len(allIdentities) == 0 {
+		return nil, fmt.Errorf("no identity found. Set SOPS_AGE_KEY_FILE, CONFCRYPT_AGE_KEY_FILE, CONFCRYPT_SSH_KEY_FILE, or create %s or ~/.ssh/id_ed25519", defaultKeyFile)
+	}
+
+	return allIdentities, nil
 }
 
 func loadIdentitiesFromFile(path string) ([]age.Identity, error) {
+	return loadIdentitiesFromFileWithPassphrase(path, promptPassphrase)
+}
+
+func loadIdentitiesFromFileWithPassphrase(path string, passphraseFunc crypto.PassphraseFunc) ([]age.Identity, error) {
+	// Check file permissions for SSH keys (security warning)
+	if info, err := os.Stat(path); err == nil {
+		perm := info.Mode().Perm()
+		if strings.Contains(path, ".ssh") && perm&0077 != 0 {
+			fmt.Fprintf(os.Stderr, "Warning: %s has permissive permissions %04o, should be 0600\n", path, perm)
+		}
+	}
+
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read key file %s: %w", path, err)
 	}
-	return crypto.ParseAgeIdentities(string(content))
+	return crypto.ParseIdentitiesWithPassphrase(string(content), path, passphraseFunc)
+}
+
+// promptPassphrase prompts the user for a passphrase to decrypt an SSH key.
+func promptPassphrase(keyPath string) ([]byte, error) {
+	fmt.Fprintf(os.Stderr, "Enter passphrase for %s: ", filepath.Base(keyPath))
+	passphrase, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Fprintln(os.Stderr) // newline after password input
+	if err != nil {
+		return nil, fmt.Errorf("failed to read passphrase: %w", err)
+	}
+	return passphrase, nil
 }
 
 // GetFilesToProcess returns the list of files to process based on flags and config

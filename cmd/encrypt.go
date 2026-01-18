@@ -49,6 +49,24 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 		os.Exit(0)
 	}
 
+	// Check if any files have unencrypted values that need encryption
+	hasUnencrypted := false
+	for _, file := range files {
+		content, err := os.ReadFile(file)
+		if err != nil {
+			continue
+		}
+		if proc.HasUnencryptedValues(content, file) {
+			hasUnencrypted = true
+			break
+		}
+	}
+
+	if !hasUnencrypted {
+		fmt.Println("No values to encrypt")
+		os.Exit(0)
+	}
+
 	// Check if secrets already exist (we'll reuse the key, no need to re-save secrets)
 	hadSecrets := cfg.HasSecrets()
 

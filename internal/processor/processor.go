@@ -120,12 +120,13 @@ func (p *Processor) SetupEncryptionWithIdentities(identities []age.Identity) err
 	return nil
 }
 
-// SetupDecryption prepares the processor for decryption
-func (p *Processor) SetupDecryption(identities []age.Identity) error {
+// SetupDecryption prepares the processor for decryption.
+// Returns the public key of the recipient that was used for decryption.
+func (p *Processor) SetupDecryption(identities []age.Identity) (string, error) {
 	p.identities = identities
 
 	if !p.config.HasSecrets() {
-		return fmt.Errorf("no encrypted secrets found in .confcrypt section")
+		return "", fmt.Errorf("no encrypted secrets found in .confcrypt section")
 	}
 
 	// Find and decrypt the AES key
@@ -133,11 +134,11 @@ func (p *Processor) SetupDecryption(identities []age.Identity) error {
 		key, err := crypto.DecryptWithIdentities([]byte(entry.Secret), identities)
 		if err == nil {
 			p.aesKey = key
-			return nil
+			return entry.Recipient, nil
 		}
 	}
 
-	return fmt.Errorf("could not decrypt AES key with provided identities")
+	return "", fmt.Errorf("could not decrypt AES key with provided identities")
 }
 
 // SaveEncryptedSecrets encrypts the AES key for all recipients and saves to config
@@ -145,17 +146,22 @@ func (p *Processor) SaveEncryptedSecrets() error {
 	secrets := make(map[string]string)
 
 	for _, r := range p.config.Recipients {
-		recipient, err := crypto.ParseAgeRecipient(r.Age)
+		pubKey := r.GetPublicKey()
+		if pubKey == "" {
+			return fmt.Errorf("recipient %q has no public key", r.Name)
+		}
+
+		recipient, err := crypto.ParseRecipient(pubKey)
 		if err != nil {
 			return err
 		}
 
 		encrypted, err := crypto.EncryptForRecipients(p.aesKey, []age.Recipient{recipient})
 		if err != nil {
-			return fmt.Errorf("failed to encrypt secret for %s: %w", r.Age, err)
+			return fmt.Errorf("failed to encrypt secret for %s: %w", pubKey, err)
 		}
 
-		secrets[r.Age] = string(encrypted)
+		secrets[pubKey] = string(encrypted)
 	}
 
 	p.config.SetSecrets(secrets)
@@ -508,6 +514,57 @@ func (p *Processor) HasEncryptedValues(content []byte, filePath string) bool {
 
 	values := collectEncryptedValues(data, nil)
 	return len(values) > 0
+}
+
+// HasUnencryptedValues checks if file content contains any unencrypted values that match encryption rules
+func (p *Processor) HasUnencryptedValues(content []byte, filePath string) bool {
+	fileFormat := DetectFormat(filePath)
+
+	var data interface{}
+	switch fileFormat {
+	case FormatYAML:
+		if err := yaml.Unmarshal(content, &data); err != nil {
+			return false
+		}
+	case FormatJSON:
+		if err := json.Unmarshal(content, &data); err != nil {
+			return false
+		}
+	default:
+		return false
+	}
+
+	return p.hasUnencryptedValuesRecursive(data, nil)
+}
+
+// hasUnencryptedValuesRecursive recursively checks for unencrypted values matching encryption rules
+func (p *Processor) hasUnencryptedValuesRecursive(data interface{}, path []string) bool {
+	switch v := data.(type) {
+	case map[string]interface{}:
+		for key, val := range v {
+			newPath := append(path, key)
+			if p.hasUnencryptedValuesRecursive(val, newPath) {
+				return true
+			}
+		}
+	case []interface{}:
+		for i, val := range v {
+			newPath := append(path, fmt.Sprintf("[%d]", i))
+			if p.hasUnencryptedValuesRecursive(val, newPath) {
+				return true
+			}
+		}
+	case string:
+		// Check if this value should be encrypted but isn't
+		keyName := ""
+		if len(path) > 0 {
+			keyName = path[len(path)-1]
+		}
+		if p.matcher.ShouldEncrypt(keyName, path) && !format.IsEncrypted(v) {
+			return true
+		}
+	}
+	return false
 }
 
 // UpdateMAC computes and stores the MAC for a file

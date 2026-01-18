@@ -112,7 +112,7 @@ api_key: myapikey
 		t.Fatalf("Failed to create processor for decryption: %v", err)
 	}
 
-	if err := proc2.SetupDecryption([]age.Identity{identity}); err != nil {
+	if _, err := proc2.SetupDecryption([]age.Identity{identity}); err != nil {
 		t.Fatalf("Failed to setup decryption: %v", err)
 	}
 
@@ -377,7 +377,7 @@ func TestProcessorTypePreservation(t *testing.T) {
 
 	// Decrypt
 	proc2, _ := NewProcessor(cfg, nil)
-	proc2.SetupDecryption([]age.Identity{identity})
+	proc2.SetupDecryption([]age.Identity{identity}) //nolint:errcheck
 
 	decrypted, _, err := proc2.ProcessFile(testFile, false)
 	if err != nil {
@@ -451,7 +451,7 @@ func TestMultipleRecipients(t *testing.T) {
 	// Both recipients should be able to decrypt
 	for i, identity := range []*age.X25519Identity{identity1, identity2} {
 		proc, _ := NewProcessor(cfg, nil)
-		err := proc.SetupDecryption([]age.Identity{identity})
+		_, err := proc.SetupDecryption([]age.Identity{identity})
 		if err != nil {
 			t.Errorf("Recipient %d failed to setup decryption: %v", i+1, err)
 			continue
@@ -516,7 +516,7 @@ func TestAddRecipient(t *testing.T) {
 	// All 3 recipients should be able to decrypt
 	for i, identity := range []*age.X25519Identity{identity1, identity2, identity3} {
 		proc, _ := NewProcessor(cfg, nil)
-		err := proc.SetupDecryption([]age.Identity{identity})
+		_, err := proc.SetupDecryption([]age.Identity{identity})
 		if err != nil {
 			t.Errorf("Recipient %d failed to setup decryption after adding recipient: %v", i+1, err)
 			continue
@@ -598,7 +598,7 @@ func TestRecipientAddRemove(t *testing.T) {
 	// Recipients 1 and 3 should be able to decrypt
 	for i, identity := range []*age.X25519Identity{identity1, identity3} {
 		proc, _ := NewProcessor(cfg, nil)
-		err := proc.SetupDecryption([]age.Identity{identity})
+		_, err := proc.SetupDecryption([]age.Identity{identity})
 		if err != nil {
 			t.Errorf("Remaining recipient %d failed to setup decryption: %v", i+1, err)
 			continue
@@ -617,7 +617,7 @@ func TestRecipientAddRemove(t *testing.T) {
 
 	// Recipient 2 should NOT be able to decrypt
 	proc4, _ := NewProcessor(cfg, nil)
-	err := proc4.SetupDecryption([]age.Identity{identity2})
+	_, err := proc4.SetupDecryption([]age.Identity{identity2})
 	if err == nil {
 		t.Error("Removed recipient should not be able to setup decryption")
 	}
@@ -763,7 +763,7 @@ func TestStoreNotChangedWhenAddingNewValues(t *testing.T) {
 
 	// Verify we can still decrypt with the same key
 	proc3, _ := NewProcessor(cfg, identityLoader)
-	proc3.SetupDecryption([]age.Identity{identity})
+	proc3.SetupDecryption([]age.Identity{identity}) //nolint:errcheck
 	decrypted, _, err := proc3.ProcessFile(testFile, false)
 	if err != nil {
 		t.Fatalf("Failed to decrypt: %v", err)
