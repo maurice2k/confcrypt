@@ -6,11 +6,13 @@ import (
 	"path/filepath"
 	"strings"
 
+	"filippo.io/age"
 	"github.com/spf13/cobra"
 
 	"github.com/maurice2k/confcrypt/internal/config"
 	"github.com/maurice2k/confcrypt/internal/crypto"
 	"github.com/maurice2k/confcrypt/internal/processor"
+	"github.com/maurice2k/confcrypt/internal/yubikey"
 )
 
 var (
@@ -27,7 +29,7 @@ var recipientCmd = &cobra.Command{
 var recipientAddCmd = &cobra.Command{
 	Use:   "add <public-key>",
 	Short: "Add a recipient",
-	Long:  `Add a new recipient who can decrypt the files. Supports both age keys and SSH keys (ed25519, RSA).`,
+	Long:  `Add a new recipient who can decrypt the files. Supports age keys, SSH keys (ed25519, RSA), YubiKey, and FIDO2 recipients.`,
 	Args:  cobra.ExactArgs(1),
 	Run:   runRecipientAdd,
 }
@@ -92,10 +94,10 @@ func runRecipientAdd(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Validate key format (supports both age and SSH keys)
+	// Validate key format (supports age, SSH, YubiKey, and FIDO2 keys)
 	if _, err := crypto.ParseRecipient(pubKey); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: invalid public key format\n")
-		fmt.Fprintf(os.Stderr, "  Expected: age1... (age key) or ssh-ed25519/ssh-rsa... (SSH key)\n")
+		fmt.Fprintf(os.Stderr, "  Expected: age1... (age key), ssh-ed25519/ssh-rsa... (SSH key), age1yubikey1... (YubiKey), or age1fido21... (FIDO2)\n")
 		os.Exit(1)
 	}
 
@@ -108,7 +110,7 @@ func runRecipientAdd(cmd *cobra.Command, args []string) {
 
 	// Check if recipient already exists (use matchesKey to ignore SSH key comments)
 	for _, r := range cfg.Recipients {
-		if matchesKey(r.Age, pubKey) || matchesKey(r.SSH, pubKey) {
+		if matchesKey(r.Age, pubKey) || matchesKey(r.SSH, pubKey) || matchesKey(r.YubiKey, pubKey) || matchesKey(r.FIDO2, pubKey) {
 			fmt.Fprintf(os.Stderr, "Error: recipient %s already exists\n", truncateKey(pubKey))
 			os.Exit(1)
 		}
@@ -118,7 +120,13 @@ func runRecipientAdd(cmd *cobra.Command, args []string) {
 	newRecipient := config.RecipientConfig{
 		Name: recipientName,
 	}
-	if crypto.IsSSHKey(pubKey) {
+	keyType := crypto.DetectKeyType(pubKey)
+	switch keyType {
+	case crypto.KeyTypeYubiKey:
+		newRecipient.YubiKey = pubKey
+	case crypto.KeyTypeFIDO2:
+		newRecipient.FIDO2 = pubKey
+	case crypto.KeyTypeSSHEd25519, crypto.KeyTypeSSHRSA, crypto.KeyTypeSSHECDSA:
 		newRecipient.SSH = pubKey
 		// If no name provided, use SSH key comment as name
 		if newRecipient.Name == "" {
@@ -126,20 +134,22 @@ func runRecipientAdd(cmd *cobra.Command, args []string) {
 				newRecipient.Name = comment
 			}
 		}
-	} else {
+	default:
 		newRecipient.Age = pubKey
 	}
 	cfg.Recipients = append(cfg.Recipients, newRecipient)
 
 	// If there are existing encrypted secrets, re-encrypt for all recipients
 	if cfg.HasSecrets() {
-		identities, err := LoadIdentities()
+		identities, err := LoadDecryptionIdentity(cfg, "", "", false, false)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: cannot re-encrypt secrets for new recipient: %v\n", err)
 			os.Exit(1)
 		}
 
-		proc, err := processor.NewProcessor(cfg, LoadIdentities)
+		proc, err := processor.NewProcessor(cfg, func() ([]age.Identity, error) {
+			return LoadDecryptionIdentity(cfg, "", "", false, false)
+		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
@@ -169,9 +179,18 @@ func runRecipientAdd(cmd *cobra.Command, args []string) {
 	}
 }
 
-// truncateKey truncates long SSH keys for display
+// truncateKey truncates long keys for display
 func truncateKey(key string) string {
+	// Truncate SSH keys
 	if len(key) > 60 && (len(key) > 4 && key[:4] == "ssh-" || len(key) > 5 && key[:5] == "ecdsa") {
+		return key[:50] + "..."
+	}
+	// Truncate YubiKey recipients (they're ~129 chars)
+	if len(key) > 60 && yubikey.IsYubiKeyRecipient(key) {
+		return key[:50] + "..."
+	}
+	// Truncate FIDO2 recipients (they can be very long due to variable credential ID)
+	if len(key) > 60 && crypto.IsFIDO2Recipient(key) {
 		return key[:50] + "..."
 	}
 	return key
@@ -239,13 +258,13 @@ func runRecipientRm(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Find and remove recipient (check both age and ssh fields)
+	// Find and remove recipient (check age, ssh, yubikey, and fido2 fields)
 	// For SSH keys, match by prefix (ignoring comment) to make removal easier
 	found := false
 	var removedName string
 	newRecipients := make([]config.RecipientConfig, 0, len(cfg.Recipients))
 	for _, r := range cfg.Recipients {
-		if matchesKey(r.Age, pubKey) || matchesKey(r.SSH, pubKey) {
+		if matchesKey(r.Age, pubKey) || matchesKey(r.SSH, pubKey) || matchesKey(r.YubiKey, pubKey) || matchesKey(r.FIDO2, pubKey) {
 			found = true
 			removedName = r.Name
 		} else {
@@ -267,7 +286,7 @@ func runRecipientRm(cmd *cobra.Command, args []string) {
 
 	// If there are existing encrypted secrets, handle rekey
 	if cfg.HasSecrets() {
-		identities, err := LoadIdentities()
+		identities, err := LoadDecryptionIdentity(cfg, "", "", false, false)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: cannot decrypt secrets: %v\n", err)
 			os.Exit(1)
@@ -275,7 +294,9 @@ func runRecipientRm(cmd *cobra.Command, args []string) {
 
 		if noRekey {
 			// Just re-encrypt the existing AES key for remaining recipients (no rekey)
-			proc, err := processor.NewProcessor(cfg, LoadIdentities)
+			proc, err := processor.NewProcessor(cfg, func() ([]age.Identity, error) {
+				return LoadDecryptionIdentity(cfg, "", "", false, false)
+			})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
@@ -292,7 +313,9 @@ func runRecipientRm(cmd *cobra.Command, args []string) {
 			}
 		} else {
 			// Rekey: decrypt all, generate new key, re-encrypt all
-			proc, err := processor.NewProcessor(cfg, LoadIdentities)
+			proc, err := processor.NewProcessor(cfg, func() ([]age.Identity, error) {
+				return LoadDecryptionIdentity(cfg, "", "", false, false)
+			})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
@@ -332,7 +355,9 @@ func runRecipientRm(cmd *cobra.Command, args []string) {
 			cfg.Confcrypt.Store = nil
 
 			// Create new processor with fresh key
-			proc2, err := processor.NewProcessor(cfg, LoadIdentities)
+			proc2, err := processor.NewProcessor(cfg, func() ([]age.Identity, error) {
+				return LoadDecryptionIdentity(cfg, "", "", false, false)
+			})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)

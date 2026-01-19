@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 
+	"filippo.io/age"
 	"github.com/spf13/cobra"
 
 	"github.com/maurice2k/confcrypt/internal/config"
@@ -31,7 +32,9 @@ func runCheck(cmd *cobra.Command, args []string) {
 	}
 
 	// Create processor
-	proc, err := processor.NewProcessor(cfg, LoadIdentities)
+	proc, err := processor.NewProcessor(cfg, func() ([]age.Identity, error) {
+		return LoadDecryptionIdentity(cfg, "", "", false, false)
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -45,7 +48,7 @@ func runCheck(cmd *cobra.Command, args []string) {
 	}
 
 	if len(files) == 0 {
-		fmt.Fprintf(os.Stderr, "No files to process\n")
+		fmt.Fprintf(os.Stderr, "Warning: No files matched the configured patterns\n")
 		os.Exit(0)
 	}
 

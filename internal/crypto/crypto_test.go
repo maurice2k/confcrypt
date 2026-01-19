@@ -360,6 +360,8 @@ func TestDetectKeyType(t *testing.T) {
 		expected KeyType
 	}{
 		{"age_key", agePubKey, KeyTypeAge},
+		{"yubikey", "age1yubikey1qpzry9x8gf2tvdw0s3jn54khce6mua7lmqqqxw", KeyTypeYubiKey},
+		{"fido2", "age1fido21qpzry9x8gf2tvdw0s3jn54khce6mua7lmqqqxw", KeyTypeFIDO2},
 		{"ssh_ed25519", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest test@example.com", KeyTypeSSHEd25519},
 		{"ssh_rsa", "ssh-rsa AAAAB3NzaC1yc2EAAAAtest test@example.com", KeyTypeSSHRSA},
 		{"ecdsa", "ecdsa-sha2-nistp256 AAAAE2VjZHNhtest test@example.com", KeyTypeSSHECDSA},

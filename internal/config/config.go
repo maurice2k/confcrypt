@@ -38,9 +38,11 @@ type ConfcryptSection struct {
 
 // RecipientConfig represents a recipient in the config
 type RecipientConfig struct {
-	Name string `yaml:"name,omitempty"`
-	Age  string `yaml:"age,omitempty"` // Native age X25519 public key
-	SSH  string `yaml:"ssh,omitempty"` // SSH public key (ed25519, RSA)
+	Name    string `yaml:"name,omitempty"`
+	Age     string `yaml:"age,omitempty"`     // Native age X25519 public key
+	SSH     string `yaml:"ssh,omitempty"`     // SSH public key (ed25519, RSA)
+	YubiKey string `yaml:"yubikey,omitempty"` // YubiKey-derived age key (age1yubikey1...)
+	FIDO2   string `yaml:"fido2,omitempty"`   // FIDO2-derived age key (age1fido21...)
 }
 
 // SecretEntry represents an encrypted secret for a recipient
@@ -147,10 +149,16 @@ func (c *Config) GetRecipients() ([]age.Recipient, error) {
 	return recipients, nil
 }
 
-// GetPublicKey returns the public key from either Age or SSH field
+// GetPublicKey returns the public key from either Age, YubiKey, FIDO2, or SSH field
 func (r *RecipientConfig) GetPublicKey() string {
 	if r.Age != "" {
 		return r.Age
+	}
+	if r.YubiKey != "" {
+		return r.YubiKey
+	}
+	if r.FIDO2 != "" {
+		return r.FIDO2
 	}
 	return r.SSH
 }
@@ -159,6 +167,12 @@ func (r *RecipientConfig) GetPublicKey() string {
 func (r *RecipientConfig) GetKeyType() crypto.KeyType {
 	if r.Age != "" {
 		return crypto.KeyTypeAge
+	}
+	if r.YubiKey != "" {
+		return crypto.KeyTypeYubiKey
+	}
+	if r.FIDO2 != "" {
+		return crypto.KeyTypeFIDO2
 	}
 	if r.SSH != "" {
 		return crypto.DetectKeyType(r.SSH)
@@ -246,10 +260,10 @@ func (c *Config) GetSecretForRecipient(pubKey string) (string, bool) {
 	return "", false
 }
 
-// FindRecipientByKey finds a recipient config by their public key (age or ssh)
+// FindRecipientByKey finds a recipient config by their public key (age, ssh, yubikey, or fido2)
 func (c *Config) FindRecipientByKey(pubKey string) *RecipientConfig {
 	for i := range c.Recipients {
-		if c.Recipients[i].Age == pubKey || c.Recipients[i].SSH == pubKey {
+		if c.Recipients[i].Age == pubKey || c.Recipients[i].SSH == pubKey || c.Recipients[i].YubiKey == pubKey || c.Recipients[i].FIDO2 == pubKey {
 			return &c.Recipients[i]
 		}
 	}

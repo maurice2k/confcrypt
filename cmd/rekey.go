@@ -13,11 +13,11 @@ import (
 )
 
 var (
-	rekeyAgeKeyFile string
-	rekeySSHKeyFile string
+	rekeyAgeKeyFile  string
+	rekeySSHKeyFile  string
+	rekeyYubiKeyFlag bool
+	rekeyFIDO2Flag   bool
 )
-
-const rekeyAutoDetectMarker = "auto"
 
 var rekeyCmd = &cobra.Command{
 	Use:   "rekey",
@@ -29,9 +29,11 @@ var rekeyCmd = &cobra.Command{
 func init() {
 	rekeyCmd.Flags().StringVar(&rekeyAgeKeyFile, "age-key", "", "Path to age private key file (use without value to force age auto-detect)")
 	rekeyCmd.Flags().StringVar(&rekeySSHKeyFile, "ssh-key", "", "Path to SSH private key file (use without value to force SSH auto-detect)")
+	rekeyCmd.Flags().BoolVar(&rekeyYubiKeyFlag, "yubikey-key", false, "Use YubiKey HMAC challenge-response")
+	rekeyCmd.Flags().BoolVar(&rekeyFIDO2Flag, "fido2-key", false, "Use FIDO2 hmac-secret (requires CGO build)")
 	// Allow --age-key and --ssh-key without a value (sets to "auto")
-	rekeyCmd.Flags().Lookup("age-key").NoOptDefVal = rekeyAutoDetectMarker
-	rekeyCmd.Flags().Lookup("ssh-key").NoOptDefVal = rekeyAutoDetectMarker
+	rekeyCmd.Flags().Lookup("age-key").NoOptDefVal = AutoDetectMarker
+	rekeyCmd.Flags().Lookup("ssh-key").NoOptDefVal = AutoDetectMarker
 	rootCmd.AddCommand(rekeyCmd)
 }
 
@@ -49,14 +51,16 @@ func runRekey(cmd *cobra.Command, args []string) {
 	}
 
 	// Load identities to decrypt current values
-	identities, err := loadRekeyIdentities()
+	identities, err := LoadDecryptionIdentity(cfg, rekeyAgeKeyFile, rekeySSHKeyFile, rekeyYubiKeyFlag, rekeyFIDO2Flag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading identities: %v\n", err)
 		os.Exit(1)
 	}
 
 	// Create processor and setup decryption with old key
-	proc, err := processor.NewProcessor(cfg, LoadIdentities)
+	proc, err := processor.NewProcessor(cfg, func() ([]age.Identity, error) {
+		return LoadDecryptionIdentity(cfg, "", "", false, false)
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -102,7 +106,9 @@ func runRekey(cmd *cobra.Command, args []string) {
 	cfg.Confcrypt.Store = nil
 
 	// Create new processor with fresh key
-	proc2, err := processor.NewProcessor(cfg, LoadIdentities)
+	proc2, err := processor.NewProcessor(cfg, func() ([]age.Identity, error) {
+		return LoadDecryptionIdentity(cfg, "", "", false, false)
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -153,30 +159,4 @@ func runRekey(cmd *cobra.Command, args []string) {
 	}
 
 	fmt.Printf("\nSuccessfully rekeyed %d file(s) with new AES key\n", len(decryptedFiles))
-}
-
-// loadRekeyIdentities loads identities based on rekey command flags
-func loadRekeyIdentities() ([]age.Identity, error) {
-	// --age-key with specific path
-	if rekeyAgeKeyFile != "" && rekeyAgeKeyFile != rekeyAutoDetectMarker {
-		return LoadIdentitiesWithOptions(rekeyAgeKeyFile, "")
-	}
-
-	// --ssh-key with specific path
-	if rekeySSHKeyFile != "" && rekeySSHKeyFile != rekeyAutoDetectMarker {
-		return LoadIdentitiesWithOptions("", rekeySSHKeyFile)
-	}
-
-	// --age-key without value (auto-detect age only)
-	if rekeyAgeKeyFile == rekeyAutoDetectMarker {
-		return autoDetectAgeIdentities()
-	}
-
-	// --ssh-key without value (auto-detect SSH only)
-	if rekeySSHKeyFile == rekeyAutoDetectMarker {
-		return autoDetectSSHIdentities()
-	}
-
-	// No flags - load all available identities
-	return LoadIdentities()
 }

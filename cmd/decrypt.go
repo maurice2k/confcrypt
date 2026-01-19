@@ -9,18 +9,17 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/maurice2k/confcrypt/internal/config"
-	"github.com/maurice2k/confcrypt/internal/crypto"
 	"github.com/maurice2k/confcrypt/internal/processor"
 )
 
 var (
-	forceDecrypt      bool
-	decryptAgeKeyFile string
-	decryptSSHKeyFile string
-	decryptOutputPath string
+	forceDecrypt       bool
+	decryptAgeKeyFile  string
+	decryptSSHKeyFile  string
+	decryptYubiKeyFlag bool
+	decryptFIDO2Flag   bool
+	decryptOutputPath  string
 )
-
-const decryptAutoDetectMarker = "auto"
 
 var decryptCmd = &cobra.Command{
 	Use:   "decrypt",
@@ -33,10 +32,12 @@ func init() {
 	decryptCmd.Flags().BoolVar(&forceDecrypt, "force", false, "Continue decryption even if MAC verification fails")
 	decryptCmd.Flags().StringVar(&decryptAgeKeyFile, "age-key", "", "Path to age private key file (use without value to force age auto-detect)")
 	decryptCmd.Flags().StringVar(&decryptSSHKeyFile, "ssh-key", "", "Path to SSH private key file (use without value to force SSH auto-detect)")
+	decryptCmd.Flags().BoolVar(&decryptYubiKeyFlag, "yubikey-key", false, "Use YubiKey HMAC challenge-response")
+	decryptCmd.Flags().BoolVar(&decryptFIDO2Flag, "fido2-key", false, "Use FIDO2 hmac-secret (requires CGO build)")
 	decryptCmd.Flags().StringVar(&decryptOutputPath, "output-path", "", "Write decrypted files to this directory (relative to .confcrypt.yml if not absolute)")
 	// Allow --age-key and --ssh-key without a value (sets to "auto")
-	decryptCmd.Flags().Lookup("age-key").NoOptDefVal = decryptAutoDetectMarker
-	decryptCmd.Flags().Lookup("ssh-key").NoOptDefVal = decryptAutoDetectMarker
+	decryptCmd.Flags().Lookup("age-key").NoOptDefVal = AutoDetectMarker
+	decryptCmd.Flags().Lookup("ssh-key").NoOptDefVal = AutoDetectMarker
 	rootCmd.AddCommand(decryptCmd)
 }
 
@@ -49,7 +50,9 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 	}
 
 	// Create processor
-	proc, err := processor.NewProcessor(cfg, LoadIdentities)
+	proc, err := processor.NewProcessor(cfg, func() ([]age.Identity, error) {
+		return LoadDecryptionIdentity(cfg, "", "", false, false)
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -86,7 +89,7 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 	}
 
 	// Load identities based on flags
-	identities, err := loadDecryptIdentities()
+	identities, err := LoadDecryptionIdentity(cfg, decryptAgeKeyFile, decryptSSHKeyFile, decryptYubiKeyFlag, decryptFIDO2Flag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading identities: %v\n", err)
 		os.Exit(1)
@@ -211,111 +214,4 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 			}
 		}
 	}
-}
-
-// loadDecryptIdentities loads identities based on decrypt command flags
-func loadDecryptIdentities() ([]age.Identity, error) {
-	// --age-key with specific path
-	if decryptAgeKeyFile != "" && decryptAgeKeyFile != decryptAutoDetectMarker {
-		return LoadIdentitiesWithOptions(decryptAgeKeyFile, "")
-	}
-
-	// --ssh-key with specific path
-	if decryptSSHKeyFile != "" && decryptSSHKeyFile != decryptAutoDetectMarker {
-		return LoadIdentitiesWithOptions("", decryptSSHKeyFile)
-	}
-
-	// --age-key without value (auto-detect age only)
-	if decryptAgeKeyFile == decryptAutoDetectMarker {
-		return autoDetectAgeIdentities()
-	}
-
-	// --ssh-key without value (auto-detect SSH only)
-	if decryptSSHKeyFile == decryptAutoDetectMarker {
-		return autoDetectSSHIdentities()
-	}
-
-	// No flags - load all available identities
-	return LoadIdentities()
-}
-
-// autoDetectAgeIdentities auto-detects age identities only (ignores SSH)
-func autoDetectAgeIdentities() ([]age.Identity, error) {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("could not determine home directory: %w", err)
-	}
-
-	var allIdentities []age.Identity
-
-	// Try SOPS_AGE_KEY_FILE
-	if keyFile := os.Getenv("SOPS_AGE_KEY_FILE"); keyFile != "" {
-		if ids, err := loadIdentitiesFromFile(keyFile); err == nil {
-			allIdentities = append(allIdentities, ids...)
-		}
-	}
-
-	// Try CONFCRYPT_AGE_KEY_FILE
-	if keyFile := os.Getenv("CONFCRYPT_AGE_KEY_FILE"); keyFile != "" {
-		if ids, err := loadIdentitiesFromFile(keyFile); err == nil {
-			allIdentities = append(allIdentities, ids...)
-		}
-	}
-
-	// Try CONFCRYPT_AGE_KEY (direct key content)
-	if keyContent := os.Getenv("CONFCRYPT_AGE_KEY"); keyContent != "" {
-		if ids, err := crypto.ParseIdentities(keyContent); err == nil {
-			allIdentities = append(allIdentities, ids...)
-		}
-	}
-
-	// Try default age key location
-	defaultKeyFile := filepath.Join(homeDir, ".config", "age", "key.txt")
-	if _, err := os.Stat(defaultKeyFile); err == nil {
-		if ids, err := loadIdentitiesFromFile(defaultKeyFile); err == nil {
-			allIdentities = append(allIdentities, ids...)
-		}
-	}
-
-	if len(allIdentities) == 0 {
-		return nil, fmt.Errorf("no age identity found")
-	}
-
-	return allIdentities, nil
-}
-
-// autoDetectSSHIdentities auto-detects SSH identities only (ignores age)
-func autoDetectSSHIdentities() ([]age.Identity, error) {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("could not determine home directory: %w", err)
-	}
-
-	var allIdentities []age.Identity
-
-	// Try CONFCRYPT_SSH_KEY_FILE
-	if keyFile := os.Getenv("CONFCRYPT_SSH_KEY_FILE"); keyFile != "" {
-		if ids, err := loadIdentitiesFromFile(keyFile); err == nil {
-			allIdentities = append(allIdentities, ids...)
-		}
-	}
-
-	// Try default SSH key locations
-	sshKeyPaths := []string{
-		filepath.Join(homeDir, ".ssh", "id_ed25519"),
-		filepath.Join(homeDir, ".ssh", "id_rsa"),
-	}
-	for _, sshKeyPath := range sshKeyPaths {
-		if _, err := os.Stat(sshKeyPath); err == nil {
-			if ids, err := loadIdentitiesFromFile(sshKeyPath); err == nil {
-				allIdentities = append(allIdentities, ids...)
-			}
-		}
-	}
-
-	if len(allIdentities) == 0 {
-		return nil, fmt.Errorf("no SSH identity found")
-	}
-
-	return allIdentities, nil
 }

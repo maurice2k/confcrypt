@@ -12,9 +12,13 @@ import (
 
 	"github.com/maurice2k/confcrypt/internal/config"
 	"github.com/maurice2k/confcrypt/internal/crypto"
+	"github.com/maurice2k/confcrypt/internal/yubikey"
 )
 
-const version = "1.4.0"
+const (
+	version          = "1.5.0"
+	AutoDetectMarker = "auto"
+)
 
 var (
 	// Global flags
@@ -63,46 +67,14 @@ func Execute() {
 	}
 }
 
-// LoadIdentities loads ALL available identities from environment and default locations.
-// Supports both native age keys and SSH keys (ed25519, RSA).
-// Returns all found identities so SetupDecryption can try each one.
-func LoadIdentities() ([]age.Identity, error) {
-	return LoadIdentitiesWithOptions("", "")
-}
-
-// LoadIdentitiesWithOptions loads identities with optional explicit key file paths.
-// If ageKeyFile is set, only load from that age key file.
-// If sshKeyFile is set, only load from that SSH key file.
-// If both are empty, collect ALL available identities.
-func LoadIdentitiesWithOptions(ageKeyFile, sshKeyFile string) ([]age.Identity, error) {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("could not determine home directory: %w", err)
-	}
-
-	// If explicit age key file is specified, use only that
-	if ageKeyFile != "" {
-		return loadIdentitiesFromFile(ageKeyFile)
-	}
-
-	// If explicit SSH key file is specified, use only that
-	if sshKeyFile != "" {
-		return loadIdentitiesFromFile(sshKeyFile)
-	}
-
-	// Collect ALL available identities
+// loadFileBasedIdentities loads ALL available file-based identities (age and SSH) from environment and default locations.
+// Uses shared path discovery from keydetect.go
+func loadFileBasedIdentities() ([]age.Identity, error) {
 	var allIdentities []age.Identity
 
-	// Try SOPS_AGE_KEY_FILE
-	if keyFile := os.Getenv("SOPS_AGE_KEY_FILE"); keyFile != "" {
-		if ids, err := loadIdentitiesFromFile(keyFile); err == nil {
-			allIdentities = append(allIdentities, ids...)
-		}
-	}
-
-	// Try CONFCRYPT_AGE_KEY_FILE
-	if keyFile := os.Getenv("CONFCRYPT_AGE_KEY_FILE"); keyFile != "" {
-		if ids, err := loadIdentitiesFromFile(keyFile); err == nil {
+	// Load age identities
+	for _, path := range getAgeKeyFiles() {
+		if ids, err := loadIdentitiesFromFile(path); err == nil {
 			allIdentities = append(allIdentities, ids...)
 		}
 	}
@@ -114,38 +86,17 @@ func LoadIdentitiesWithOptions(ageKeyFile, sshKeyFile string) ([]age.Identity, e
 		}
 	}
 
-	// Try CONFCRYPT_SSH_KEY_FILE (SSH private key file)
-	if keyFile := os.Getenv("CONFCRYPT_SSH_KEY_FILE"); keyFile != "" {
-		if ids, err := loadIdentitiesFromFile(keyFile); err == nil {
-			allIdentities = append(allIdentities, ids...)
-		}
-	}
-
-	// Try default age key location
-	defaultKeyFile := filepath.Join(homeDir, ".config", "age", "key.txt")
-	if _, err := os.Stat(defaultKeyFile); err == nil {
-		if ids, err := loadIdentitiesFromFile(defaultKeyFile); err == nil {
-			allIdentities = append(allIdentities, ids...)
-		}
-	}
-
-	// Try default SSH key locations
-	// Use passphrase callback - agessh.EncryptedSSHIdentity has lazy evaluation,
-	// so passphrase is only prompted when the identity is actually used for decryption
-	sshKeyPaths := []string{
-		filepath.Join(homeDir, ".ssh", "id_ed25519"),
-		filepath.Join(homeDir, ".ssh", "id_rsa"),
-	}
-	for _, sshKeyPath := range sshKeyPaths {
-		if _, err := os.Stat(sshKeyPath); err == nil {
-			if ids, err := loadIdentitiesFromFile(sshKeyPath); err == nil {
+	// Load SSH identities
+	for _, path := range getSSHKeyFiles() {
+		if _, err := os.Stat(path); err == nil {
+			if ids, err := loadIdentitiesFromFile(path); err == nil {
 				allIdentities = append(allIdentities, ids...)
 			}
 		}
 	}
 
 	if len(allIdentities) == 0 {
-		return nil, fmt.Errorf("no identity found. Set SOPS_AGE_KEY_FILE, CONFCRYPT_AGE_KEY_FILE, CONFCRYPT_SSH_KEY_FILE, or create %s or ~/.ssh/id_ed25519", defaultKeyFile)
+		return nil, fmt.Errorf("no identity found. Set SOPS_AGE_KEY_FILE, CONFCRYPT_AGE_KEY_FILE, CONFCRYPT_SSH_KEY_FILE, or create ~/.config/age/key.txt or ~/.ssh/id_ed25519")
 	}
 
 	return allIdentities, nil
@@ -192,4 +143,296 @@ func GetFilesToProcess(cfg *config.Config) ([]string, error) {
 		return []string{absPath}, nil
 	}
 	return cfg.GetMatchingFiles()
+}
+
+// LoadDecryptionIdentity loads a single identity that can decrypt a store entry.
+// Priority: age > ssh > fido2 > yubikey
+// Only loads identity types that are present in the store.
+func LoadDecryptionIdentity(cfg *config.Config, ageKeyFile, sshKeyFile string, useYubiKey, useFIDO2 bool) ([]age.Identity, error) {
+	// Get recipients from store
+	storeRecipients := getStoreRecipients(cfg)
+	if len(storeRecipients) == 0 {
+		// No store entries - load all available for first encryption
+		return loadAllAvailableIdentities(cfg)
+	}
+
+	// Explicit flags: only try that type
+	if ageKeyFile != "" && ageKeyFile != AutoDetectMarker {
+		return findAgeIdentity(ageKeyFile, storeRecipients)
+	}
+	if sshKeyFile != "" && sshKeyFile != AutoDetectMarker {
+		return findSSHIdentity(sshKeyFile, storeRecipients)
+	}
+	if ageKeyFile == AutoDetectMarker {
+		return findMatchingAgeIdentity(storeRecipients)
+	}
+	if sshKeyFile == AutoDetectMarker {
+		return findMatchingSSHIdentity(storeRecipients)
+	}
+	if useYubiKey {
+		return findYubiKeyIdentity(storeRecipients)
+	}
+	if useFIDO2 {
+		return findFIDO2Identity(storeRecipients)
+	}
+
+	// No flags: iterate by priority, only for types in store
+	requiredTypes := getRequiredKeyTypes(storeRecipients)
+
+	// Priority 1 & 2: age and SSH (file-based identities)
+	if requiredTypes[crypto.KeyTypeAge] || hasSSHTypes(requiredTypes) {
+		if ids, err := findMatchingFileIdentity(storeRecipients); err == nil && len(ids) > 0 {
+			return ids, nil
+		}
+	}
+	// Priority 3: FIDO2
+	if requiredTypes[crypto.KeyTypeFIDO2] {
+		if ids, err := findFIDO2Identity(storeRecipients); err == nil && len(ids) > 0 {
+			return ids, nil
+		}
+	}
+	// Priority 4: YubiKey
+	if requiredTypes[crypto.KeyTypeYubiKey] {
+		if ids, err := findYubiKeyIdentity(storeRecipients); err == nil && len(ids) > 0 {
+			return ids, nil
+		}
+	}
+
+	return nil, fmt.Errorf("no matching identity found for store recipients")
+}
+
+// getStoreRecipients returns a list of recipient public keys from the store
+func getStoreRecipients(cfg *config.Config) []string {
+	var recipients []string
+	if cfg.Confcrypt == nil {
+		return recipients
+	}
+	for _, entry := range cfg.Confcrypt.Store {
+		recipients = append(recipients, entry.Recipient)
+	}
+	return recipients
+}
+
+// getRequiredKeyTypes returns a map of key types required by store recipients
+func getRequiredKeyTypes(storeRecipients []string) map[crypto.KeyType]bool {
+	types := make(map[crypto.KeyType]bool)
+	for _, recipient := range storeRecipients {
+		keyType := crypto.DetectKeyType(recipient)
+		types[keyType] = true
+	}
+	return types
+}
+
+// hasSSHTypes checks if any SSH key types are in the map
+func hasSSHTypes(types map[crypto.KeyType]bool) bool {
+	return types[crypto.KeyTypeSSHEd25519] || types[crypto.KeyTypeSSHRSA] || types[crypto.KeyTypeSSHECDSA]
+}
+
+// loadAllAvailableIdentities loads all available identities when store is empty
+func loadAllAvailableIdentities(cfg *config.Config) ([]age.Identity, error) {
+	var identities []age.Identity
+
+	// Load file-based identities
+	if ids, err := loadFileBasedIdentities(); err == nil {
+		identities = append(identities, ids...)
+	}
+
+	// Load YubiKey identities
+	if ykIds, err := loadYubiKeyIdentities(cfg); err == nil {
+		identities = append(identities, ykIds...)
+	}
+
+	// Load FIDO2 identities
+	if fido2Ids, err := loadFIDO2Identities(cfg); err == nil {
+		identities = append(identities, fido2Ids...)
+	}
+
+	if len(identities) == 0 {
+		return nil, fmt.Errorf("no identities found")
+	}
+
+	return identities, nil
+}
+
+// findAgeIdentity loads an age identity from a specific path
+func findAgeIdentity(path string, storeRecipients []string) ([]age.Identity, error) {
+	ids, pubKey, err := loadAgeIdentityWithPubKey(path)
+	if err != nil {
+		return nil, err
+	}
+	if contains(storeRecipients, pubKey) {
+		return ids, nil
+	}
+	return nil, fmt.Errorf("age identity at %s does not match any store recipient", path)
+}
+
+// findSSHIdentity loads an SSH identity from a specific path
+func findSSHIdentity(path string, storeRecipients []string) ([]age.Identity, error) {
+	ids, pubKey, err := loadSSHIdentityWithPubKey(path)
+	if err != nil {
+		return nil, err
+	}
+	if containsSSHKey(storeRecipients, pubKey) {
+		return ids, nil
+	}
+	return nil, fmt.Errorf("SSH identity at %s does not match any store recipient", path)
+}
+
+// findMatchingAgeIdentity finds an age identity that matches a store recipient
+func findMatchingAgeIdentity(storeRecipients []string) ([]age.Identity, error) {
+	for _, path := range getAgeKeyFiles() {
+		if ids, pubKey, err := loadAgeIdentityWithPubKey(path); err == nil {
+			if contains(storeRecipients, pubKey) {
+				return ids, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("no matching age identity found")
+}
+
+// findMatchingSSHIdentity finds an SSH identity that matches a store recipient
+func findMatchingSSHIdentity(storeRecipients []string) ([]age.Identity, error) {
+	for _, path := range getSSHKeyFiles() {
+		if ids, pubKey, err := loadSSHIdentityWithPubKey(path); err == nil {
+			if containsSSHKey(storeRecipients, pubKey) {
+				return ids, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("no matching SSH identity found")
+}
+
+// findMatchingFileIdentity checks if any local age/SSH key matches a store recipient
+func findMatchingFileIdentity(storeRecipients []string) ([]age.Identity, error) {
+	// For age keys: load identity, get public key, check if in storeRecipients
+	for _, path := range getAgeKeyFiles() {
+		if ids, pubKey, err := loadAgeIdentityWithPubKey(path); err == nil {
+			if contains(storeRecipients, pubKey) {
+				return ids, nil
+			}
+		}
+	}
+
+	// For SSH keys: load identity, derive public key, check if in storeRecipients
+	for _, path := range getSSHKeyFiles() {
+		if ids, pubKey, err := loadSSHIdentityWithPubKey(path); err == nil {
+			if containsSSHKey(storeRecipients, pubKey) {
+				return ids, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("no matching file identity found")
+}
+
+// findYubiKeyIdentity checks if connected YubiKey matches any store recipient
+func findYubiKeyIdentity(storeRecipients []string) ([]age.Identity, error) {
+	for _, recipient := range storeRecipients {
+		if !yubikey.IsYubiKeyRecipient(recipient) {
+			continue
+		}
+		ykId, err := yubikey.DecodeRecipient(recipient)
+		if err != nil {
+			continue
+		}
+		// Check if this YubiKey is connected (uses serial from recipient)
+		if _, err := yubikey.FindYubiKeyBySerial(ykId.Serial); err != nil {
+			continue
+		}
+		// YubiKey is connected - derive identity
+		fmt.Fprintf(os.Stderr, "Found YubiKey %d, touch to decrypt...\n", ykId.Serial)
+		identity, err := ykId.ToAgeIdentity()
+		if err != nil {
+			continue
+		}
+		return []age.Identity{identity}, nil
+	}
+	return nil, fmt.Errorf("no matching YubiKey found")
+}
+
+// findFIDO2Identity checks if connected FIDO2 device matches any store recipient
+// This is implemented in helpers_fido2.go / helpers_nofido2.go
+func findFIDO2Identity(storeRecipients []string) ([]age.Identity, error) {
+	return findFIDO2IdentityImpl(storeRecipients)
+}
+
+// loadAgeIdentityWithPubKey loads an age identity and returns both the identity and its public key
+func loadAgeIdentityWithPubKey(path string) ([]age.Identity, string, error) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, "", err
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", err
+	}
+	ids, err := crypto.ParseIdentities(string(content))
+	if err != nil {
+		return nil, "", err
+	}
+	if len(ids) == 0 {
+		return nil, "", fmt.Errorf("no identities in file")
+	}
+	// Get public key from first identity
+	if x25519, ok := ids[0].(*age.X25519Identity); ok {
+		return ids, x25519.Recipient().String(), nil
+	}
+	return nil, "", fmt.Errorf("not an age X25519 identity")
+}
+
+// loadSSHIdentityWithPubKey loads an SSH identity and returns both the identity and its public key
+func loadSSHIdentityWithPubKey(path string) ([]age.Identity, string, error) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, "", err
+	}
+
+	// Load identity from private key
+	ids, err := loadIdentitiesFromFile(path)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(ids) == 0 {
+		return nil, "", fmt.Errorf("no identities in file")
+	}
+
+	// Read public key from .pub file
+	pubPath := path + ".pub"
+	pubContent, err := os.ReadFile(pubPath)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to read public key: %w", err)
+	}
+
+	pubKey := strings.TrimSpace(string(pubContent))
+	return ids, pubKey, nil
+}
+
+// contains checks if a string is in a slice
+func contains(slice []string, s string) bool {
+	for _, item := range slice {
+		if item == s {
+			return true
+		}
+	}
+	return false
+}
+
+// containsSSHKey checks if an SSH public key matches any recipient in the slice
+// SSH keys can have different comments, so we match by key content (first two space-separated fields)
+func containsSSHKey(storeRecipients []string, pubKey string) bool {
+	// Extract key type and key data (ignore comment)
+	pubKeyParts := strings.Fields(pubKey)
+	if len(pubKeyParts) < 2 {
+		return false
+	}
+	pubKeyPrefix := pubKeyParts[0] + " " + pubKeyParts[1]
+
+	for _, recipient := range storeRecipients {
+		recipientParts := strings.Fields(recipient)
+		if len(recipientParts) >= 2 {
+			recipientPrefix := recipientParts[0] + " " + recipientParts[1]
+			if recipientPrefix == pubKeyPrefix {
+				return true
+			}
+		}
+	}
+	return false
 }

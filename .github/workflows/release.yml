@@ -9,7 +9,38 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  build-darwin:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14      # Apple Silicon runner
+            arch: arm64
+          # - os: macos-13    # Intel runner (disabled)
+          #   arch: amd64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Install libfido2
+        run: brew install libfido2 openssl@3
+
+      - name: Build binary (CGO enabled)
+        run: |
+          BREW_PREFIX=$(brew --prefix)
+          export CGO_CFLAGS="-I${BREW_PREFIX}/opt/libfido2/include -I${BREW_PREFIX}/opt/openssl@3/include"
+          export CGO_LDFLAGS="-L${BREW_PREFIX}/opt/libfido2/lib -lfido2 -L${BREW_PREFIX}/opt/openssl@3/lib -lcrypto"
+          CGO_ENABLED=1 go build -ldflags "-s -w" -o confcrypt-darwin-${{ matrix.arch }} .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: confcrypt-darwin-${{ matrix.arch }}
+          path: confcrypt-darwin-${{ matrix.arch }}
+
+  build-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,17 +49,29 @@ jobs:
         with:
           go-version: '1.22'
 
-      - name: Build binaries
-        run: |
-          VERSION=${GITHUB_REF#refs/tags/}
+      - name: Install libfido2-dev
+        run: sudo apt-get update && sudo apt-get install -y libfido2-dev
 
-          GOOS=darwin GOARCH=arm64 go build -ldflags "-s -w" -o confcrypt-darwin-arm64 .
-          GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o confcrypt-linux-amd64 .
+      - name: Build binary (CGO enabled)
+        run: |
+          CGO_ENABLED=1 go build -ldflags "-s -w" -o confcrypt-linux-amd64 .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: confcrypt-linux-amd64
+          path: confcrypt-linux-amd64
+
+  release:
+    needs: [build-darwin, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            confcrypt-darwin-arm64
-            confcrypt-linux-amd64
+          files: artifacts/*
           generate_release_notes: true

@@ -1,14 +1,16 @@
 # confcrypt
 
-A command-line tool for encrypting sensitive values in YAML and JSON configuration files using [age](https://github.com/FiloSottile/age) or SSH public-key cryptography.
+A command-line tool for encrypting sensitive values in YAML and JSON configuration files using [age](https://github.com/FiloSottile/age) public-key cryptography.
 
-*confcrypt* encrypts only values matching configured patterns while keeping the file structure readable. Internal state is stored separately in `.confcrypt.yml`, and a `check` command detects unencrypted secrets (useful as a pre-commit hook). Supports multiple recipients, allowing team members to decrypt with their own keys. Similar to [sops](https://github.com/getsops/sops), but more straightforward.
+*confcrypt* only encrypts values matching configured patterns while keeping the file structure readable. Supports multiple recipients with age keys, SSH keys, FIDO2 compatible devices or YubiKey OTP. Works similarly to [sops](https://github.com/getsops/sops), but more straightforward.
 
 ## Features
 
 - **Selective encryption**: Only encrypts values matching your defined key patterns
 - **Multiple recipients**: Encrypt for multiple team members using age or SSH public keys
 - **SSH key support**: Use existing SSH keys (ed25519, RSA) alongside native age keys
+- **FIDO2 support**: Derive keys from FIDO2 hmac-secret extension (requires CGO build)
+- **YubiKey support**: Derive keys from YubiKey HMAC challenge-response (OTP slot)
 - **Format preservation**: Maintains YAML/JSON structure and comments
 - **Flexible key matching**: Exact names, regex patterns, or JSON paths
 - **Idempotent**: Re-running encryption leaves already-encrypted values unchanged
@@ -17,13 +19,17 @@ A command-line tool for encrypting sensitive values in YAML and JSON configurati
 
 ## Quick Start
 
+[Install *confcrypt*](#installation), then:
+
 ### 1. Have a keypair ready
 
-You can use either:
+You can use any of:
 - **Native age key**: `age-keygen -o ~/.config/age/key.txt`
 - **Existing SSH key**: `~/.ssh/id_ed25519` (ed25519 or RSA)
+- **FIDO2 device (YubiKey, FIDO2 compatible)**: Use hmac-secret extension (see [FIDO2 Support](#fido2-support))
+- **YubiKey OTP**: Configure HMAC challenge-response (see [YubiKey Support](#yubikey-support))
 
-### 2. Initialize confcrypt
+### 2. Initialize *confcrypt*
 
 ```bash
 confcrypt init
@@ -34,7 +40,7 @@ This creates a `.confcrypt.yml` with:
 - Default file patterns: `*.yml`, `*.yaml`, `*.json`
 - Default sensitive key patterns: `/password$/`, `/api_key$/`, `/secret$/`, `/token$/`
 
-You can also specify a particular key file:
+You can also specify a particular key file or hardware key:
 
 ```bash
 # Use specific age key
@@ -42,6 +48,12 @@ confcrypt init --age-key ~/.age/key.txt
 
 # Use specific SSH public key
 confcrypt init --ssh-key ~/.ssh/id_ed25519.pub
+
+# Use FIDO2 hmac-secret (requires CGO build)
+confcrypt init --fido2-key
+
+# Use YubiKey HMAC challenge-response
+confcrypt init --yubikey-key
 ```
 
 ### 3. Encrypt your config files
@@ -62,19 +74,70 @@ confcrypt decrypt
 
 ## Installation
 
-### From source
+### Quick Install (recommended)
+
+Download and install the latest release automatically:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/maurice2k/confcrypt/main/install.sh | sh
+```
+
+This installs to `/usr/local/bin` by default. To install elsewhere:
+
+```bash
+INSTALL_DIR=~/.local/bin curl -fsSL https://raw.githubusercontent.com/maurice2k/confcrypt/main/install.sh | sh
+```
+
+### From source (go install)
 
 ```bash
 go install github.com/maurice2k/confcrypt@latest
 ```
 
-### Build from source
+**Note:** This builds without CGO, so FIDO2 support is disabled.
+
+### Build from source with CGO (FIDO2 support)
+
+For full FIDO2 hmac-secret support, you need to build with CGO enabled and `libfido2` installed.
+
+**1. Install libfido2:**
+
+```bash
+# macOS
+brew install libfido2
+
+# Debian/Ubuntu
+sudo apt install libfido2-dev
+
+# Fedora
+sudo dnf install libfido2-devel
+```
+
+**2. Build with CGO:**
+
+On Linux, this usually works out of the box:
 
 ```bash
 git clone https://github.com/maurice2k/confcrypt.git
 cd confcrypt
-go build -o confcrypt .
+CGO_ENABLED=1 go build -o confcrypt .
 ```
+
+On macOS, you may need to specify library paths via `CGO_LDFLAGS` and `CGO_CFLAGS` if Go can't find the Homebrew-installed libraries automatically:
+
+```bash
+# macOS (Apple Silicon)
+CGO_LDFLAGS="-L/opt/homebrew/opt/libfido2/lib -lfido2 -L/opt/homebrew/opt/openssl@3/lib -lcrypto" \
+CGO_CFLAGS="-I/opt/homebrew/opt/libfido2/include -I/opt/homebrew/opt/openssl@3/include" \
+CGO_ENABLED=1 go build -o confcrypt .
+
+# macOS (Intel)
+CGO_LDFLAGS="-L/usr/local/opt/libfido2/lib -lfido2 -L/usr/local/opt/openssl@3/lib -lcrypto" \
+CGO_CFLAGS="-I/usr/local/opt/libfido2/include -I/usr/local/opt/openssl@3/include" \
+CGO_ENABLED=1 go build -o confcrypt .
+```
+
+These flags tell the C compiler where to find the `libfido2` headers (`CGO_CFLAGS`) and the linker where to find the libraries (`CGO_LDFLAGS`).
 
 ### Manual Configuration
 
@@ -82,7 +145,7 @@ You can also create `.confcrypt.yml` manually:
 
 ```yaml
 # Recipients who can decrypt the files
-# Supports both native age keys (age:) and SSH keys (ssh:)
+# Supports age keys (age:), SSH keys (ssh:), FIDO2 (fido2:), and YubiKey (yubikey:)
 recipients:
   - name: "Alice"
     age: age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
@@ -90,6 +153,10 @@ recipients:
     ssh: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... bob@example.com
   - name: "Carol"
     ssh: ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAB... carol@example.com
+  - name: "Dave"
+    fido2: age1fido21qpzry9x8...  # FIDO2-derived key
+  - name: "Eve"
+    yubikey: age1yubikey1q94ldgcz...  # YubiKey-derived key
 
 # Files to process (glob patterns)
 files:
@@ -152,7 +219,7 @@ api:
   api_key: sk_live_12345
 ```
 
-**After running `confcrypt`:**
+**After running *confcrypt*:**
 ```yaml
 database:
   host: localhost
@@ -234,9 +301,9 @@ When using `--output-path`:
 
 ## Managing Recipients
 
-confcrypt supports adding and removing recipients dynamically.
+*confcrypt* supports adding and removing recipients dynamically.
 
-### Add a new team member (`recipient-add`)
+### Add a recipient (`recipient add`)
 
 ```bash
 # Add with age key
@@ -252,18 +319,18 @@ confcrypt recipient add age1lggyhqrw2nlhcxprm67z43rta597azn8gknawjehu9d9dl0jq3yq
 **What happens:**
 1. The new recipient is added to the `recipients` list in `.confcrypt.yml`
 2. If encrypted secrets exist, the existing AES-256 key is encrypted for the new recipient
-3. The new team member can now decrypt all config files with their private key
+3. The new recipient can now decrypt all config files with their private key
 
 **Note:** No rekeying occurs - the same AES-256 key is used, just encrypted for an additional recipient.
 
-### Remove a team member (`recipient-rm`)
+### Remove a recipient (`recipient rm`)
 
 ```bash
 # Default: rekeys (generates new AES-256 key, re-encrypts everything)
-confcrypt recipient-rm age1lggyhqrw2nlhcxprm67z43rta597azn8gknawjehu9d9dl0jq3yqqvfafg
+confcrypt recipient rm age1lggyhqrw2nlhcxprm67z43rta597azn8gknawjehu9d9dl0jq3yqqvfafg
 
 # Skip rekeying (just remove their access to current key)
-confcrypt recipient-rm --no-rekey age1lggyhqrw2nlhcxprm67z43rta597azn8gknawjehu9d9dl0jq3yqqvfafg
+confcrypt recipient rm --no-rekey age1lggyhqrw2nlhcxprm67z43rta597azn8gknawjehu9d9dl0jq3yqqvfafg
 ```
 
 **Default behavior (with rekey):**
@@ -271,12 +338,12 @@ confcrypt recipient-rm --no-rekey age1lggyhqrw2nlhcxprm67z43rta597azn8gknawjehu9
 2. A new AES-256 key is generated
 3. All encrypted values are decrypted and re-encrypted with the new key
 4. The new key is encrypted for remaining recipients only
-5. The removed team member cannot decrypt any files (even if they had a copy of the old AES-256 key)
+5. The removed recipient cannot decrypt any files (even if they had a copy of the old AES-256 key)
 
 **With `--no-rekey`:**
 1. The recipient is removed from the `recipients` list
 2. The existing AES-256 key is re-encrypted for remaining recipients only
-3. The removed team member loses access, but if they had a copy of the old AES-256 key, they could still decrypt
+3. The removed recipient loses access, but if they had a copy of the old AES-256 key, they could still decrypt
 
 **Note:** You cannot remove the last recipient - at least one must remain.
 
@@ -302,7 +369,7 @@ confcrypt rekey
 
 ## Private Key Configuration
 
-confcrypt looks for your private key in this order (age keys take precedence over SSH keys):
+*confcrypt* looks for your private key in this order (age keys take precedence over SSH keys):
 
 1. `SOPS_AGE_KEY_FILE` environment variable (for sops compatibility)
 2. `CONFCRYPT_AGE_KEY_FILE` environment variable
@@ -311,6 +378,8 @@ confcrypt looks for your private key in this order (age keys take precedence ove
 5. `~/.config/age/key.txt` (default age location)
 6. `~/.ssh/id_ed25519` (SSH ed25519 key)
 7. `~/.ssh/id_rsa` (SSH RSA key)
+8. FIDO2 recipients from `.confcrypt.yml` (auto-detected, requires touch/PIN)
+9. YubiKey recipients from `.confcrypt.yml` (auto-detected, requires touch)
 
 ### Supported Key Types
 
@@ -319,9 +388,103 @@ confcrypt looks for your private key in this order (age keys take precedence ove
 | Native age (X25519) | `age:` field | age key file |
 | SSH ed25519 | `ssh:` field | `~/.ssh/id_ed25519` |
 | SSH RSA | `ssh:` field | `~/.ssh/id_rsa` |
+| FIDO2 hmac-secret | `fido2:` field | FIDO2 device |
+| YubiKey HMAC | `yubikey:` field | YubiKey device |
 | SSH sk-ed25519 (FIDO) | Not supported | Not supported |
 
-**Note**: SSH sk-ed25519 (hardware-backed FIDO keys) are not supported because the private key material cannot be exported from the hardware token.
+**Note**: SSH sk-ed25519 (hardware-backed FIDO keys) are not supported because the private key material cannot be exported from the hardware token. Use the FIDO2 hmac-secret support instead.
+
+## FIDO2 Support
+
+*confcrypt* can derive encryption keys from FIDO2 devices using the hmac-secret extension. This provides stronger crypto (SHA-256) and optional PIN protection.
+
+**Note**: FIDO2 support requires building *confcrypt* with CGO enabled and libfido2 installed. See [Build from source with CGO](#build-from-source-with-cgo-fido2-support) in the Installation section.
+
+### Generate a FIDO2 recipient
+
+```bash
+confcrypt keygen fido2
+confcrypt keygen fido2 --pin  # Require PIN
+```
+
+This outputs a recipient string like:
+```
+age1fido21qpzry9x8gf2tvdw0s3jn54khce6mua7l...
+```
+
+### Add FIDO2 recipient to project
+
+```bash
+confcrypt recipient add --name "Your Name" age1fido21qpzry9x8...
+```
+
+### How it works
+
+1. **Credential creation**: A FIDO2 credential is created with the hmac-secret extension
+2. **Salt generation**: A random 32-byte salt is generated
+3. **Secret derivation**: The device computes HMAC-SHA256 using its internal secret and the salt
+4. **Key derivation**: The secret is used to derive an X25519 keypair
+5. **Decryption**: Touch the device (and enter PIN if configured) to re-derive the private key
+
+### FIDO2 vs YubiKey OTP
+
+| Feature | FIDO2 hmac-secret | YubiKey OTP HMAC |
+|---------|-------------------|------------------|
+| Algorithm | HMAC-SHA256 | HMAC-SHA1 |
+| PIN support | Yes | No |
+| External tool | `libfido2` (CGO) | `ykman` |
+| Build | Requires CGO | Standard Go |
+
+## YubiKey Support
+
+*confcrypt* supports deriving encryption keys from YubiKey HMAC challenge-response. This provides hardware-backed key derivation without storing any secrets on disk.
+
+### Prerequisites
+
+1. Install `ykman` (YubiKey Manager):
+   ```bash
+   brew install ykman  # macOS
+   pip install yubikey-manager  # or via pip
+   ```
+
+2. Configure HMAC challenge-response on your YubiKey:
+   ```bash
+   ykman otp chalresp --generate 2 --touch
+   ```
+   This configures slot 2 with a random secret and requires touch for each operation.
+
+### Generate a YubiKey recipient
+
+```bash
+confcrypt keygen yubikey
+```
+
+This outputs a recipient string like:
+```
+age1yubikey1q94ldgcz5v2ejqt7gt7vrxxg6jr652pe8guse6kgnctrc9x3hev52wwr8588z7a3ukc7ewwy72ssts0xm0r5xy9yk6jjjrlzz7thuta9wcve2ygv44r0y
+```
+
+The recipient string contains:
+- YubiKey serial number (for device identification)
+- HMAC slot (1 or 2)
+- Random challenge (salt)
+- X25519 public key
+
+### Add YubiKey recipient to project
+
+```bash
+confcrypt recipient add --name "Your Name" age1yubikey1q94ldgcz...
+```
+
+### How it works
+
+1. **Key generation**: A random 32-byte challenge is generated and sent to the YubiKey
+2. **HMAC response**: The YubiKey computes HMAC-SHA1 using its internal secret
+3. **Key derivation**: The response is combined with the challenge via SHA256 to derive an X25519 keypair
+4. **Encryption**: The derived public key is used for age encryption
+5. **Decryption**: Touch the YubiKey to re-derive the private key on-demand
+
+The private key is **never stored** - it's derived each time using the YubiKey.
 
 ## Encrypted Value Format
 
@@ -340,7 +503,7 @@ The AES-256 key is randomly generated per config and encrypted for each recipien
 
 ## Config File Structure
 
-After encryption, confcrypt adds a `.confcrypt` section to your `.confcrypt.yml`:
+After encryption, *confcrypt* adds a `.confcrypt` section to your `.confcrypt.yml`:
 
 ```yaml
 .confcrypt:

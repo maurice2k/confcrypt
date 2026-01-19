@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"filippo.io/age"
 	"github.com/spf13/cobra"
 
 	"github.com/maurice2k/confcrypt/internal/config"
@@ -31,7 +32,9 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 	}
 
 	// Create processor
-	proc, err := processor.NewProcessor(cfg, LoadIdentities)
+	proc, err := processor.NewProcessor(cfg, func() ([]age.Identity, error) {
+		return LoadDecryptionIdentity(cfg, "", "", false, false)
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)

@@ -13,6 +13,8 @@ import (
 	"filippo.io/age"
 	"filippo.io/age/agessh"
 	"golang.org/x/crypto/ssh"
+
+	"github.com/maurice2k/confcrypt/internal/yubikey"
 )
 
 // GenerateAESKey generates a random 256-bit AES key
@@ -111,11 +113,29 @@ func DecryptWithIdentities(data []byte, identities []age.Identity) ([]byte, erro
 }
 
 // ParseRecipient parses a public key string into a Recipient.
-// Supports both native age X25519 keys and SSH keys (ed25519, RSA).
+// Supports native age X25519 keys, SSH keys (ed25519, RSA), YubiKey, and FIDO2 recipients.
 func ParseRecipient(pubKey string) (age.Recipient, error) {
 	pubKey = strings.TrimSpace(pubKey)
 
-	// Try SSH key first (starts with "ssh-")
+	// Try YubiKey recipient first (starts with "age1yubikey")
+	if yubikey.IsYubiKeyRecipient(pubKey) {
+		identity, err := yubikey.DecodeRecipient(pubKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse YubiKey recipient %q: %w", pubKey, err)
+		}
+		return identity.ToAgeRecipient()
+	}
+
+	// Try FIDO2 recipient (starts with "age1fido2")
+	if IsFIDO2Recipient(pubKey) {
+		recipient, err := ParseFIDO2Recipient(pubKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse FIDO2 recipient %q: %w", pubKey, err)
+		}
+		return recipient, nil
+	}
+
+	// Try SSH key (starts with "ssh-")
 	if strings.HasPrefix(pubKey, "ssh-") || strings.HasPrefix(pubKey, "ecdsa-") {
 		recipient, err := agessh.ParseRecipient(pubKey)
 		if err != nil {
@@ -282,6 +302,8 @@ type KeyType string
 
 const (
 	KeyTypeAge        KeyType = "age"
+	KeyTypeYubiKey    KeyType = "yubikey"
+	KeyTypeFIDO2      KeyType = "fido2"
 	KeyTypeSSHEd25519 KeyType = "ssh-ed25519"
 	KeyTypeSSHRSA     KeyType = "ssh-rsa"
 	KeyTypeSSHECDSA   KeyType = "ecdsa"
@@ -292,6 +314,10 @@ const (
 func DetectKeyType(pubKey string) KeyType {
 	pubKey = strings.TrimSpace(pubKey)
 	switch {
+	case yubikey.IsYubiKeyRecipient(pubKey):
+		return KeyTypeYubiKey
+	case IsFIDO2Recipient(pubKey):
+		return KeyTypeFIDO2
 	case strings.HasPrefix(pubKey, "age1"):
 		return KeyTypeAge
 	case strings.HasPrefix(pubKey, "ssh-ed25519"):
@@ -309,4 +335,9 @@ func DetectKeyType(pubKey string) KeyType {
 func IsSSHKey(pubKey string) bool {
 	keyType := DetectKeyType(pubKey)
 	return keyType == KeyTypeSSHEd25519 || keyType == KeyTypeSSHRSA || keyType == KeyTypeSSHECDSA
+}
+
+// IsYubiKeyRecipient returns true if the string is a YubiKey recipient
+func IsYubiKeyRecipient(pubKey string) bool {
+	return yubikey.IsYubiKeyRecipient(pubKey)
 }

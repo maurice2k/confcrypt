@@ -257,7 +257,7 @@ func TestGetPublicKeyForInit_ExplicitFlags(t *testing.T) {
 		// Set up env var for auto-detection
 		t.Setenv("SOPS_AGE_KEY_FILE", ageKeyPath)
 
-		initAgeKeyFile = autoDetectMarker // This is what Cobra sets when --age-key is used without value
+		initAgeKeyFile = AutoDetectMarker // This is what Cobra sets when --age-key is used without value
 		initSSHKeyFile = ""
 
 		pubKey, keyType, err := getPublicKeyForInit()
@@ -287,7 +287,7 @@ func TestGetPublicKeyForInit_ExplicitFlags(t *testing.T) {
 		t.Setenv("HOME", tmpDir)
 
 		initAgeKeyFile = ""
-		initSSHKeyFile = autoDetectMarker // This is what Cobra sets when --ssh-key is used without value
+		initSSHKeyFile = AutoDetectMarker // This is what Cobra sets when --ssh-key is used without value
 
 		pubKey, keyType, err := getPublicKeyForInit()
 		if err != nil {
@@ -314,7 +314,7 @@ func TestGetPublicKeyForInit_ExplicitFlags(t *testing.T) {
 		t.Setenv("CONFCRYPT_AGE_KEY_FILE", "")
 		t.Setenv("HOME", tmpDir)
 
-		initAgeKeyFile = autoDetectMarker
+		initAgeKeyFile = AutoDetectMarker
 		initSSHKeyFile = ""
 
 		// Should fail because no age key exists, even though SSH key does
@@ -396,7 +396,7 @@ func TestGetPublicKeyForInit_EnvironmentVariables(t *testing.T) {
 	})
 }
 
-func TestAutoDetectPublicKey(t *testing.T) {
+func TestDetectPublicKey(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Generate test age key
@@ -408,7 +408,7 @@ func TestAutoDetectPublicKey(t *testing.T) {
 	t.Run("auto-detect from SOPS_AGE_KEY_FILE", func(t *testing.T) {
 		t.Setenv("SOPS_AGE_KEY_FILE", ageKeyPath)
 
-		pubKey, keyType, err := autoDetectPublicKey()
+		pubKey, keyType, err := detectPublicKey()
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
