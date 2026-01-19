@@ -306,6 +306,14 @@ func (c *Config) HasSecrets() bool {
 	return c.Confcrypt != nil && len(c.Confcrypt.Store) > 0
 }
 
+// ClearSecrets removes all encrypted secrets from the store.
+// This triggers a fresh AES key generation on the next encryption.
+func (c *Config) ClearSecrets() {
+	if c.Confcrypt != nil {
+		c.Confcrypt.Store = nil
+	}
+}
+
 // ConfigDir returns the directory containing the config file
 func (c *Config) ConfigDir() string {
 	return c.configDir

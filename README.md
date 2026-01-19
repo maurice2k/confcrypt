@@ -116,22 +116,23 @@ keys_exclude:
 confcrypt [command] [options]
 
 Commands:
-  init           Initialize a new .confcrypt.yml config file
-  encrypt        Encrypt matching keys (default)
-  decrypt        Decrypt encrypted values
-  check          Check for unencrypted keys (exit 1 if found)
-  rekey          Rotate the AES-256 key and re-encrypt all values
-  recipient-add  Add a recipient (public key required, --name optional)
-  recipient-rm   Remove a recipient by public key (rekeys by default)
+  init            Initialize a new .confcrypt.yml config file
+  encrypt         Encrypt matching keys (default)
+  decrypt         Decrypt encrypted values
+  check           Check for unencrypted keys (exit 1 if found)
+  rekey           Rotate the AES-256 key and re-encrypt all values
+  recipient add   Add a recipient (public key required, --name optional)
+  recipient rm    Remove a recipient by public key (rekeys by default)
 
 Options:
-  -path string      Base path where .confcrypt.yml is located (default: current directory)
-  -config string    Path to .confcrypt.yml config file (overrides -path)
-  -file string      Process a specific file only
-  -stdout           Output to stdout instead of modifying files in-place
-  -force            Continue decryption even if MAC verification fails
-  -version          Show version
-  -help             Show help
+  --path string        Base path where .confcrypt.yml is located (default: current directory)
+  --config string      Path to .confcrypt.yml config file (overrides --path)
+  --file string        Process a specific file only
+  --stdout             Output to stdout instead of modifying files in-place
+  --output-path string Write decrypted files to this directory (decrypt only)
+  --force              Continue decryption even if MAC verification fails
+  --version            Show version
+  --help               Show help
 ```
 
 ## Examples
@@ -216,6 +217,20 @@ confcrypt check
 ```bash
 confcrypt decrypt --stdout config.yml
 ```
+
+### Decrypt to a different directory
+
+```bash
+# Decrypt to a separate directory (preserves encrypted source files)
+confcrypt decrypt --output-path ./decrypted/
+
+# Use absolute path
+confcrypt decrypt --output-path /tmp/decrypted-configs/
+```
+
+When using `--output-path`:
+- Decrypted files are written to the specified directory, preserving the relative path structure
+- Source files remain encrypted
 
 ## Managing Recipients
 
