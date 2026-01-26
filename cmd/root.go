@@ -15,10 +15,12 @@ import (
 	"github.com/maurice2k/confcrypt/internal/yubikey"
 )
 
-const (
-	version          = "1.5.0"
-	AutoDetectMarker = "auto"
-)
+// version can be overridden at build time via:
+//
+//	go build -ldflags "-X github.com/maurice2k/confcrypt/cmd.version=x.y.z"
+var version = "dev"
+
+const AutoDetectMarker = "auto"
 
 var (
 	// Global flags

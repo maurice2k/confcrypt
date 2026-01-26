@@ -96,6 +96,38 @@ go install github.com/maurice2k/confcrypt@latest
 
 **Note:** This builds without CGO, so FIDO2 support is disabled.
 
+### Build from source using Makefile
+
+The project includes a Makefile with convenient build targets:
+
+```bash
+git clone https://github.com/maurice2k/confcrypt.git
+cd confcrypt
+
+# Build with CGO (FIDO2 support, requires libfido2)
+make build
+
+# Install to $GOPATH/bin (with CGO)
+make install
+
+# Build without CGO (no FIDO2 support, but portable)
+make build-nocgo
+
+# Install to $GOPATH/bin (without CGO)
+make install-nocgo
+
+# Cross-compile for all platforms (without CGO)
+make build-all-nocgo
+
+# Run tests
+make test
+
+# See all available targets
+make help
+```
+
+The Makefile automatically detects macOS with Homebrew and sets the correct CGO flags for libfido2.
+
 ### Build from source with CGO (FIDO2 support)
 
 For full FIDO2 hmac-secret support, you need to build with CGO enabled and `libfido2` installed.
@@ -115,15 +147,19 @@ sudo dnf install libfido2-devel
 
 **2. Build with CGO:**
 
-On Linux, this usually works out of the box:
+Using the Makefile (recommended):
 
 ```bash
-git clone https://github.com/maurice2k/confcrypt.git
-cd confcrypt
+make build
+```
+
+Or manually on Linux:
+
+```bash
 CGO_ENABLED=1 go build -o confcrypt .
 ```
 
-On macOS, you may need to specify library paths via `CGO_LDFLAGS` and `CGO_CFLAGS` if Go can't find the Homebrew-installed libraries automatically:
+On macOS without the Makefile, you may need to specify library paths:
 
 ```bash
 # macOS (Apple Silicon)

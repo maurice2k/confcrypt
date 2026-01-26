@@ -1,4 +1,6 @@
 confcrypt
+confcrypt-*
+build/
 testdata/
 .confcrypt.yml
 .idea/
