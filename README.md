@@ -227,15 +227,21 @@ Commands:
   recipient add   Add a recipient (public key required, --name optional)
   recipient rm    Remove a recipient by public key (rekeys by default)
 
-Options:
+Global Options:
   --path string        Base path where .confcrypt.yml is located (default: current directory)
   --config string      Path to .confcrypt.yml config file (overrides --path)
   --file string        Process a specific file only
   --stdout             Output to stdout instead of modifying files in-place
-  --output-path string Write decrypted files to this directory (decrypt only)
-  --force              Continue decryption even if MAC verification fails
   --version            Show version
   --help               Show help
+
+Encrypt Options:
+  --dry-run            Show what would be encrypted without making changes
+  --json               Output encrypted fields in JSON format
+
+Decrypt Options:
+  --output-path string Write decrypted files to this directory
+  --force              Continue decryption even if MAC verification fails
 ```
 
 ## Examples
@@ -305,6 +311,33 @@ keys_include:
     type: exact
   - key: "/literal/slashes/"
     type: exact
+```
+
+### Preview encryption (dry-run)
+
+```bash
+# Show what would be encrypted (human-readable)
+confcrypt encrypt --dry-run
+
+# Show what would be encrypted (JSON format)
+confcrypt encrypt --dry-run --json
+```
+
+### JSON output
+
+```bash
+# Encrypt and output what was encrypted in JSON format
+confcrypt encrypt --json
+```
+
+Output format:
+```json
+{
+  "files": {
+    "config.yml": ["database.password", "api.api_key"],
+    "secrets.json": ["credentials.token"]
+  }
+}
 ```
 
 ### Check for unencrypted secrets (CI usage)
