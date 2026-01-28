@@ -1022,3 +1022,277 @@ api:
 		t.Error("Blank line before 'timeout:' not preserved after decryption")
 	}
 }
+
+func TestProcessorEnvFileEncryptDecrypt(t *testing.T) {
+	dir := t.TempDir()
+
+	identity, err := crypto.GenerateAgeKeypair()
+	if err != nil {
+		t.Fatalf("Failed to generate keypair: %v", err)
+	}
+
+	// Create config with .env file pattern and keys to encrypt
+	cfg := &config.Config{
+		Recipients: []config.RecipientConfig{
+			{Name: "test", Age: identity.Recipient().String()},
+		},
+		Files: []string{"*.env", ".env*"},
+		KeysInclude: []interface{}{
+			"/.*_PASSWORD$/",
+			"/.*_SECRET$/",
+			"API_KEY",
+		},
+	}
+
+	configPath := filepath.Join(dir, ".confcrypt.yml")
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("Failed to marshal config: %v", err)
+	}
+	if err := os.WriteFile(configPath, data, 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	cfg, err = config.Load(configPath)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	// Create test .env file
+	testFile := filepath.Join(dir, ".env")
+	testContent := `# Database configuration
+DB_HOST=localhost
+DB_PORT=5432
+DB_PASSWORD=supersecret123
+
+# API configuration
+API_KEY=myapikey456
+API_URL=https://api.example.com
+
+# App config
+APP_SECRET=topsecret789
+DEBUG=true
+`
+	if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
+	}
+
+	// Create processor and encrypt
+	proc, err := NewProcessor(cfg, nil)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+
+	if err := proc.SetupEncryption(); err != nil {
+		t.Fatalf("Failed to setup encryption: %v", err)
+	}
+
+	output, modified, err := proc.ProcessFile(testFile, true)
+	if err != nil {
+		t.Fatalf("Failed to encrypt: %v", err)
+	}
+
+	if !modified {
+		t.Error("Expected file to be modified")
+	}
+
+	outputStr := string(output)
+
+	// Verify encrypted values
+	if !strings.Contains(outputStr, "ENC[AES256_GCM,") {
+		t.Error("Expected encrypted values in output")
+	}
+
+	// Verify non-secret values are NOT encrypted
+	if !strings.Contains(outputStr, "DB_HOST=localhost") {
+		t.Error("DB_HOST should not be encrypted")
+	}
+	if !strings.Contains(outputStr, "DB_PORT=5432") {
+		t.Error("DB_PORT should not be encrypted")
+	}
+	if !strings.Contains(outputStr, "DEBUG=true") {
+		t.Error("DEBUG should not be encrypted")
+	}
+
+	// Verify comments are preserved
+	if !strings.Contains(outputStr, "# Database configuration") {
+		t.Error("Comments should be preserved")
+	}
+
+	// Write encrypted file
+	if err := os.WriteFile(testFile, output, 0644); err != nil {
+		t.Fatalf("Failed to write encrypted file: %v", err)
+	}
+
+	// Save secrets
+	if err := proc.SaveEncryptedSecrets(); err != nil {
+		t.Fatalf("Failed to save secrets: %v", err)
+	}
+
+	// Create new processor for decryption
+	proc2, err := NewProcessor(cfg, nil)
+	if err != nil {
+		t.Fatalf("Failed to create processor for decryption: %v", err)
+	}
+
+	if _, err := proc2.SetupDecryption([]age.Identity{identity}); err != nil {
+		t.Fatalf("Failed to setup decryption: %v", err)
+	}
+
+	decrypted, modified, err := proc2.ProcessFile(testFile, false)
+	if err != nil {
+		t.Fatalf("Failed to decrypt: %v", err)
+	}
+
+	if !modified {
+		t.Error("Expected file to be modified during decryption")
+	}
+
+	decryptedStr := string(decrypted)
+
+	// Verify decrypted values
+	if strings.Contains(decryptedStr, "ENC[AES256_GCM,") {
+		t.Error("Expected no encrypted values after decryption")
+	}
+
+	// Values may be quoted or unquoted after decryption
+	if !strings.Contains(decryptedStr, "supersecret123") {
+		t.Error("Expected original DB_PASSWORD value")
+	}
+	if !strings.Contains(decryptedStr, "myapikey456") {
+		t.Error("Expected original API_KEY value")
+	}
+	if !strings.Contains(decryptedStr, "topsecret789") {
+		t.Error("Expected original APP_SECRET value")
+	}
+
+	// Verify structure preserved
+	if !strings.Contains(decryptedStr, "# Database configuration") {
+		t.Error("Comments should be preserved after decryption")
+	}
+}
+
+func TestProcessorEnvFileCheck(t *testing.T) {
+	dir := t.TempDir()
+
+	identity, _ := crypto.GenerateAgeKeypair()
+
+	cfg := &config.Config{
+		Recipients: []config.RecipientConfig{
+			{Name: "test", Age: identity.Recipient().String()},
+		},
+		Files: []string{"*.env"},
+		KeysInclude: []interface{}{
+			"DB_PASSWORD",
+			"API_KEY",
+		},
+	}
+
+	configPath := filepath.Join(dir, ".confcrypt.yml")
+	data, _ := yaml.Marshal(cfg)
+	os.WriteFile(configPath, data, 0644)
+	cfg, _ = config.Load(configPath)
+
+	testFile := filepath.Join(dir, "app.env")
+	testContent := `DB_HOST=localhost
+DB_PASSWORD=secret
+API_KEY=mykey
+DEBUG=true`
+	os.WriteFile(testFile, []byte(testContent), 0644)
+
+	proc, _ := NewProcessor(cfg, nil)
+
+	// Check should find unencrypted values
+	results, err := proc.CheckFile(testFile)
+	if err != nil {
+		t.Fatalf("CheckFile() error = %v", err)
+	}
+
+	if len(results) != 2 {
+		t.Errorf("Expected 2 unencrypted keys, got %d", len(results))
+	}
+
+	foundPassword := false
+	foundApiKey := false
+	for _, r := range results {
+		if r.KeyName == "DB_PASSWORD" {
+			foundPassword = true
+		}
+		if r.KeyName == "API_KEY" {
+			foundApiKey = true
+		}
+	}
+
+	if !foundPassword {
+		t.Error("Expected to find DB_PASSWORD as unencrypted")
+	}
+	if !foundApiKey {
+		t.Error("Expected to find API_KEY as unencrypted")
+	}
+}
+
+func TestProcessorEnvQuotePreservation(t *testing.T) {
+	dir := t.TempDir()
+
+	identity, err := crypto.GenerateAgeKeypair()
+	if err != nil {
+		t.Fatalf("Failed to generate keypair: %v", err)
+	}
+
+	cfg := &config.Config{
+		Recipients: []config.RecipientConfig{
+			{Name: "test", Age: identity.Recipient().String()},
+		},
+		Files: []string{"*.env"},
+		KeysInclude: []interface{}{
+			"UNQUOTED_SECRET",
+			"QUOTED_SECRET",
+		},
+	}
+
+	configPath := filepath.Join(dir, ".confcrypt.yml")
+	data, _ := yaml.Marshal(cfg)
+	os.WriteFile(configPath, data, 0644)
+	cfg, _ = config.Load(configPath)
+
+	// Create test file with mixed quoting
+	testFile := filepath.Join(dir, ".env")
+	testContent := `# Test quote preservation
+UNQUOTED_SECRET=mysecret
+QUOTED_SECRET="anothersecret"
+NORMAL_VAR=value
+`
+	os.WriteFile(testFile, []byte(testContent), 0644)
+
+	// Encrypt
+	proc, _ := NewProcessor(cfg, nil)
+	proc.SetupEncryption()
+	encrypted, _, _ := proc.ProcessFile(testFile, true)
+	encryptedStr := string(encrypted)
+
+	// Both ENC values are unquoted (the quotes are inside the encrypted payload for quoted values)
+	if !strings.Contains(encryptedStr, `UNQUOTED_SECRET=ENC[AES256_GCM,`) {
+		t.Errorf("Encrypted UNQUOTED_SECRET should have ENC value, got:\n%s", encryptedStr)
+	}
+	if !strings.Contains(encryptedStr, `QUOTED_SECRET=ENC[AES256_GCM,`) {
+		t.Errorf("Encrypted QUOTED_SECRET should have ENC value, got:\n%s", encryptedStr)
+	}
+
+	// Write encrypted file and save secrets
+	os.WriteFile(testFile, encrypted, 0644)
+	proc.SaveEncryptedSecrets()
+
+	// Decrypt
+	proc2, _ := NewProcessor(cfg, nil)
+	proc2.SetupDecryption([]age.Identity{identity})
+	decrypted, _, _ := proc2.ProcessFile(testFile, false)
+	decryptedStr := string(decrypted)
+
+	// Verify original quote styles are restored (raw bytes preserved)
+	if !strings.Contains(decryptedStr, "UNQUOTED_SECRET=mysecret") {
+		t.Errorf("Decrypted UNQUOTED_SECRET should be unquoted, got:\n%s", decryptedStr)
+	}
+	if !strings.Contains(decryptedStr, `QUOTED_SECRET="anothersecret"`) {
+		t.Errorf("Decrypted QUOTED_SECRET should be quoted, got:\n%s", decryptedStr)
+	}
+}

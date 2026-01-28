@@ -24,6 +24,7 @@ type FileFormat int
 const (
 	FormatYAML FileFormat = iota
 	FormatJSON
+	FormatEnv
 )
 
 // IdentityLoader is a function that loads age identities
@@ -202,6 +203,16 @@ func (p *Processor) ProcessFile(filePath string, encrypt bool) ([]byte, bool, er
 			return content, false, nil
 		}
 		output, err = marshalJSON(content, data)
+	case FormatEnv:
+		var envFile *EnvFile
+		envFile, modified, err = p.processEnv(content, encrypt)
+		if err != nil {
+			return nil, false, err
+		}
+		if !modified {
+			return content, false, nil
+		}
+		output = envFile.Marshal()
 	default:
 		return nil, false, fmt.Errorf("unsupported file format")
 	}
@@ -383,6 +394,66 @@ func (p *Processor) processJSON(content []byte, encrypt bool) (interface{}, bool
 	return data, modified, nil
 }
 
+// processEnv processes .env file content
+func (p *Processor) processEnv(content []byte, encrypt bool) (*EnvFile, bool, error) {
+	envFile, err := ParseEnvFile(content)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to parse .env file: %w", err)
+	}
+
+	modified := false
+
+	for i, line := range envFile.Lines {
+		if line.Type != EnvLineKeyValue {
+			continue
+		}
+
+		key := line.Key
+		path := []string{key} // Flat structure - key is at root level
+
+		if encrypt {
+			if p.matcher.ShouldEncrypt(key, path) {
+				if !format.IsEncrypted(line.Value) {
+					// Encrypt raw value (including quotes if present)
+					ciphertext, iv, tag, err := crypto.EncryptAESGCM(p.aesKey, []byte(line.Value))
+					if err != nil {
+						return nil, false, fmt.Errorf("failed to encrypt %s: %w", key, err)
+					}
+
+					ev := &format.EncryptedValue{
+						Data: ciphertext,
+						IV:   iv,
+						Tag:  tag,
+						Type: format.TypeString,
+					}
+
+					envFile.Lines[i].Value = format.FormatEncryptedValue(ev)
+					modified = true
+				}
+			}
+		} else {
+			// Decrypt if encrypted
+			if format.IsEncrypted(line.Value) {
+				ev, err := format.ParseEncryptedValue(line.Value)
+				if err != nil {
+					return nil, false, fmt.Errorf("failed to parse encrypted value for %s: %w", key, err)
+				}
+
+				plaintext, err := crypto.DecryptAESGCM(p.aesKey, ev.Data, ev.IV, ev.Tag)
+				if err != nil {
+					return nil, false, fmt.Errorf("failed to decrypt %s: %w", key, err)
+				}
+
+				// Decrypted value includes original quotes if they were present
+				envFile.Lines[i].Value = string(plaintext)
+				modified = true
+			}
+		}
+	}
+
+	return envFile, modified, nil
+}
+
 // transformData recursively transforms data for encryption/decryption
 func (p *Processor) transformData(data *interface{}, path []string, encrypt bool) (bool, error) {
 	modified := false
@@ -500,6 +571,19 @@ func (p *Processor) CheckFile(filePath string) ([]MatchResult, error) {
 		if err := json.Unmarshal(content, &data); err != nil {
 			return nil, fmt.Errorf("failed to parse JSON: %w", err)
 		}
+	case FormatEnv:
+		envFile, err := ParseEnvFile(content)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse .env file: %w", err)
+		}
+		// Convert to map[string]interface{} for matcher
+		m := make(map[string]interface{})
+		for _, line := range envFile.Lines {
+			if line.Type == EnvLineKeyValue {
+				m[line.Key] = line.Value
+			}
+		}
+		data = m
 	default:
 		return nil, fmt.Errorf("unsupported file format")
 	}
@@ -535,6 +619,19 @@ func (p *Processor) ComputeMAC(content []byte, fileFormat FileFormat) ([]byte, e
 		if err := json.Unmarshal(content, &data); err != nil {
 			return nil, fmt.Errorf("failed to parse JSON: %w", err)
 		}
+	case FormatEnv:
+		envFile, err := ParseEnvFile(content)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse .env file: %w", err)
+		}
+		// Convert to map[string]interface{} for collectEncryptedValues
+		m := make(map[string]interface{})
+		for _, line := range envFile.Lines {
+			if line.Type == EnvLineKeyValue {
+				m[line.Key] = line.Value
+			}
+		}
+		data = m
 	default:
 		return nil, fmt.Errorf("unsupported file format")
 	}
@@ -643,6 +740,18 @@ func (p *Processor) HasEncryptedValues(content []byte, filePath string) bool {
 		if err := json.Unmarshal(content, &data); err != nil {
 			return false
 		}
+	case FormatEnv:
+		envFile, err := ParseEnvFile(content)
+		if err != nil {
+			return false
+		}
+		m := make(map[string]interface{})
+		for _, line := range envFile.Lines {
+			if line.Type == EnvLineKeyValue {
+				m[line.Key] = line.Value
+			}
+		}
+		data = m
 	default:
 		return false
 	}
@@ -665,6 +774,18 @@ func (p *Processor) HasUnencryptedValues(content []byte, filePath string) bool {
 		if err := json.Unmarshal(content, &data); err != nil {
 			return false
 		}
+	case FormatEnv:
+		envFile, err := ParseEnvFile(content)
+		if err != nil {
+			return false
+		}
+		m := make(map[string]interface{})
+		for _, line := range envFile.Lines {
+			if line.Type == EnvLineKeyValue {
+				m[line.Key] = line.Value
+			}
+		}
+		data = m
 	default:
 		return false
 	}
@@ -730,7 +851,14 @@ func (p *Processor) UpdateMAC(filePath string, content []byte) error {
 
 // DetectFormat determines the file format from extension
 func DetectFormat(filePath string) FileFormat {
+	base := filepath.Base(filePath)
 	ext := strings.ToLower(filepath.Ext(filePath))
+
+	// Check for .env files: .env, *.env (e.g., database.env), .env.* (e.g., .env.local)
+	if base == ".env" || ext == ".env" || strings.HasPrefix(base, ".env.") {
+		return FormatEnv
+	}
+
 	switch ext {
 	case ".json":
 		return FormatJSON
