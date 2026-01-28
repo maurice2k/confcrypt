@@ -200,6 +200,13 @@ files:
   - "*.yaml"
   - "*.json"
 
+# Optional: Rename files during encrypt/decrypt
+rename_files:
+  encrypt:
+    - /(\.\w+)$/.enc\1/     # config.yml -> config.enc.yml
+  decrypt:
+    - /\.enc(\.\w+)$/\1/    # config.enc.yml -> config.yml
+
 # Keys to encrypt (exact match, /regex/, or $path)
 # Regex patterns are case-insensitive by default
 keys_include:
@@ -367,6 +374,36 @@ confcrypt decrypt --output-path /tmp/decrypted-configs/
 When using `--output-path`:
 - Decrypted files are written to the specified directory, preserving the relative path structure
 - Source files remain encrypted
+
+### Automatic file renaming
+
+You can configure *confcrypt* to rename files during encryption/decryption using regex patterns:
+
+```yaml
+rename_files:
+  encrypt:
+    - /(\.\w+)$/.enc\1/     # config.yml -> config.enc.yml
+  decrypt:
+    - /\.enc(\.\w+)$/\1/    # config.enc.yml -> config.yml
+```
+
+The pattern format is `/regex/replacement/` where:
+- `regex` is matched against the filename (not the full path)
+- `replacement` can use `\1`, `\2`, etc. for capture groups
+- Multiple patterns are checked in order; processing stops at the first match
+- If no pattern matches, the filename remains unchanged
+
+**Example workflow:**
+```bash
+# Encrypt: config.yml -> config.enc.yml (original deleted)
+confcrypt encrypt
+
+# Decrypt: config.enc.yml -> config.yml (encrypted deleted)
+confcrypt decrypt
+
+# Decrypt to output dir: config.enc.yml stays, config.yml created in output dir
+confcrypt decrypt --output-path ./decrypted/
+```
 
 ## Managing Recipients
 

@@ -140,17 +140,43 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 				fmt.Print(string(output))
 				fmt.Println()
 			} else {
-				if err := proc.WriteFile(file, output); err != nil {
-					fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", relPath, err)
+				// Compute renamed path
+				renamedFile, err := cfg.GetEncryptRename(file)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error computing rename for %s: %v\n", relPath, err)
 					os.Exit(1)
 				}
-				// Update MAC for the file
-				if err := proc.UpdateMAC(file, output); err != nil {
-					fmt.Fprintf(os.Stderr, "Error updating MAC for %s: %v\n", relPath, err)
+
+				// Write to the renamed path directly
+				if err := proc.WriteFile(renamedFile, output); err != nil {
+					fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", renamedFile, err)
 					os.Exit(1)
 				}
+
+				// If renamed, delete the original file
+				if renamedFile != file {
+					if err := os.Remove(file); err != nil {
+						fmt.Fprintf(os.Stderr, "Error removing original file %s: %v\n", relPath, err)
+						os.Exit(1)
+					}
+				}
+
+				// Update MAC for the renamed file
+				renamedRelPath, _ := filepath.Rel(cfg.ConfigDir(), renamedFile)
+				if renamedRelPath == "" {
+					renamedRelPath = renamedFile
+				}
+				if err := proc.UpdateMAC(renamedFile, output); err != nil {
+					fmt.Fprintf(os.Stderr, "Error updating MAC for %s: %v\n", renamedRelPath, err)
+					os.Exit(1)
+				}
+
 				if !jsonOutput {
-					fmt.Printf("Encrypted: %s\n", relPath)
+					if renamedFile != file {
+						fmt.Printf("Encrypted: %s -> %s\n", relPath, renamedRelPath)
+					} else {
+						fmt.Printf("Encrypted: %s\n", relPath)
+					}
 				}
 			}
 		}
@@ -191,8 +217,9 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 
 // runEncryptDryRun handles --dry-run and --json output modes
 func runEncryptDryRun(proc *processor.Processor, cfg *config.Config, files []string) {
-	// Collect unencrypted keys per file
+	// Collect unencrypted keys per file (with renamed paths)
 	result := make(map[string][]string)
+	renames := make(map[string]string) // original -> renamed
 
 	for _, file := range files {
 		unencrypted, err := proc.CheckFile(file)
@@ -206,7 +233,18 @@ func runEncryptDryRun(proc *processor.Processor, cfg *config.Config, files []str
 			for _, r := range unencrypted {
 				fields = append(fields, strings.Join(r.Path, "."))
 			}
-			result[file] = fields
+
+			// Compute renamed path for output
+			renamedFile, err := cfg.GetEncryptRename(file)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error computing rename for %s: %v\n", file, err)
+				os.Exit(1)
+			}
+
+			result[renamedFile] = fields
+			if renamedFile != file {
+				renames[file] = renamedFile
+			}
 		}
 	}
 
@@ -235,7 +273,26 @@ func runEncryptDryRun(proc *processor.Processor, cfg *config.Config, files []str
 			if relPath == "" {
 				relPath = file
 			}
-			fmt.Printf("  %s:\n", relPath)
+
+			// Check if this is a renamed file
+			var originalFile string
+			for orig, renamed := range renames {
+				if renamed == file {
+					originalFile = orig
+					break
+				}
+			}
+
+			if originalFile != "" {
+				origRelPath, _ := filepath.Rel(cfg.ConfigDir(), originalFile)
+				if origRelPath == "" {
+					origRelPath = originalFile
+				}
+				fmt.Printf("  %s -> %s:\n", origRelPath, relPath)
+			} else {
+				fmt.Printf("  %s:\n", relPath)
+			}
+
 			for _, field := range fields {
 				fmt.Printf("    - %s\n", field)
 			}

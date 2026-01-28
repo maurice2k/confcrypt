@@ -4,10 +4,13 @@
 # Binary name
 BINARY_NAME := confcrypt
 
-# Version from git tag only (falls back to "dev" if no tag)
+# Version from git tag, with -dev-<branch> suffix if working tree is dirty
 # Strips leading "v" from tags like "v1.5.0" -> "1.5.0"
-GIT_TAG := $(shell git describe --tags --exact-match 2>/dev/null)
-VERSION ?= $(if $(GIT_TAG),$(patsubst v%,%,$(GIT_TAG)),dev)
+GIT_TAG := $(shell git describe --tags --abbrev=0 2>/dev/null)
+GIT_DIRTY := $(shell git status --porcelain 2>/dev/null | head -1)
+GIT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null)
+BASE_VERSION := $(if $(GIT_TAG),$(patsubst v%,%,$(GIT_TAG)),dev)
+VERSION ?= $(if $(GIT_DIRTY),$(BASE_VERSION)-dev-$(GIT_BRANCH),$(BASE_VERSION))
 
 # Go parameters
 GOCMD := go

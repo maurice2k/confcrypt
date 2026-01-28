@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"time"
 
 	"filippo.io/age"
@@ -17,15 +19,22 @@ var Version = "1.0.0" // Set by main package at startup
 
 // Config represents the .confcrypt.yml configuration file
 type Config struct {
-	Recipients  []RecipientConfig `yaml:"recipients"`
-	Files       []string          `yaml:"files"`
-	KeysInclude []interface{}     `yaml:"keys_include"` // Can be string or KeyRule
-	KeysExclude []interface{}     `yaml:"keys_exclude"` // Can be string or KeyRule
-	Confcrypt   *ConfcryptSection `yaml:".confcrypt,omitempty"`
+	Recipients  []RecipientConfig  `yaml:"recipients"`
+	Files       []string           `yaml:"files"`
+	RenameFiles *RenameFilesConfig `yaml:"rename_files,omitempty"`
+	KeysInclude []interface{}      `yaml:"keys_include"` // Can be string or KeyRule
+	KeysExclude []interface{}      `yaml:"keys_exclude"` // Can be string or KeyRule
+	Confcrypt   *ConfcryptSection  `yaml:".confcrypt,omitempty"`
 
 	// Internal fields (not serialized)
 	configPath string
 	configDir  string
+}
+
+// RenameFilesConfig represents file renaming rules for encrypt/decrypt
+type RenameFilesConfig struct {
+	Encrypt []string `yaml:"encrypt,omitempty"`
+	Decrypt []string `yaml:"decrypt,omitempty"`
 }
 
 // ConfcryptSection represents the .confcrypt metadata section
@@ -418,4 +427,139 @@ func validateKeyRuleType(rule KeyRule) error {
 	default:
 		return fmt.Errorf("invalid key rule type: %q (must be exact, regex, or path)", rule.Type)
 	}
+}
+
+// ParseRenameRule parses a rename rule in /pattern/replacement/ format
+// Returns the compiled regex and replacement string
+func ParseRenameRule(rule string) (*regexp.Regexp, string, error) {
+	if len(rule) < 3 || rule[0] != '/' {
+		return nil, "", fmt.Errorf("rename rule must be in /pattern/replacement/ format")
+	}
+
+	// Find the second slash (end of pattern)
+	// Handle escaped slashes in pattern
+	patternEnd := -1
+	for i := 1; i < len(rule); i++ {
+		if rule[i] == '/' && (i == 1 || rule[i-1] != '\\') {
+			patternEnd = i
+			break
+		}
+	}
+
+	if patternEnd == -1 {
+		return nil, "", fmt.Errorf("rename rule must be in /pattern/replacement/ format: missing second /")
+	}
+
+	// Find the third slash (end of replacement)
+	replacementEnd := -1
+	for i := patternEnd + 1; i < len(rule); i++ {
+		if rule[i] == '/' && (i == patternEnd+1 || rule[i-1] != '\\') {
+			replacementEnd = i
+			break
+		}
+	}
+
+	if replacementEnd == -1 {
+		return nil, "", fmt.Errorf("rename rule must be in /pattern/replacement/ format: missing third /")
+	}
+
+	pattern := rule[1:patternEnd]
+	replacement := rule[patternEnd+1 : replacementEnd]
+
+	// Compile the regex
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid regex pattern %q: %w", pattern, err)
+	}
+
+	// Convert \1, \2 etc. to $1, $2 for Go's regexp replacement
+	replacement = convertBackreferences(replacement)
+
+	return re, replacement, nil
+}
+
+// convertBackreferences converts \1, \2, etc. to $1, $2 for Go regexp
+func convertBackreferences(s string) string {
+	result := strings.Builder{}
+	i := 0
+	for i < len(s) {
+		if i+1 < len(s) && s[i] == '\\' {
+			next := s[i+1]
+			if next >= '0' && next <= '9' {
+				// Convert \N to $N
+				result.WriteByte('$')
+				result.WriteByte(next)
+				i += 2
+				continue
+			} else if next == '\\' {
+				// Escaped backslash
+				result.WriteByte('\\')
+				i += 2
+				continue
+			}
+		}
+		result.WriteByte(s[i])
+		i++
+	}
+	return result.String()
+}
+
+// ApplyRenameRules applies a list of rename rules to a filename
+// Returns the renamed filename (rules are applied in order, first match wins)
+func ApplyRenameRules(filename string, rules []string) (string, error) {
+	for _, rule := range rules {
+		re, replacement, err := ParseRenameRule(rule)
+		if err != nil {
+			return "", err
+		}
+
+		if re.MatchString(filename) {
+			return re.ReplaceAllString(filename, replacement), nil
+		}
+	}
+	return filename, nil
+}
+
+// GetEncryptRename returns the renamed path for encryption
+// Applies rename_files.encrypt rules to the filename (basename only)
+func (c *Config) GetEncryptRename(filePath string) (string, error) {
+	if c.RenameFiles == nil || len(c.RenameFiles.Encrypt) == 0 {
+		return filePath, nil
+	}
+
+	dir := filepath.Dir(filePath)
+	base := filepath.Base(filePath)
+
+	newBase, err := ApplyRenameRules(base, c.RenameFiles.Encrypt)
+	if err != nil {
+		return "", err
+	}
+
+	if newBase == base {
+		return filePath, nil
+	}
+
+	return filepath.Join(dir, newBase), nil
+}
+
+// GetDecryptRename returns the renamed path for decryption
+// Applies rename_files.decrypt rules to the filename (basename only)
+func (c *Config) GetDecryptRename(filePath string) (string, error) {
+	if c.RenameFiles == nil || len(c.RenameFiles.Decrypt) == 0 {
+		return filePath, nil
+	}
+
+	dir := filepath.Dir(filePath)
+	base := filepath.Base(filePath)
+
+	newBase, err := ApplyRenameRules(base, c.RenameFiles.Decrypt)
+	if err != nil {
+		return "", err
+	}
+
+	if newBase == base {
+		return filePath, nil
+	}
+
+	return filepath.Join(dir, newBase), nil
 }

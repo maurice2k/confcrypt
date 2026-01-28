@@ -150,6 +150,7 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 		} else if modified {
 			// Determine output file path
 			outputFile := file
+			originalFile := file
 			if decryptOutputPath != "" {
 				// Resolve output path (relative to config dir if not absolute)
 				outDir := decryptOutputPath
@@ -157,11 +158,28 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 					outDir = filepath.Join(cfg.ConfigDir(), outDir)
 				}
 				outputFile = filepath.Join(outDir, relPath)
+
+				// Apply rename rules to output path
+				renamedOutput, err := cfg.GetDecryptRename(outputFile)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error computing rename for %s: %v\n", outputFile, err)
+					os.Exit(1)
+				}
+				outputFile = renamedOutput
+
 				// Create parent directories
 				if err := os.MkdirAll(filepath.Dir(outputFile), 0755); err != nil {
 					fmt.Fprintf(os.Stderr, "Error creating directory for %s: %v\n", outputFile, err)
 					os.Exit(1)
 				}
+			} else {
+				// In-place mode: compute renamed path
+				renamedFile, err := cfg.GetDecryptRename(file)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error computing rename for %s: %v\n", relPath, err)
+					os.Exit(1)
+				}
+				outputFile = renamedFile
 			}
 
 			if err := proc.WriteFile(outputFile, output); err != nil {
@@ -169,12 +187,30 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 				os.Exit(1)
 			}
 
-			// Only remove MAC if we're overwriting the source file
-			if outputFile == file {
+			// If in-place mode and renamed, delete the original file
+			if decryptOutputPath == "" && outputFile != originalFile {
+				if err := os.Remove(originalFile); err != nil {
+					fmt.Fprintf(os.Stderr, "Error removing original file %s: %v\n", relPath, err)
+					os.Exit(1)
+				}
+			}
+
+			// Only remove MAC if we're modifying in-place (no --output-path)
+			if decryptOutputPath == "" {
 				cfg.RemoveMAC(relPath)
 				anyMACsRemoved = true
 			}
-			fmt.Printf("Decrypted: %s\n", outputFile)
+
+			// Display output
+			outputRelPath, _ := filepath.Rel(cfg.ConfigDir(), outputFile)
+			if outputRelPath == "" {
+				outputRelPath = outputFile
+			}
+			if outputFile != originalFile && decryptOutputPath == "" {
+				fmt.Printf("Decrypted: %s -> %s\n", relPath, outputRelPath)
+			} else {
+				fmt.Printf("Decrypted: %s\n", outputRelPath)
+			}
 		}
 	}
 
