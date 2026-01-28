@@ -177,32 +177,33 @@ func (p *Processor) ProcessFile(filePath string, encrypt bool) ([]byte, bool, er
 		return nil, false, fmt.Errorf("failed to read file: %w", err)
 	}
 
-	var data interface{}
+	var output []byte
 	var modified bool
 
 	switch fileFormat {
 	case FormatYAML:
-		data, modified, err = p.processYAML(content, encrypt)
+		// Use node-based processing to preserve comments
+		var node *yaml.Node
+		node, modified, err = p.processYAMLNode(content, encrypt)
+		if err != nil {
+			return nil, false, err
+		}
+		if !modified {
+			return content, false, nil
+		}
+		output, err = marshalYAMLNode(node)
 	case FormatJSON:
+		var data interface{}
 		data, modified, err = p.processJSON(content, encrypt)
+		if err != nil {
+			return nil, false, err
+		}
+		if !modified {
+			return content, false, nil
+		}
+		output, err = marshalJSON(content, data)
 	default:
 		return nil, false, fmt.Errorf("unsupported file format")
-	}
-
-	if err != nil {
-		return nil, false, err
-	}
-
-	if !modified {
-		return content, false, nil
-	}
-
-	var output []byte
-	switch fileFormat {
-	case FormatYAML:
-		output, err = marshalYAML(data)
-	case FormatJSON:
-		output, err = marshalJSON(content, data)
 	}
 
 	if err != nil {
@@ -212,25 +213,159 @@ func (p *Processor) ProcessFile(filePath string, encrypt bool) ([]byte, bool, er
 	return output, true, nil
 }
 
-// processYAML processes YAML content
-func (p *Processor) processYAML(content []byte, encrypt bool) (interface{}, bool, error) {
+// processYAMLNode processes YAML content while preserving comments
+func (p *Processor) processYAMLNode(content []byte, encrypt bool) (*yaml.Node, bool, error) {
 	var node yaml.Node
 	if err := yaml.Unmarshal(content, &node); err != nil {
 		return nil, false, fmt.Errorf("failed to parse YAML: %w", err)
 	}
 
-	// Convert to map for processing
-	var data interface{}
-	if err := node.Decode(&data); err != nil {
-		return nil, false, fmt.Errorf("failed to decode YAML: %w", err)
-	}
+	// Preserve blank lines from original before any modifications
+	preserveBlankLines(&node)
 
-	modified, err := p.transformData(&data, nil, encrypt)
+	// Transform nodes in-place, preserving comments
+	modified, err := p.transformYAMLNode(&node, nil, encrypt)
 	if err != nil {
 		return nil, false, err
 	}
 
-	return data, modified, nil
+	return &node, modified, nil
+}
+
+// transformYAMLNode recursively transforms YAML nodes for encryption/decryption
+// It modifies node values in-place, preserving all comments and structure
+func (p *Processor) transformYAMLNode(node *yaml.Node, path []string, encrypt bool) (bool, error) {
+	modified := false
+
+	switch node.Kind {
+	case yaml.DocumentNode:
+		// Document node contains the root content
+		for _, child := range node.Content {
+			childModified, err := p.transformYAMLNode(child, path, encrypt)
+			if err != nil {
+				return false, err
+			}
+			if childModified {
+				modified = true
+			}
+		}
+
+	case yaml.MappingNode:
+		// Mapping nodes have alternating key/value pairs in Content
+		for i := 0; i < len(node.Content); i += 2 {
+			keyNode := node.Content[i]
+			valueNode := node.Content[i+1]
+			key := keyNode.Value
+			currentPath := append(path, key)
+
+			if valueNode.Kind == yaml.ScalarNode {
+				// Leaf value - check if we should encrypt/decrypt
+				if encrypt {
+					if p.matcher.ShouldEncrypt(key, currentPath) {
+						if !format.IsEncrypted(valueNode.Value) {
+							encrypted, err := p.encryptScalarValue(valueNode.Value, valueNode.Tag)
+							if err != nil {
+								return false, fmt.Errorf("failed to encrypt %s: %w", strings.Join(currentPath, "."), err)
+							}
+							valueNode.Value = encrypted
+							valueNode.Tag = "!!str"
+							valueNode.Style = 0 // Reset style to let encoder choose
+							modified = true
+						}
+					}
+				} else {
+					// Decrypt if encrypted
+					if format.IsEncrypted(valueNode.Value) {
+						decrypted, originalTag, err := p.decryptScalarValue(valueNode.Value)
+						if err != nil {
+							return false, fmt.Errorf("failed to decrypt %s: %w", strings.Join(currentPath, "."), err)
+						}
+						valueNode.Value = decrypted
+						valueNode.Tag = originalTag
+						valueNode.Style = 0
+						modified = true
+					}
+				}
+			} else {
+				// Recurse into nested structures
+				childModified, err := p.transformYAMLNode(valueNode, currentPath, encrypt)
+				if err != nil {
+					return false, err
+				}
+				if childModified {
+					modified = true
+				}
+			}
+		}
+
+	case yaml.SequenceNode:
+		// Sequence nodes have items in Content
+		for _, item := range node.Content {
+			childModified, err := p.transformYAMLNode(item, path, encrypt)
+			if err != nil {
+				return false, err
+			}
+			if childModified {
+				modified = true
+			}
+		}
+	}
+
+	return modified, nil
+}
+
+// encryptScalarValue encrypts a scalar YAML value
+func (p *Processor) encryptScalarValue(value string, tag string) (string, error) {
+	// Determine value type from YAML tag
+	valueType := format.TypeString
+	switch tag {
+	case "!!int":
+		valueType = format.TypeInt
+	case "!!float":
+		valueType = format.TypeFloat
+	case "!!bool":
+		valueType = format.TypeBool
+	}
+
+	ciphertext, iv, tagBytes, err := crypto.EncryptAESGCM(p.aesKey, []byte(value))
+	if err != nil {
+		return "", err
+	}
+
+	ev := &format.EncryptedValue{
+		Data: ciphertext,
+		IV:   iv,
+		Tag:  tagBytes,
+		Type: valueType,
+	}
+
+	return format.FormatEncryptedValue(ev), nil
+}
+
+// decryptScalarValue decrypts an ENC[...] value and returns the plaintext and original YAML tag
+func (p *Processor) decryptScalarValue(encStr string) (string, string, error) {
+	ev, err := format.ParseEncryptedValue(encStr)
+	if err != nil {
+		return "", "", err
+	}
+
+	plaintext, err := crypto.DecryptAESGCM(p.aesKey, ev.Data, ev.IV, ev.Tag)
+	if err != nil {
+		return "", "", err
+	}
+
+	// Determine YAML tag from stored type
+	tag := "!!str"
+	switch ev.Type {
+	case format.TypeInt:
+		tag = "!!int"
+	case format.TypeFloat:
+		tag = "!!float"
+	case format.TypeBool:
+		tag = "!!bool"
+	}
+
+	return string(plaintext), tag, nil
 }
 
 // processJSON processes JSON content
@@ -606,12 +741,12 @@ func DetectFormat(filePath string) FileFormat {
 	}
 }
 
-// marshalYAML marshals data to YAML
-func marshalYAML(data interface{}) ([]byte, error) {
+// marshalYAMLNode marshals a yaml.Node to YAML, preserving comments and structure
+func marshalYAMLNode(node *yaml.Node) ([]byte, error) {
 	var buf bytes.Buffer
 	encoder := yaml.NewEncoder(&buf)
 	encoder.SetIndent(2)
-	if err := encoder.Encode(data); err != nil {
+	if err := encoder.Encode(node); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
@@ -641,4 +776,55 @@ func marshalJSON(original []byte, data interface{}) ([]byte, error) {
 	}
 
 	return output, nil
+}
+
+// preserveBlankLines detects gaps in line numbers and adds newlines to HeadComment
+// to preserve blank lines from the original YAML file
+func preserveBlankLines(node *yaml.Node) {
+	preserveBlankLinesRecursive(node, 0)
+}
+
+// preserveBlankLinesRecursive walks the node tree and adds newlines to HeadComment
+// where there are gaps in line numbers between siblings
+func preserveBlankLinesRecursive(node *yaml.Node, prevEndLine int) int {
+	if node == nil {
+		return prevEndLine
+	}
+
+	// If there's a gap of more than 1 line from previous sibling, add blank lines
+	if node.Line > 0 && prevEndLine > 0 {
+		// Calculate how many lines the HeadComment takes up
+		headCommentLines := 0
+		if node.HeadComment != "" {
+			// Strip any leading newlines we may have added previously
+			comment := strings.TrimLeft(node.HeadComment, "\n")
+			if comment != "" {
+				// Count actual comment lines (each line of comment text)
+				headCommentLines = strings.Count(comment, "\n") + 1
+			}
+			node.HeadComment = comment // Remove accumulated leading newlines
+		}
+
+		// Gap should account for HeadComment lines
+		gap := node.Line - prevEndLine - 1 - headCommentLines
+		if gap > 0 {
+			// Add exact number of blank lines
+			node.HeadComment = strings.Repeat("\n", gap) + node.HeadComment
+		}
+	}
+
+	currentEndLine := node.Line
+
+	// Process children - track line numbers across siblings
+	childEndLine := 0
+	for _, child := range node.Content {
+		childEndLine = preserveBlankLinesRecursive(child, childEndLine)
+	}
+
+	// The end line is the maximum of current node's line and its children's end line
+	if childEndLine > currentEndLine {
+		currentEndLine = childEndLine
+	}
+
+	return currentEndLine
 }

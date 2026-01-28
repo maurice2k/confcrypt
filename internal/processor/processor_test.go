@@ -776,3 +776,249 @@ func TestStoreNotChangedWhenAddingNewValues(t *testing.T) {
 		t.Error("New api_key not found after decryption")
 	}
 }
+
+func TestYAMLCommentPreservation(t *testing.T) {
+	// Create temp directory
+	dir := t.TempDir()
+
+	// Generate keypair
+	identity, err := crypto.GenerateAgeKeypair()
+	if err != nil {
+		t.Fatalf("Failed to generate keypair: %v", err)
+	}
+
+	// Create config
+	cfg := createTestConfig(t, dir, []config.RecipientConfig{
+		{Name: "test", Age: identity.Recipient().String()},
+	})
+
+	// Create test file with comments
+	testFile := filepath.Join(dir, "test.yml")
+	testContent := `# This is a header comment
+database:
+  # Database host configuration
+  host: localhost  # inline comment
+  # The password below should be encrypted
+  password: secret123
+  port: 5432
+
+# API configuration section
+api:
+  key: myapikey  # This should also be encrypted
+  # Timeout in seconds
+  timeout: 30
+`
+	if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
+	}
+
+	// Create processor and encrypt
+	proc, err := NewProcessor(cfg, nil)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+
+	if err := proc.SetupEncryption(); err != nil {
+		t.Fatalf("Failed to setup encryption: %v", err)
+	}
+
+	// Encrypt
+	encrypted, modified, err := proc.ProcessFile(testFile, true)
+	if err != nil {
+		t.Fatalf("Failed to encrypt: %v", err)
+	}
+
+	if !modified {
+		t.Error("Expected file to be modified")
+	}
+
+	encryptedStr := string(encrypted)
+
+	// Verify comments are preserved after encryption
+	commentsToCheck := []string{
+		"# This is a header comment",
+		"# Database host configuration",
+		"# inline comment",
+		"# The password below should be encrypted",
+		"# API configuration section",
+		"# This should also be encrypted",
+		"# Timeout in seconds",
+	}
+
+	for _, comment := range commentsToCheck {
+		if !strings.Contains(encryptedStr, comment) {
+			t.Errorf("Comment not preserved after encryption: %q", comment)
+		}
+	}
+
+	// Verify encrypted values
+	if !strings.Contains(encryptedStr, "ENC[AES256_GCM,") {
+		t.Error("Expected encrypted values in output")
+	}
+
+	// Write encrypted file for decryption test
+	if err := os.WriteFile(testFile, encrypted, 0644); err != nil {
+		t.Fatalf("Failed to write encrypted file: %v", err)
+	}
+
+	// Save secrets
+	if err := proc.SaveEncryptedSecrets(); err != nil {
+		t.Fatalf("Failed to save secrets: %v", err)
+	}
+
+	// Setup decryption
+	if _, err := proc.SetupDecryption([]age.Identity{identity}); err != nil {
+		t.Fatalf("Failed to setup decryption: %v", err)
+	}
+
+	// Decrypt
+	decrypted, modified, err := proc.ProcessFile(testFile, false)
+	if err != nil {
+		t.Fatalf("Failed to decrypt: %v", err)
+	}
+
+	if !modified {
+		t.Error("Expected file to be modified during decryption")
+	}
+
+	decryptedStr := string(decrypted)
+
+	// Verify comments are preserved after decryption
+	for _, comment := range commentsToCheck {
+		if !strings.Contains(decryptedStr, comment) {
+			t.Errorf("Comment not preserved after decryption: %q", comment)
+		}
+	}
+
+	// Verify original values are restored
+	if !strings.Contains(decryptedStr, "password: secret123") {
+		t.Error("Original password not restored after decryption")
+	}
+	if !strings.Contains(decryptedStr, "key: myapikey") {
+		t.Error("Original api_key not restored after decryption")
+	}
+}
+
+func TestYAMLBlankLinePreservation(t *testing.T) {
+	// Create temp directory
+	dir := t.TempDir()
+
+	// Generate keypair
+	identity, err := crypto.GenerateAgeKeypair()
+	if err != nil {
+		t.Fatalf("Failed to generate keypair: %v", err)
+	}
+
+	// Create config
+	cfg := createTestConfig(t, dir, []config.RecipientConfig{
+		{Name: "test", Age: identity.Recipient().String()},
+	})
+
+	// Create test file with blank lines
+	testFile := filepath.Join(dir, "test.yml")
+	testContent := `database:
+  host: localhost
+  password: secret123
+
+api:
+  key: myapikey
+
+  timeout: 30
+`
+	if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
+	}
+
+	// Create processor and encrypt
+	proc, err := NewProcessor(cfg, nil)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+
+	if err := proc.SetupEncryption(); err != nil {
+		t.Fatalf("Failed to setup encryption: %v", err)
+	}
+
+	// Encrypt
+	encrypted, modified, err := proc.ProcessFile(testFile, true)
+	if err != nil {
+		t.Fatalf("Failed to encrypt: %v", err)
+	}
+
+	if !modified {
+		t.Error("Expected file to be modified")
+	}
+
+	encryptedStr := string(encrypted)
+
+	// Check that blank lines are preserved after encryption
+	// There should be a blank line between "password: ..." and "api:"
+	// And between "key: ..." and "timeout:"
+	lines := strings.Split(encryptedStr, "\n")
+	foundBlankBeforeApi := false
+	foundBlankBeforeTimeout := false
+
+	for i, line := range lines {
+		if strings.HasPrefix(line, "api:") && i > 0 && strings.TrimSpace(lines[i-1]) == "" {
+			foundBlankBeforeApi = true
+		}
+		if strings.HasPrefix(strings.TrimSpace(line), "timeout:") && i > 0 && strings.TrimSpace(lines[i-1]) == "" {
+			foundBlankBeforeTimeout = true
+		}
+	}
+
+	if !foundBlankBeforeApi {
+		t.Error("Blank line before 'api:' not preserved after encryption")
+	}
+	if !foundBlankBeforeTimeout {
+		t.Error("Blank line before 'timeout:' not preserved after encryption")
+	}
+
+	// Write encrypted file for decryption test
+	if err := os.WriteFile(testFile, encrypted, 0644); err != nil {
+		t.Fatalf("Failed to write encrypted file: %v", err)
+	}
+
+	// Save secrets
+	if err := proc.SaveEncryptedSecrets(); err != nil {
+		t.Fatalf("Failed to save secrets: %v", err)
+	}
+
+	// Setup decryption
+	if _, err := proc.SetupDecryption([]age.Identity{identity}); err != nil {
+		t.Fatalf("Failed to setup decryption: %v", err)
+	}
+
+	// Decrypt
+	decrypted, modified, err := proc.ProcessFile(testFile, false)
+	if err != nil {
+		t.Fatalf("Failed to decrypt: %v", err)
+	}
+
+	if !modified {
+		t.Error("Expected file to be modified during decryption")
+	}
+
+	decryptedStr := string(decrypted)
+
+	// Check blank lines are preserved after decryption
+	lines = strings.Split(decryptedStr, "\n")
+	foundBlankBeforeApi = false
+	foundBlankBeforeTimeout = false
+
+	for i, line := range lines {
+		if strings.HasPrefix(line, "api:") && i > 0 && strings.TrimSpace(lines[i-1]) == "" {
+			foundBlankBeforeApi = true
+		}
+		if strings.HasPrefix(strings.TrimSpace(line), "timeout:") && i > 0 && strings.TrimSpace(lines[i-1]) == "" {
+			foundBlankBeforeTimeout = true
+		}
+	}
+
+	if !foundBlankBeforeApi {
+		t.Error("Blank line before 'api:' not preserved after decryption")
+	}
+	if !foundBlankBeforeTimeout {
+		t.Error("Blank line before 'timeout:' not preserved after decryption")
+	}
+}

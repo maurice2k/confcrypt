@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/maurice2k/confcrypt/internal/crypto"
@@ -429,4 +430,96 @@ func createTestConfigWithRename(t *testing.T, dir string) *Config {
 	}
 
 	return loaded
+}
+
+func TestConfigSavePreservesComments(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, ".confcrypt.yml")
+
+	// Create a config file with comments
+	// Note: Inline comments on recipients are NOT preserved when recipients
+	// are modified (added/removed), as the list is rebuilt from scratch.
+	// Header and section comments ARE preserved.
+	configContent := `# confcrypt configuration file
+# This comment should be preserved
+
+# Recipients section
+recipients:
+  - name: test
+    age: age1test123
+
+# Files to process
+files:
+  - "*.yml"
+  - "*.yaml"
+
+# Keys to encrypt
+keys_include:
+  - password
+  - secret
+  - api_key
+`
+
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	// Load config
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	// Modify the .confcrypt section (simulating encryption)
+	cfg.Confcrypt = &ConfcryptSection{
+		Version:   "1.0.0",
+		UpdatedAt: "2024-01-01T00:00:00Z",
+		Store: []SecretEntry{
+			{Recipient: "age1test123", Secret: "encrypted-secret"},
+		},
+		MACs: map[string]string{
+			"test.yml": "mac-value",
+		},
+	}
+
+	// Save config
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Failed to save config: %v", err)
+	}
+
+	// Read saved content
+	saved, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("Failed to read saved config: %v", err)
+	}
+
+	savedStr := string(saved)
+
+	// Verify header/section comments are preserved
+	// Note: Inline comments on items inside rebuilt sections (like recipients)
+	// are not preserved, only structural comments before sections
+	commentsToCheck := []string{
+		"# confcrypt configuration file",
+		"# This comment should be preserved",
+		"# Recipients section",
+		"# Files to process",
+		"# Keys to encrypt",
+	}
+
+	for _, comment := range commentsToCheck {
+		if !strings.Contains(savedStr, comment) {
+			t.Errorf("Comment not preserved after save: %q", comment)
+		}
+	}
+
+	// Verify new .confcrypt section was added
+	if !strings.Contains(savedStr, ".confcrypt:") {
+		t.Error("Expected .confcrypt section in saved file")
+	}
+	if !strings.Contains(savedStr, "version: 1.0.0") {
+		t.Error("Expected version in .confcrypt section")
+	}
+	if !strings.Contains(savedStr, "encrypted-secret") {
+		t.Error("Expected encrypted secret in saved file")
+	}
 }

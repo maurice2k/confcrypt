@@ -1,12 +1,14 @@
 package config
 
 import (
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"filippo.io/age"
 	"gopkg.in/yaml.v3"
@@ -29,6 +31,7 @@ type Config struct {
 	// Internal fields (not serialized)
 	configPath string
 	configDir  string
+	rawNode    *yaml.Node // Preserve original YAML structure with comments
 }
 
 // RenameFilesConfig represents file renaming rules for encrypt/decrypt
@@ -85,9 +88,16 @@ func Load(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("failed to read config file %q: %w", configPath, err)
 	}
 
-	var config Config
-	if err := yaml.Unmarshal(data, &config); err != nil {
+	// Parse as yaml.Node to preserve comments
+	var node yaml.Node
+	if err := yaml.Unmarshal(data, &node); err != nil {
 		return nil, fmt.Errorf("failed to parse config file %q: %w", configPath, err)
+	}
+
+	// Decode into struct for easy access
+	var config Config
+	if err := node.Decode(&config); err != nil {
+		return nil, fmt.Errorf("failed to decode config file %q: %w", configPath, err)
 	}
 
 	absPath, err := filepath.Abs(configPath)
@@ -97,6 +107,7 @@ func Load(configPath string) (*Config, error) {
 
 	config.configPath = absPath
 	config.configDir = filepath.Dir(absPath)
+	config.rawNode = &node
 
 	return &config, nil
 }
@@ -124,8 +135,29 @@ func findConfig() (string, error) {
 	return "", fmt.Errorf("no %s found in current directory or any parent", DefaultConfigName)
 }
 
-// Save writes the config back to disk
+// Save writes the config back to disk, preserving comments
 func (c *Config) Save() error {
+	// If we have the original node, sync changes and preserve comments
+	if c.rawNode != nil {
+		if err := c.syncToNode(); err != nil {
+			return fmt.Errorf("failed to sync config to node: %w", err)
+		}
+
+		var buf strings.Builder
+		encoder := yaml.NewEncoder(&buf)
+		encoder.SetIndent(2)
+		if err := encoder.Encode(c.rawNode); err != nil {
+			return fmt.Errorf("failed to marshal config: %w", err)
+		}
+		encoder.Close()
+
+		if err := os.WriteFile(c.configPath, []byte(buf.String()), 0644); err != nil {
+			return fmt.Errorf("failed to write config file: %w", err)
+		}
+		return nil
+	}
+
+	// Fallback: no rawNode (e.g., newly created config), use standard marshal
 	data, err := yaml.Marshal(c)
 	if err != nil {
 		return fmt.Errorf("failed to marshal config: %w", err)
@@ -136,6 +168,201 @@ func (c *Config) Save() error {
 	}
 
 	return nil
+}
+
+// syncToNode syncs the Config struct changes back into the rawNode
+func (c *Config) syncToNode() error {
+	if c.rawNode == nil {
+		return nil
+	}
+
+	root := c.rawNode
+	// Document nodes have content
+	if root.Kind == yaml.DocumentNode && len(root.Content) > 0 {
+		root = root.Content[0]
+	}
+
+	if root.Kind != yaml.MappingNode {
+		return fmt.Errorf("expected mapping node at root")
+	}
+
+	// Sync recipients section
+	if err := c.syncRecipientsSection(root); err != nil {
+		return err
+	}
+
+	// Sync .confcrypt section
+	if c.Confcrypt != nil {
+		confcryptNode := findOrCreateMapKey(root, ".confcrypt")
+		if confcryptNode == nil {
+			return fmt.Errorf("failed to find/create .confcrypt section")
+		}
+		if err := c.syncConfcryptSection(confcryptNode); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// syncRecipientsSection syncs the Recipients list to the yaml.Node
+func (c *Config) syncRecipientsSection(root *yaml.Node) error {
+	recipientsNode := findOrCreateMapKey(root, "recipients")
+	if recipientsNode == nil {
+		return fmt.Errorf("failed to find/create recipients section")
+	}
+
+	recipientsNode.Kind = yaml.SequenceNode
+	recipientsNode.Tag = "!!seq"
+	recipientsNode.Content = nil
+
+	for _, r := range c.Recipients {
+		entryNode := &yaml.Node{
+			Kind: yaml.MappingNode,
+			Tag:  "!!map",
+		}
+		if r.Name != "" {
+			setMapValue(entryNode, "name", r.Name)
+		}
+		if r.Age != "" {
+			setMapValue(entryNode, "age", r.Age)
+		}
+		if r.SSH != "" {
+			setMapValue(entryNode, "ssh", r.SSH)
+		}
+		if r.YubiKey != "" {
+			setMapValue(entryNode, "yubikey", r.YubiKey)
+		}
+		if r.FIDO2 != "" {
+			setMapValue(entryNode, "fido2", r.FIDO2)
+		}
+		recipientsNode.Content = append(recipientsNode.Content, entryNode)
+	}
+
+	return nil
+}
+
+// syncConfcryptSection syncs the Confcrypt struct to its yaml.Node
+func (c *Config) syncConfcryptSection(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		// Convert to mapping node
+		node.Kind = yaml.MappingNode
+		node.Content = nil
+	}
+
+	// Update version
+	setMapValue(node, "version", c.Confcrypt.Version)
+
+	// Update updated_at
+	setMapValue(node, "updated_at", c.Confcrypt.UpdatedAt)
+
+	// Sync store (list of recipient/secret pairs)
+	storeNode := findOrCreateMapKey(node, "store")
+	if storeNode != nil {
+		storeNode.Kind = yaml.SequenceNode
+		storeNode.Tag = "!!seq"
+		storeNode.Content = nil
+		for _, entry := range c.Confcrypt.Store {
+			entryNode := &yaml.Node{
+				Kind: yaml.MappingNode,
+				Tag:  "!!map",
+			}
+			setMapValue(entryNode, "recipient", entry.Recipient)
+			setMapValue(entryNode, "secret", entry.Secret)
+			storeNode.Content = append(storeNode.Content, entryNode)
+		}
+	}
+
+	// Sync MACs
+	if len(c.Confcrypt.MACs) > 0 {
+		macsNode := findOrCreateMapKey(node, "macs")
+		if macsNode != nil {
+			macsNode.Kind = yaml.MappingNode
+			macsNode.Tag = "!!map"
+			macsNode.Content = nil
+			for path, mac := range c.Confcrypt.MACs {
+				keyNode := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: path}
+				valNode := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: mac}
+				macsNode.Content = append(macsNode.Content, keyNode, valNode)
+			}
+		}
+	} else {
+		// Remove macs section if empty
+		removeMapKey(node, "macs")
+	}
+
+	return nil
+}
+
+// findOrCreateMapKey finds a key in a mapping node or creates it
+func findOrCreateMapKey(node *yaml.Node, key string) *yaml.Node {
+	if node.Kind != yaml.MappingNode {
+		return nil
+	}
+
+	// Search for existing key
+	for i := 0; i < len(node.Content); i += 2 {
+		if node.Content[i].Value == key {
+			return node.Content[i+1]
+		}
+	}
+
+	// Create new key-value pair
+	keyNode := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}
+	valNode := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+	node.Content = append(node.Content, keyNode, valNode)
+	return valNode
+}
+
+// setMapValue sets a scalar value in a mapping node
+// Automatically handles binary data by using !!binary tag with base64 encoding
+func setMapValue(node *yaml.Node, key, value string) {
+	if node.Kind != yaml.MappingNode {
+		return
+	}
+
+	// Determine if value is valid UTF-8, if not use binary encoding
+	tag := "!!str"
+	nodeValue := value
+	style := yaml.Style(0)
+
+	if !utf8.ValidString(value) {
+		// Binary data - use base64 encoding
+		tag = "!!binary"
+		nodeValue = base64.StdEncoding.EncodeToString([]byte(value))
+		style = yaml.LiteralStyle // Use block style for readability
+	}
+
+	// Search for existing key
+	for i := 0; i < len(node.Content); i += 2 {
+		if node.Content[i].Value == key {
+			node.Content[i+1].Value = nodeValue
+			node.Content[i+1].Kind = yaml.ScalarNode
+			node.Content[i+1].Tag = tag
+			node.Content[i+1].Style = style
+			return
+		}
+	}
+
+	// Create new key-value pair
+	keyNode := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}
+	valNode := &yaml.Node{Kind: yaml.ScalarNode, Tag: tag, Value: nodeValue, Style: style}
+	node.Content = append(node.Content, keyNode, valNode)
+}
+
+// removeMapKey removes a key from a mapping node
+func removeMapKey(node *yaml.Node, key string) {
+	if node.Kind != yaml.MappingNode {
+		return
+	}
+
+	for i := 0; i < len(node.Content); i += 2 {
+		if node.Content[i].Value == key {
+			// Remove key and value
+			node.Content = append(node.Content[:i], node.Content[i+2:]...)
+			return
+		}
+	}
 }
 
 // GetRecipients returns parsed recipients (age or SSH keys)
