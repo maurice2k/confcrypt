@@ -118,6 +118,15 @@ func findConfig() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to get current directory: %w", err)
 	}
+	return FindConfigFromPath(dir)
+}
+
+// FindConfigFromPath searches for .confcrypt.yml starting from startDir and walking upward
+func FindConfigFromPath(startDir string) (string, error) {
+	dir, err := filepath.Abs(startDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to get absolute path: %w", err)
+	}
 
 	for {
 		configPath := filepath.Join(dir, DefaultConfigName)
@@ -132,7 +141,7 @@ func findConfig() (string, error) {
 		dir = parent
 	}
 
-	return "", fmt.Errorf("no %s found in current directory or any parent", DefaultConfigName)
+	return "", fmt.Errorf("no %s found in %s or any parent directory", DefaultConfigName, startDir)
 }
 
 // Save writes the config back to disk, preserving comments
@@ -191,6 +200,11 @@ func (c *Config) syncToNode() error {
 		return err
 	}
 
+	// Sync files section
+	if err := c.syncFilesSection(root); err != nil {
+		return err
+	}
+
 	// Sync .confcrypt section
 	if c.Confcrypt != nil {
 		confcryptNode := findOrCreateMapKey(root, ".confcrypt")
@@ -237,6 +251,29 @@ func (c *Config) syncRecipientsSection(root *yaml.Node) error {
 			setMapValue(entryNode, "fido2", r.FIDO2)
 		}
 		recipientsNode.Content = append(recipientsNode.Content, entryNode)
+	}
+
+	return nil
+}
+
+// syncFilesSection syncs the Files list to the yaml.Node
+func (c *Config) syncFilesSection(root *yaml.Node) error {
+	filesNode := findOrCreateMapKey(root, "files")
+	if filesNode == nil {
+		return fmt.Errorf("failed to find/create files section")
+	}
+
+	filesNode.Kind = yaml.SequenceNode
+	filesNode.Tag = "!!seq"
+	filesNode.Content = nil
+
+	for _, f := range c.Files {
+		fileNode := &yaml.Node{
+			Kind:  yaml.ScalarNode,
+			Tag:   "!!str",
+			Value: f,
+		}
+		filesNode.Content = append(filesNode.Content, fileNode)
 	}
 
 	return nil
@@ -572,6 +609,35 @@ func (c *Config) ConfigDir() string {
 // ConfigPath returns the path to the config file
 func (c *Config) ConfigPath() string {
 	return c.configPath
+}
+
+// MatchesFile checks if the given absolute file path matches any of the configured file patterns
+func (c *Config) MatchesFile(absFilePath string) (bool, error) {
+	relPath, err := filepath.Rel(c.configDir, absFilePath)
+	if err != nil {
+		return false, err
+	}
+
+	// Check if file is outside config dir (starts with ..)
+	if strings.HasPrefix(relPath, "..") {
+		return false, nil
+	}
+
+	for _, pattern := range c.Files {
+		matched, err := matchPattern(pattern, relPath)
+		if err != nil {
+			return false, err
+		}
+		if matched {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// AddFilePattern adds a file pattern to the config's files list
+func (c *Config) AddFilePattern(pattern string) {
+	c.Files = append(c.Files, pattern)
 }
 
 // ParseKeyRules parses the keys_include or keys_exclude into KeyRule structs

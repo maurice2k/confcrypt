@@ -20,10 +20,19 @@ var (
 )
 
 var encryptCmd = &cobra.Command{
-	Use:   "encrypt",
+	Use:   "encrypt [file|folder]",
 	Short: "Encrypt matching keys (default command)",
-	Long:  `Encrypt values for keys matching the configured patterns.`,
-	Run:   runEncrypt,
+	Long: `Encrypt values for keys matching the configured patterns.
+
+If a file is specified, searches upward from the file's directory to find .confcrypt.yml
+and encrypts only that file. The file must match a pattern in the 'files' list.
+
+If a folder is specified, it must contain .confcrypt.yml directly and all matching
+files in that folder are encrypted.
+
+If no argument is given, searches from current directory upward for .confcrypt.yml.`,
+	Args: cobra.MaximumNArgs(1),
+	Run:  runEncrypt,
 }
 
 func init() {
@@ -33,8 +42,27 @@ func init() {
 }
 
 func runEncrypt(cmd *cobra.Command, args []string) {
+	var singleFile string
+	cfgPath := resolvedConfigPath
+
+	// Handle positional argument
+	if len(args) > 0 {
+		// Check for conflict with --file flag
+		if filePath != "" {
+			fmt.Fprintf(os.Stderr, "Error: cannot use both positional argument and --file flag\n")
+			os.Exit(1)
+		}
+
+		var err error
+		cfgPath, singleFile, err = ResolveTarget(args[0])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	// Load config
-	cfg, err := config.Load(resolvedConfigPath)
+	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -50,10 +78,32 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 	}
 
 	// Get files to process
-	files, err := GetFilesToProcess(cfg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+	var files []string
+	if singleFile != "" {
+		files = []string{singleFile}
+
+		// Check if file matches existing patterns
+		matches, err := cfg.MatchesFile(singleFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error checking file pattern: %v\n", err)
+			os.Exit(1)
+		}
+		if !matches {
+			relPath, _ := filepath.Rel(cfg.ConfigDir(), singleFile)
+			if relPath == "" || strings.HasPrefix(relPath, "..") {
+				fmt.Fprintf(os.Stderr, "Error: file %s is outside config directory %s\n", singleFile, cfg.ConfigDir())
+			} else {
+				fmt.Fprintf(os.Stderr, "Error: file %q does not match any pattern in files list\n", relPath)
+				fmt.Fprintf(os.Stderr, "Add it to the 'files' section in %s\n", cfg.ConfigPath())
+			}
+			os.Exit(1)
+		}
+	} else {
+		files, err = GetFilesToProcess(cfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	if len(files) == 0 {

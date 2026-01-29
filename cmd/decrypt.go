@@ -22,10 +22,19 @@ var (
 )
 
 var decryptCmd = &cobra.Command{
-	Use:   "decrypt",
+	Use:   "decrypt [file|folder]",
 	Short: "Decrypt encrypted values",
-	Long:  `Decrypt all encrypted values in the matching config files.`,
-	Run:   runDecrypt,
+	Long: `Decrypt all encrypted values in the matching config files.
+
+If a file is specified, searches upward from the file's directory to find .confcrypt.yml
+and decrypts only that file.
+
+If a folder is specified, it must contain .confcrypt.yml directly and all matching
+files in that folder are decrypted.
+
+If no argument is given, searches from current directory upward for .confcrypt.yml.`,
+	Args: cobra.MaximumNArgs(1),
+	Run:  runDecrypt,
 }
 
 func init() {
@@ -42,8 +51,27 @@ func init() {
 }
 
 func runDecrypt(cmd *cobra.Command, args []string) {
+	var singleFile string
+	cfgPath := resolvedConfigPath
+
+	// Handle positional argument
+	if len(args) > 0 {
+		// Check for conflict with --file flag
+		if filePath != "" {
+			fmt.Fprintf(os.Stderr, "Error: cannot use both positional argument and --file flag\n")
+			os.Exit(1)
+		}
+
+		var err error
+		cfgPath, singleFile, err = ResolveTarget(args[0])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	// Load config
-	cfg, err := config.Load(resolvedConfigPath)
+	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -59,10 +87,15 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 	}
 
 	// Get files to process
-	files, err := GetFilesToProcess(cfg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+	var files []string
+	if singleFile != "" {
+		files = []string{singleFile}
+	} else {
+		files, err = GetFilesToProcess(cfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	if len(files) == 0 {

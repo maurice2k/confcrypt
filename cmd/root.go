@@ -59,7 +59,7 @@ https://github.com/maurice2k/confcrypt`,
 func init() {
 	rootCmd.PersistentFlags().StringVar(&basePath, "path", "", "Base path where .confcrypt.yml is located (default: current directory)")
 	rootCmd.PersistentFlags().StringVar(&configPath, "config", "", "Path to .confcrypt.yml config file (overrides --path)")
-	rootCmd.PersistentFlags().StringVar(&filePath, "file", "", "Process a specific file only")
+	rootCmd.PersistentFlags().StringVar(&filePath, "file", "", "Process a specific file only (deprecated: use positional argument instead)")
 	rootCmd.PersistentFlags().BoolVar(&toStdout, "stdout", false, "Output to stdout instead of modifying files in-place")
 }
 
@@ -145,6 +145,38 @@ func GetFilesToProcess(cfg *config.Config) ([]string, error) {
 		return []string{absPath}, nil
 	}
 	return cfg.GetMatchingFiles()
+}
+
+// ResolveTarget resolves a target path (file or folder) to a config path and optional single file.
+// For a file: searches upward from the file's directory to find .confcrypt.yml
+// For a folder: the folder must contain .confcrypt.yml directly (no upward search)
+// Returns: configPath, singleFile (empty if folder/all files), error
+func ResolveTarget(target string) (configPath string, singleFile string, err error) {
+	absTarget, err := filepath.Abs(target)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to resolve path: %w", err)
+	}
+
+	info, err := os.Stat(absTarget)
+	if err != nil {
+		return "", "", fmt.Errorf("target not found: %w", err)
+	}
+
+	if info.IsDir() {
+		// Folder: config must be directly in this folder
+		cfgPath := filepath.Join(absTarget, config.DefaultConfigName)
+		if _, err := os.Stat(cfgPath); err != nil {
+			return "", "", fmt.Errorf("no %s in folder %s", config.DefaultConfigName, target)
+		}
+		return cfgPath, "", nil
+	}
+
+	// File: search upward from file's directory
+	cfgPath, err := config.FindConfigFromPath(filepath.Dir(absTarget))
+	if err != nil {
+		return "", "", err
+	}
+	return cfgPath, absTarget, nil
 }
 
 // LoadDecryptionIdentity loads a single identity that can decrypt a store entry.

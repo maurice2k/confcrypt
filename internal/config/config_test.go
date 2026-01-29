@@ -432,6 +432,231 @@ func createTestConfigWithRename(t *testing.T, dir string) *Config {
 	return loaded
 }
 
+func TestFindConfigFromPath(t *testing.T) {
+	// Create a temp directory structure:
+	// tmpdir/
+	//   .confcrypt.yml
+	//   subdir1/
+	//     subdir2/
+	//       file.yml
+	dir := t.TempDir()
+
+	// Create the config file at root
+	configPath := filepath.Join(dir, ".confcrypt.yml")
+	configContent := `recipients:
+  - name: test
+    age: age1test123
+files:
+  - "*.yml"
+`
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	// Create nested directories
+	subdir1 := filepath.Join(dir, "subdir1")
+	subdir2 := filepath.Join(subdir1, "subdir2")
+	if err := os.MkdirAll(subdir2, 0755); err != nil {
+		t.Fatalf("Failed to create directories: %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		startDir  string
+		wantPath  string
+		wantError bool
+	}{
+		{
+			name:     "find from root dir",
+			startDir: dir,
+			wantPath: configPath,
+		},
+		{
+			name:     "find from subdir1",
+			startDir: subdir1,
+			wantPath: configPath,
+		},
+		{
+			name:     "find from subdir2",
+			startDir: subdir2,
+			wantPath: configPath,
+		},
+		{
+			name:      "not found in isolated dir",
+			startDir:  t.TempDir(), // completely separate temp dir
+			wantError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := FindConfigFromPath(tt.startDir)
+			if tt.wantError {
+				if err == nil {
+					t.Errorf("FindConfigFromPath() expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("FindConfigFromPath() unexpected error: %v", err)
+				return
+			}
+			if got != tt.wantPath {
+				t.Errorf("FindConfigFromPath() = %q, want %q", got, tt.wantPath)
+			}
+		})
+	}
+}
+
+func TestMatchesFile(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create config
+	configPath := filepath.Join(dir, ".confcrypt.yml")
+	configContent := `recipients:
+  - name: test
+    age: age1test123
+files:
+  - "*.yml"
+  - "*.yaml"
+  - "subdir/config.json"
+`
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	// Create subdirectory
+	subdir := filepath.Join(dir, "subdir")
+	if err := os.MkdirAll(subdir, 0755); err != nil {
+		t.Fatalf("Failed to create subdir: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		filePath  string
+		wantMatch bool
+		wantError bool
+	}{
+		{
+			name:      "yml file matches",
+			filePath:  filepath.Join(dir, "config.yml"),
+			wantMatch: true,
+		},
+		{
+			name:      "yaml file matches",
+			filePath:  filepath.Join(dir, "config.yaml"),
+			wantMatch: true,
+		},
+		{
+			name:      "yml in subdir matches",
+			filePath:  filepath.Join(subdir, "test.yml"),
+			wantMatch: true,
+		},
+		{
+			name:      "exact path matches",
+			filePath:  filepath.Join(dir, "subdir", "config.json"),
+			wantMatch: true,
+		},
+		{
+			name:      "txt file does not match",
+			filePath:  filepath.Join(dir, "readme.txt"),
+			wantMatch: false,
+		},
+		{
+			name:      "file outside config dir does not match",
+			filePath:  "/some/other/path/config.yml",
+			wantMatch: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := cfg.MatchesFile(tt.filePath)
+			if tt.wantError {
+				if err == nil {
+					t.Errorf("MatchesFile() expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("MatchesFile() unexpected error: %v", err)
+				return
+			}
+			if got != tt.wantMatch {
+				t.Errorf("MatchesFile(%q) = %v, want %v", tt.filePath, got, tt.wantMatch)
+			}
+		})
+	}
+}
+
+func TestAddFilePattern(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create config
+	configPath := filepath.Join(dir, ".confcrypt.yml")
+	configContent := `recipients:
+  - name: test
+    age: age1test123
+files:
+  - "*.yml"
+`
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	// Verify initial state
+	if len(cfg.Files) != 1 {
+		t.Errorf("Expected 1 file pattern, got %d", len(cfg.Files))
+	}
+
+	// Add new pattern
+	cfg.AddFilePattern("subdir/secrets.env")
+
+	// Verify pattern was added
+	if len(cfg.Files) != 2 {
+		t.Errorf("Expected 2 file patterns after add, got %d", len(cfg.Files))
+	}
+	if cfg.Files[1] != "subdir/secrets.env" {
+		t.Errorf("Expected second pattern to be 'subdir/secrets.env', got %q", cfg.Files[1])
+	}
+
+	// Save and reload
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Failed to save config: %v", err)
+	}
+
+	reloaded, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Failed to reload config: %v", err)
+	}
+
+	// Verify pattern persisted
+	if len(reloaded.Files) != 2 {
+		t.Errorf("Expected 2 file patterns after reload, got %d", len(reloaded.Files))
+	}
+
+	found := false
+	for _, f := range reloaded.Files {
+		if f == "subdir/secrets.env" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("Pattern 'subdir/secrets.env' not found after reload, files: %v", reloaded.Files)
+	}
+}
+
 func TestConfigSavePreservesComments(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, ".confcrypt.yml")
