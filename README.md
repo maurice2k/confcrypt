@@ -248,6 +248,7 @@ Encrypt Options:
 
 Decrypt Options:
   --output-path string Write decrypted files to this directory
+  --output-tar string  Write decrypted files to tar archive (use '-' for stdout)
   --force              Continue decryption even if MAC verification fails
 ```
 
@@ -374,6 +375,21 @@ confcrypt decrypt --output-path /tmp/decrypted-configs/
 When using `--output-path`:
 - Decrypted files are written to the specified directory, preserving the relative path structure
 - Source files remain encrypted
+
+### Decrypt to a tar archive
+
+```bash
+# Decrypt to a tar file
+confcrypt decrypt --output-tar decrypted.tar
+
+# Stream directly to stdout (e.g., pipe to another process)
+confcrypt decrypt --output-tar - | tar -xf - -C /target/dir
+```
+
+When using `--output-tar`:
+- Decrypted files are written to a tar archive with the base directory as prefix (e.g., `myproject/config.yml`)
+- Source files remain encrypted
+- Use `-` to stream the tar to stdout (info messages go to stderr)
 
 ### Automatic file renaming
 
