@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"archive/tar"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -821,5 +823,519 @@ api_key: myapikey
 	unrenamedOutputFile := filepath.Join(outputDir, "config.enc.yml")
 	if _, err := os.Stat(unrenamedOutputFile); !os.IsNotExist(err) {
 		t.Error("Expected unrenamed output file (config.enc.yml) to NOT exist")
+	}
+}
+
+func TestDecryptToTar(t *testing.T) {
+	dir := t.TempDir()
+
+	// Generate keypair
+	identity, err := crypto.GenerateAgeKeypair()
+	if err != nil {
+		t.Fatalf("Failed to generate keypair: %v", err)
+	}
+
+	// Create config with rename rules
+	cfg := createTestConfigWithRename(t, dir, identity)
+
+	// Create test file with sensitive data and encrypt it
+	originalFile := filepath.Join(dir, "config.yml")
+	testContent := `database:
+  host: localhost
+  password: secret123
+api_key: myapikey
+`
+	if err := os.WriteFile(originalFile, []byte(testContent), 0644); err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
+	}
+
+	// Encrypt the file
+	proc, err := processor.NewProcessor(cfg, nil)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+
+	if err := proc.SetupEncryption(); err != nil {
+		t.Fatalf("Failed to setup encryption: %v", err)
+	}
+
+	encrypted, _, err := proc.ProcessFile(originalFile, true)
+	if err != nil {
+		t.Fatalf("Failed to encrypt: %v", err)
+	}
+
+	// Write to renamed path (config.enc.yml)
+	encryptedFile := filepath.Join(dir, "config.enc.yml")
+	if err := os.WriteFile(encryptedFile, encrypted, 0644); err != nil {
+		t.Fatalf("Failed to write encrypted file: %v", err)
+	}
+
+	// Delete original file
+	if err := os.Remove(originalFile); err != nil {
+		t.Fatalf("Failed to remove original file: %v", err)
+	}
+
+	// Save secrets
+	if err := proc.SaveEncryptedSecrets(); err != nil {
+		t.Fatalf("Failed to save secrets: %v", err)
+	}
+
+	// Now decrypt to a tar file
+	tarPath := filepath.Join(dir, "decrypted.tar")
+	tarFile, err := os.Create(tarPath)
+	if err != nil {
+		t.Fatalf("Failed to create tar file: %v", err)
+	}
+
+	tarWriter := tar.NewWriter(tarFile)
+
+	proc2, err := processor.NewProcessor(cfg, nil)
+	if err != nil {
+		t.Fatalf("Failed to create processor for decryption: %v", err)
+	}
+
+	if _, err := proc2.SetupDecryption([]age.Identity{identity}); err != nil {
+		t.Fatalf("Failed to setup decryption: %v", err)
+	}
+
+	decrypted, _, err := proc2.ProcessFile(encryptedFile, false)
+	if err != nil {
+		t.Fatalf("Failed to decrypt: %v", err)
+	}
+
+	// Apply rename rules to get final filename (like the decrypt command does)
+	relPath, _ := filepath.Rel(cfg.ConfigDir(), encryptedFile)
+	outputName, err := cfg.GetDecryptRename(relPath)
+	if err != nil {
+		t.Fatalf("Failed to get decrypt rename: %v", err)
+	}
+
+	// Expected: config.yml (not config.enc.yml)
+	if outputName != "config.yml" {
+		t.Errorf("Expected output name to be 'config.yml', got %q", outputName)
+	}
+
+	// Include base directory in tar path (like the decrypt command does)
+	baseDir := filepath.Base(cfg.ConfigDir())
+	tarEntryPath := filepath.Join(baseDir, outputName)
+
+	// Write to tar
+	header := &tar.Header{
+		Name: tarEntryPath,
+		Size: int64(len(decrypted)),
+		Mode: 0644,
+	}
+	if err := tarWriter.WriteHeader(header); err != nil {
+		t.Fatalf("Failed to write tar header: %v", err)
+	}
+	if _, err := tarWriter.Write(decrypted); err != nil {
+		t.Fatalf("Failed to write tar content: %v", err)
+	}
+
+	tarWriter.Close()
+	tarFile.Close()
+
+	// Verify source encrypted file still exists (tar output is non-destructive)
+	if _, err := os.Stat(encryptedFile); os.IsNotExist(err) {
+		t.Error("Expected source encrypted file to still exist after tar output")
+	}
+
+	// Verify tar file exists and contains the expected file
+	tarFile, err = os.Open(tarPath)
+	if err != nil {
+		t.Fatalf("Failed to open tar file for reading: %v", err)
+	}
+	defer tarFile.Close()
+
+	tarReader := tar.NewReader(tarFile)
+
+	header, err = tarReader.Next()
+	if err != nil {
+		t.Fatalf("Failed to read tar header: %v", err)
+	}
+
+	// Tar entry should include base directory name (baseDir already declared above)
+	expectedTarPath := filepath.Join(baseDir, "config.yml")
+	if header.Name != expectedTarPath {
+		t.Errorf("Expected tar entry name to be %q, got %q", expectedTarPath, header.Name)
+	}
+
+	content, err := io.ReadAll(tarReader)
+	if err != nil {
+		t.Fatalf("Failed to read tar content: %v", err)
+	}
+
+	if strings.Contains(string(content), "ENC[AES256_GCM,") {
+		t.Error("Expected tar content to be decrypted")
+	}
+
+	if !strings.Contains(string(content), "secret123") {
+		t.Error("Expected tar content to have decrypted password")
+	}
+
+	if !strings.Contains(string(content), "myapikey") {
+		t.Error("Expected tar content to have decrypted api_key")
+	}
+
+	// Verify no more entries in tar
+	_, err = tarReader.Next()
+	if err != io.EOF {
+		t.Error("Expected only one entry in tar")
+	}
+}
+
+func TestDecryptToTarEmpty(t *testing.T) {
+	dir := t.TempDir()
+
+	// Generate keypair
+	identity, err := crypto.GenerateAgeKeypair()
+	if err != nil {
+		t.Fatalf("Failed to generate keypair: %v", err)
+	}
+
+	// Create config
+	cfg := createTestConfigWithSecrets(t, dir, identity)
+
+	// Create test file WITHOUT any sensitive data (no encryption needed)
+	testFile := filepath.Join(dir, "config.yml")
+	testContent := `database:
+  host: localhost
+  port: 5432
+`
+	if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
+	}
+
+	// Create processor and check - should have no encrypted values
+	proc, err := processor.NewProcessor(cfg, nil)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+
+	content, err := os.ReadFile(testFile)
+	if err != nil {
+		t.Fatalf("Failed to read test file: %v", err)
+	}
+
+	if proc.HasEncryptedValues(content, testFile) {
+		t.Fatal("Expected no encrypted values in test file")
+	}
+
+	// Create empty tar (simulating what decrypt command does when no encrypted values)
+	tarPath := filepath.Join(dir, "empty.tar")
+	tarFile, err := os.Create(tarPath)
+	if err != nil {
+		t.Fatalf("Failed to create tar file: %v", err)
+	}
+
+	tarWriter := tar.NewWriter(tarFile)
+	tarWriter.Close() // Creates valid empty tar with EOF blocks
+	tarFile.Close()
+
+	// Verify tar file exists and is valid (should be 1024 bytes - two 512-byte zero blocks)
+	info, err := os.Stat(tarPath)
+	if err != nil {
+		t.Fatalf("Failed to stat tar file: %v", err)
+	}
+
+	// Empty tar should be 1024 bytes (2 x 512-byte EOF blocks)
+	if info.Size() != 1024 {
+		t.Errorf("Expected empty tar to be 1024 bytes, got %d", info.Size())
+	}
+
+	// Verify tar is readable and empty
+	tarFile, err = os.Open(tarPath)
+	if err != nil {
+		t.Fatalf("Failed to open tar file: %v", err)
+	}
+	defer tarFile.Close()
+
+	tarReader := tar.NewReader(tarFile)
+	_, err = tarReader.Next()
+	if err != io.EOF {
+		t.Error("Expected empty tar to have no entries")
+	}
+}
+
+func TestDecryptToTarWithBasePath(t *testing.T) {
+	dir := t.TempDir()
+
+	// Generate keypair
+	identity, err := crypto.GenerateAgeKeypair()
+	if err != nil {
+		t.Fatalf("Failed to generate keypair: %v", err)
+	}
+
+	// Create config
+	cfg := createTestConfigWithSecrets(t, dir, identity)
+
+	// Create subdirectory
+	subdir := filepath.Join(dir, "subdir")
+	if err := os.MkdirAll(subdir, 0755); err != nil {
+		t.Fatalf("Failed to create subdir: %v", err)
+	}
+
+	// Create test files in root and subdir
+	testFiles := map[string]string{
+		"config.yml":        "password: secret1\n",
+		"subdir/config.yml": "password: secret2\n",
+	}
+
+	proc, err := processor.NewProcessor(cfg, nil)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+
+	if err := proc.SetupEncryption(); err != nil {
+		t.Fatalf("Failed to setup encryption: %v", err)
+	}
+
+	for relName, content := range testFiles {
+		filePath := filepath.Join(dir, relName)
+		if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+			t.Fatalf("Failed to write test file %s: %v", relName, err)
+		}
+
+		encrypted, _, err := proc.ProcessFile(filePath, true)
+		if err != nil {
+			t.Fatalf("Failed to encrypt %s: %v", relName, err)
+		}
+
+		if err := os.WriteFile(filePath, encrypted, 0644); err != nil {
+			t.Fatalf("Failed to write encrypted file %s: %v", relName, err)
+		}
+	}
+
+	if err := proc.SaveEncryptedSecrets(); err != nil {
+		t.Fatalf("Failed to save secrets: %v", err)
+	}
+
+	// Decrypt to tar
+	tarPath := filepath.Join(dir, "output.tar")
+	tarFile, err := os.Create(tarPath)
+	if err != nil {
+		t.Fatalf("Failed to create tar file: %v", err)
+	}
+
+	tarWriter := tar.NewWriter(tarFile)
+
+	proc2, err := processor.NewProcessor(cfg, nil)
+	if err != nil {
+		t.Fatalf("Failed to create processor for decryption: %v", err)
+	}
+
+	if _, err := proc2.SetupDecryption([]age.Identity{identity}); err != nil {
+		t.Fatalf("Failed to setup decryption: %v", err)
+	}
+
+	baseDir := filepath.Base(cfg.ConfigDir())
+	for relName := range testFiles {
+		filePath := filepath.Join(dir, relName)
+		decrypted, _, err := proc2.ProcessFile(filePath, false)
+		if err != nil {
+			t.Fatalf("Failed to decrypt %s: %v", relName, err)
+		}
+
+		// Include base directory in tar path (like the decrypt command does)
+		tarEntryPath := filepath.Join(baseDir, relName)
+		header := &tar.Header{
+			Name: tarEntryPath,
+			Size: int64(len(decrypted)),
+			Mode: 0644,
+		}
+		if err := tarWriter.WriteHeader(header); err != nil {
+			t.Fatalf("Failed to write tar header for %s: %v", relName, err)
+		}
+		if _, err := tarWriter.Write(decrypted); err != nil {
+			t.Fatalf("Failed to write tar content for %s: %v", relName, err)
+		}
+	}
+
+	tarWriter.Close()
+	tarFile.Close()
+
+	// Verify tar contains files with base path prefix
+	tarFile, err = os.Open(tarPath)
+	if err != nil {
+		t.Fatalf("Failed to open tar file for reading: %v", err)
+	}
+	defer tarFile.Close()
+
+	tarReader := tar.NewReader(tarFile)
+	foundFiles := make(map[string]bool)
+
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Failed to read tar header: %v", err)
+		}
+
+		foundFiles[header.Name] = true
+
+		// Verify path starts with base directory
+		if !strings.HasPrefix(header.Name, baseDir+string(filepath.Separator)) {
+			t.Errorf("Expected tar entry %q to start with base dir %q", header.Name, baseDir)
+		}
+
+		content, err := io.ReadAll(tarReader)
+		if err != nil {
+			t.Fatalf("Failed to read tar content for %s: %v", header.Name, err)
+		}
+
+		if strings.Contains(string(content), "ENC[AES256_GCM,") {
+			t.Errorf("Expected %s to be decrypted", header.Name)
+		}
+	}
+
+	if len(foundFiles) != 2 {
+		t.Errorf("Expected 2 files in tar, found %d", len(foundFiles))
+	}
+
+	// Verify expected paths
+	expectedPaths := []string{
+		filepath.Join(baseDir, "config.yml"),
+		filepath.Join(baseDir, "subdir", "config.yml"),
+	}
+	for _, expectedPath := range expectedPaths {
+		if !foundFiles[expectedPath] {
+			t.Errorf("Expected %s in tar, found: %v", expectedPath, foundFiles)
+		}
+	}
+}
+
+func TestDecryptToTarMultipleFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	// Generate keypair
+	identity, err := crypto.GenerateAgeKeypair()
+	if err != nil {
+		t.Fatalf("Failed to generate keypair: %v", err)
+	}
+
+	// Create config
+	cfg := createTestConfigWithSecrets(t, dir, identity)
+
+	// Create multiple test files
+	testFiles := map[string]string{
+		"config1.yml": "password: secret1\n",
+		"config2.yml": "password: secret2\n",
+	}
+
+	proc, err := processor.NewProcessor(cfg, nil)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+
+	if err := proc.SetupEncryption(); err != nil {
+		t.Fatalf("Failed to setup encryption: %v", err)
+	}
+
+	for name, content := range testFiles {
+		filePath := filepath.Join(dir, name)
+		if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+			t.Fatalf("Failed to write test file %s: %v", name, err)
+		}
+
+		encrypted, _, err := proc.ProcessFile(filePath, true)
+		if err != nil {
+			t.Fatalf("Failed to encrypt %s: %v", name, err)
+		}
+
+		if err := os.WriteFile(filePath, encrypted, 0644); err != nil {
+			t.Fatalf("Failed to write encrypted file %s: %v", name, err)
+		}
+	}
+
+	if err := proc.SaveEncryptedSecrets(); err != nil {
+		t.Fatalf("Failed to save secrets: %v", err)
+	}
+
+	// Decrypt to tar
+	tarPath := filepath.Join(dir, "all.tar")
+	tarFile, err := os.Create(tarPath)
+	if err != nil {
+		t.Fatalf("Failed to create tar file: %v", err)
+	}
+
+	tarWriter := tar.NewWriter(tarFile)
+
+	proc2, err := processor.NewProcessor(cfg, nil)
+	if err != nil {
+		t.Fatalf("Failed to create processor for decryption: %v", err)
+	}
+
+	if _, err := proc2.SetupDecryption([]age.Identity{identity}); err != nil {
+		t.Fatalf("Failed to setup decryption: %v", err)
+	}
+
+	baseDir := filepath.Base(cfg.ConfigDir())
+	for name := range testFiles {
+		filePath := filepath.Join(dir, name)
+		decrypted, _, err := proc2.ProcessFile(filePath, false)
+		if err != nil {
+			t.Fatalf("Failed to decrypt %s: %v", name, err)
+		}
+
+		// Include base directory in tar path
+		tarEntryPath := filepath.Join(baseDir, name)
+		header := &tar.Header{
+			Name: tarEntryPath,
+			Size: int64(len(decrypted)),
+			Mode: 0644,
+		}
+		if err := tarWriter.WriteHeader(header); err != nil {
+			t.Fatalf("Failed to write tar header for %s: %v", name, err)
+		}
+		if _, err := tarWriter.Write(decrypted); err != nil {
+			t.Fatalf("Failed to write tar content for %s: %v", name, err)
+		}
+	}
+
+	tarWriter.Close()
+	tarFile.Close()
+
+	// Verify tar contains both files
+	tarFile, err = os.Open(tarPath)
+	if err != nil {
+		t.Fatalf("Failed to open tar file for reading: %v", err)
+	}
+	defer tarFile.Close()
+
+	tarReader := tar.NewReader(tarFile)
+	foundFiles := make(map[string]bool)
+
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Failed to read tar header: %v", err)
+		}
+
+		foundFiles[header.Name] = true
+
+		content, err := io.ReadAll(tarReader)
+		if err != nil {
+			t.Fatalf("Failed to read tar content for %s: %v", header.Name, err)
+		}
+
+		if strings.Contains(string(content), "ENC[AES256_GCM,") {
+			t.Errorf("Expected %s to be decrypted", header.Name)
+		}
+	}
+
+	if len(foundFiles) != 2 {
+		t.Errorf("Expected 2 files in tar, found %d", len(foundFiles))
+	}
+
+	for name := range testFiles {
+		expectedPath := filepath.Join(baseDir, name)
+		if !foundFiles[expectedPath] {
+			t.Errorf("Expected %s in tar", expectedPath)
+		}
 	}
 }

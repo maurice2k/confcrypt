@@ -222,10 +222,11 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 				}
 
 				if !jsonOutput {
+					baseDir := filepath.Base(cfg.ConfigDir())
 					if renamedFile != file {
-						fmt.Printf("Encrypted: %s -> %s\n", relPath, renamedRelPath)
+						fmt.Printf("Encrypted: %s -> %s\n", filepath.Join(baseDir, relPath), filepath.Join(baseDir, renamedRelPath))
 					} else {
-						fmt.Printf("Encrypted: %s\n", relPath)
+						fmt.Printf("Encrypted: %s\n", filepath.Join(baseDir, relPath))
 					}
 				}
 			}
@@ -318,6 +319,7 @@ func runEncryptDryRun(proc *processor.Processor, cfg *config.Config, files []str
 		}
 
 		fmt.Println("Would encrypt:")
+		baseDir := filepath.Base(cfg.ConfigDir())
 		for file, fields := range result {
 			relPath, _ := filepath.Rel(cfg.ConfigDir(), file)
 			if relPath == "" {
@@ -338,9 +340,9 @@ func runEncryptDryRun(proc *processor.Processor, cfg *config.Config, files []str
 				if origRelPath == "" {
 					origRelPath = originalFile
 				}
-				fmt.Printf("  %s -> %s:\n", origRelPath, relPath)
+				fmt.Printf("  %s -> %s:\n", filepath.Join(baseDir, origRelPath), filepath.Join(baseDir, relPath))
 			} else {
-				fmt.Printf("  %s:\n", relPath)
+				fmt.Printf("  %s:\n", filepath.Join(baseDir, relPath))
 			}
 
 			for _, field := range fields {

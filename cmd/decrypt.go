@@ -1,9 +1,12 @@
 package cmd
 
 import (
+	"archive/tar"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"filippo.io/age"
 	"github.com/spf13/cobra"
@@ -19,6 +22,7 @@ var (
 	decryptYubiKeyFlag bool
 	decryptFIDO2Flag   bool
 	decryptOutputPath  string
+	decryptOutputTar   string
 )
 
 var decryptCmd = &cobra.Command{
@@ -44,6 +48,7 @@ func init() {
 	decryptCmd.Flags().BoolVar(&decryptYubiKeyFlag, "yubikey-key", false, "Use YubiKey HMAC challenge-response")
 	decryptCmd.Flags().BoolVar(&decryptFIDO2Flag, "fido2-key", false, "Use FIDO2 hmac-secret (requires CGO build)")
 	decryptCmd.Flags().StringVar(&decryptOutputPath, "output-path", "", "Write decrypted files to this directory (relative to .confcrypt.yml if not absolute)")
+	decryptCmd.Flags().StringVar(&decryptOutputTar, "output-tar", "", "Write decrypted files to tar archive (use '-' for stdout)")
 	// Allow --age-key and --ssh-key without a value (sets to "auto")
 	decryptCmd.Flags().Lookup("age-key").NoOptDefVal = AutoDetectMarker
 	decryptCmd.Flags().Lookup("ssh-key").NoOptDefVal = AutoDetectMarker
@@ -51,6 +56,16 @@ func init() {
 }
 
 func runDecrypt(cmd *cobra.Command, args []string) {
+	// Check mutually exclusive flags
+	if decryptOutputTar != "" && decryptOutputPath != "" {
+		fmt.Fprintf(os.Stderr, "Error: cannot use both --output-tar and --output-path\n")
+		os.Exit(1)
+	}
+	if decryptOutputTar != "" && toStdout {
+		fmt.Fprintf(os.Stderr, "Error: cannot use both --output-tar and --stdout\n")
+		os.Exit(1)
+	}
+
 	var singleFile string
 	cfgPath := resolvedConfigPath
 
@@ -117,6 +132,25 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 	}
 
 	if !hasEncrypted {
+		// If outputting to tar, create an empty tar file
+		if decryptOutputTar != "" {
+			var out io.Writer
+			if decryptOutputTar == "-" {
+				out = os.Stdout
+			} else {
+				f, err := os.Create(decryptOutputTar)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error creating tar file: %v\n", err)
+					os.Exit(1)
+				}
+				defer f.Close()
+				out = f
+			}
+			tw := tar.NewWriter(out)
+			tw.Close() // Creates valid empty tar with EOF blocks
+			fmt.Fprintf(os.Stderr, "No encrypted values found (empty tar created)\n")
+			os.Exit(0)
+		}
 		fmt.Println("No encrypted values found")
 		os.Exit(0)
 	}
@@ -134,15 +168,43 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Display which key was used
+	// Display which key was used (to stderr if tar goes to stdout)
+	printInfo := func(format string, args ...interface{}) {
+		if decryptOutputTar == "-" {
+			fmt.Fprintf(os.Stderr, format, args...)
+		} else {
+			fmt.Printf(format, args...)
+		}
+	}
 	if recipient := cfg.FindRecipientByKey(usedKey); recipient != nil {
 		if recipient.Name != "" {
-			fmt.Printf("Using key: %s (%s)\n", recipient.Name, truncateKey(usedKey))
+			printInfo("Using key: %s (%s)\n", recipient.Name, truncateKey(usedKey))
 		} else {
-			fmt.Printf("Using key: %s\n", truncateKey(usedKey))
+			printInfo("Using key: %s\n", truncateKey(usedKey))
 		}
 	} else {
-		fmt.Printf("Using key: %s\n", truncateKey(usedKey))
+		printInfo("Using key: %s\n", truncateKey(usedKey))
+	}
+
+	// Set up tar writer if --output-tar is specified
+	var tarWriter *tar.Writer
+	var tarFile *os.File
+	if decryptOutputTar != "" {
+		var out io.Writer
+		if decryptOutputTar == "-" {
+			out = os.Stdout
+		} else {
+			var err error
+			tarFile, err = os.Create(decryptOutputTar)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error creating tar file: %v\n", err)
+				os.Exit(1)
+			}
+			defer tarFile.Close()
+			out = tarFile
+		}
+		tarWriter = tar.NewWriter(out)
+		defer tarWriter.Close()
 	}
 
 	anyMACsRemoved := false
@@ -180,6 +242,40 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 
 		if toStdout {
 			fmt.Print(string(output))
+		} else if tarWriter != nil {
+			// Write to tar archive
+			// Apply rename rules to get final filename
+			outputName, err := cfg.GetDecryptRename(relPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error computing rename for %s: %v\n", relPath, err)
+				os.Exit(1)
+			}
+
+			// Include base directory name in tar path
+			baseDir := filepath.Base(cfg.ConfigDir())
+			tarPath := filepath.Join(baseDir, outputName)
+
+			header := &tar.Header{
+				Name:    tarPath,
+				Size:    int64(len(output)),
+				Mode:    0644,
+				ModTime: time.Now(),
+			}
+			if err := tarWriter.WriteHeader(header); err != nil {
+				fmt.Fprintf(os.Stderr, "Error writing tar header for %s: %v\n", outputName, err)
+				os.Exit(1)
+			}
+			if _, err := tarWriter.Write(output); err != nil {
+				fmt.Fprintf(os.Stderr, "Error writing tar content for %s: %v\n", outputName, err)
+				os.Exit(1)
+			}
+
+			// Display progress (to stderr if tar goes to stdout)
+			if decryptOutputTar == "-" {
+				fmt.Fprintf(os.Stderr, "Decrypted: %s\n", tarPath)
+			} else {
+				fmt.Printf("Decrypted: %s\n", tarPath)
+			}
 		} else if modified {
 			// Determine output file path
 			outputFile := file
@@ -234,15 +330,18 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 				anyMACsRemoved = true
 			}
 
-			// Display output
+			// Display output (include base directory for consistency)
 			outputRelPath, _ := filepath.Rel(cfg.ConfigDir(), outputFile)
 			if outputRelPath == "" {
 				outputRelPath = outputFile
 			}
+			baseDir := filepath.Base(cfg.ConfigDir())
+			displayPath := filepath.Join(baseDir, outputRelPath)
 			if outputFile != originalFile && decryptOutputPath == "" {
-				fmt.Printf("Decrypted: %s -> %s\n", relPath, outputRelPath)
+				displayFrom := filepath.Join(baseDir, relPath)
+				fmt.Printf("Decrypted: %s -> %s\n", displayFrom, displayPath)
 			} else {
-				fmt.Printf("Decrypted: %s\n", outputRelPath)
+				fmt.Printf("Decrypted: %s\n", displayPath)
 			}
 		}
 	}
@@ -257,7 +356,8 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 
 	// Check if all files are now fully decrypted (no encrypted values remain)
 	// If so, clear the secret store to trigger fresh key generation on next encrypt
-	if !toStdout {
+	// Skip this check for non-destructive exports (--output-tar, --output-path)
+	if !toStdout && decryptOutputTar == "" && decryptOutputPath == "" {
 		// Get ALL matching files (not just the ones processed via --file flag)
 		allFiles, err := cfg.GetMatchingFiles()
 		if err == nil && len(allFiles) > 0 {
