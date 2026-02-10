@@ -72,6 +72,29 @@ type KeyRule struct {
 
 const DefaultConfigName = ".confcrypt.yml"
 
+// FilePattern represents a file pattern with optional format override
+type FilePattern struct {
+	Pattern string // The glob pattern (e.g., "*.yml", "*.txt")
+	Format  string // Optional format override: "", "full", "yaml", "json", "env"
+}
+
+// ParseFilePattern parses a file pattern string that may include a format override
+// Format: "pattern" or "pattern:format" (e.g., "*.txt:full", "*.yml:json")
+func ParseFilePattern(pattern string) FilePattern {
+	// Check for :format suffix
+	if idx := strings.LastIndex(pattern, ":"); idx > 0 {
+		suffix := strings.ToLower(pattern[idx+1:])
+		switch suffix {
+		case "full", "yaml", "json", "env":
+			return FilePattern{
+				Pattern: pattern[:idx],
+				Format:  suffix,
+			}
+		}
+	}
+	return FilePattern{Pattern: pattern, Format: ""}
+}
+
 // Load loads the configuration from the specified path or searches for it
 func Load(configPath string) (*Config, error) {
 	if configPath == "" {
@@ -453,12 +476,34 @@ func (r *RecipientConfig) GetKeyType() crypto.KeyType {
 	return crypto.KeyTypeUnknown
 }
 
+// MatchedFile represents a file that matched a pattern, along with its format override
+type MatchedFile struct {
+	Path   string // Absolute path to the file
+	Format string // Format override from the pattern ("", "full", "yaml", "json", "env")
+}
+
 // GetMatchingFiles returns all files matching the configured patterns
 func (c *Config) GetMatchingFiles() ([]string, error) {
-	var files []string
-	seen := make(map[string]bool)
+	matched, err := c.GetMatchingFilesWithFormat()
+	if err != nil {
+		return nil, err
+	}
+	files := make([]string, len(matched))
+	for i, m := range matched {
+		files[i] = m.Path
+	}
+	return files, nil
+}
 
-	for _, pattern := range c.Files {
+// GetMatchingFilesWithFormat returns all files matching the configured patterns with format info
+// If a file matches multiple patterns, explicit format overrides (e.g., :full) take precedence
+func (c *Config) GetMatchingFilesWithFormat() ([]MatchedFile, error) {
+	var files []MatchedFile
+	seen := make(map[string]int) // path -> index in files slice
+
+	for _, patternStr := range c.Files {
+		fp := ParseFilePattern(patternStr)
+
 		// Walk the config directory and match files
 		err := filepath.Walk(c.configDir, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
@@ -485,15 +530,22 @@ func (c *Config) GetMatchingFiles() ([]string, error) {
 				return err
 			}
 
-			// Match against pattern
-			matched, err := matchPattern(pattern, relPath)
+			// Match against pattern (without format suffix)
+			matched, err := matchPattern(fp.Pattern, relPath)
 			if err != nil {
-				return fmt.Errorf("invalid pattern %q: %w", pattern, err)
+				return fmt.Errorf("invalid pattern %q: %w", fp.Pattern, err)
 			}
 
-			if matched && !seen[path] {
-				seen[path] = true
-				files = append(files, path)
+			if matched {
+				if idx, exists := seen[path]; exists {
+					// File already matched - explicit format override always takes precedence
+					if fp.Format != "" {
+						files[idx].Format = fp.Format
+					}
+				} else {
+					seen[path] = len(files)
+					files = append(files, MatchedFile{Path: path, Format: fp.Format})
+				}
 			}
 
 			return nil
@@ -613,26 +665,50 @@ func (c *Config) ConfigPath() string {
 
 // MatchesFile checks if the given absolute file path matches any of the configured file patterns
 func (c *Config) MatchesFile(absFilePath string) (bool, error) {
+	_, matched, err := c.MatchesFileWithFormat(absFilePath)
+	return matched, err
+}
+
+// MatchesFileWithFormat checks if the given absolute file path matches any of the configured file patterns
+// Returns the format override (if any) and whether the file matched
+// If multiple patterns match, explicit format overrides take precedence
+func (c *Config) MatchesFileWithFormat(absFilePath string) (string, bool, error) {
 	relPath, err := filepath.Rel(c.configDir, absFilePath)
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
 
 	// Check if file is outside config dir (starts with ..)
 	if strings.HasPrefix(relPath, "..") {
-		return false, nil
+		return "", false, nil
 	}
 
-	for _, pattern := range c.Files {
-		matched, err := matchPattern(pattern, relPath)
+	// Never match the config file itself
+	filename := filepath.Base(absFilePath)
+	if filename == ".confcrypt.yml" || filename == ".confcrypt.yaml" {
+		return "", false, nil
+	}
+
+	matchedFormat := ""
+	anyMatched := false
+
+	for _, patternStr := range c.Files {
+		fp := ParseFilePattern(patternStr)
+		matched, err := matchPattern(fp.Pattern, relPath)
 		if err != nil {
-			return false, err
+			return "", false, err
 		}
 		if matched {
-			return true, nil
+			anyMatched = true
+			// Explicit format override takes precedence
+			if fp.Format != "" {
+				matchedFormat = fp.Format
+			} else if matchedFormat == "" {
+				matchedFormat = fp.Format
+			}
 		}
 	}
-	return false, nil
+	return matchedFormat, anyMatched, nil
 }
 
 // AddFilePattern adds a file pattern to the config's files list

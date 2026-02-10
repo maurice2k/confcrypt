@@ -3,8 +3,290 @@ package format
 import (
 	"bytes"
 	"crypto/rand"
+	"strings"
 	"testing"
 )
+
+func TestChunkBase64(t *testing.T) {
+	tests := []struct {
+		name    string
+		data    string
+		lineLen int
+		want    string
+	}{
+		{
+			name:    "short data no chunking",
+			data:    "aGVsbG8gd29ybGQ=",
+			lineLen: 80,
+			want:    "aGVsbG8gd29ybGQ=",
+		},
+		{
+			name:    "exact line length",
+			data:    strings.Repeat("A", 80),
+			lineLen: 80,
+			want:    strings.Repeat("A", 80),
+		},
+		{
+			name:    "two lines",
+			data:    strings.Repeat("A", 100),
+			lineLen: 80,
+			want:    strings.Repeat("A", 80) + "\n" + strings.Repeat("A", 20),
+		},
+		{
+			name:    "three lines",
+			data:    strings.Repeat("B", 200),
+			lineLen: 80,
+			want:    strings.Repeat("B", 80) + "\n" + strings.Repeat("B", 80) + "\n" + strings.Repeat("B", 40),
+		},
+		{
+			name:    "empty data",
+			data:    "",
+			lineLen: 80,
+			want:    "",
+		},
+		{
+			name:    "zero line length",
+			data:    "test",
+			lineLen: 0,
+			want:    "test",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ChunkBase64(tt.data, tt.lineLen)
+			if got != tt.want {
+				t.Errorf("ChunkBase64() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUnchunkBase64(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want string
+	}{
+		{
+			name: "no newlines",
+			data: "aGVsbG8gd29ybGQ=",
+			want: "aGVsbG8gd29ybGQ=",
+		},
+		{
+			name: "with newlines",
+			data: "aGVsbG8g\nd29ybGQ=",
+			want: "aGVsbG8gd29ybGQ=",
+		},
+		{
+			name: "with multiple newlines",
+			data: "aGVs\nbG8g\nd29y\nbGQ=",
+			want: "aGVsbG8gd29ybGQ=",
+		},
+		{
+			name: "with CRLF",
+			data: "aGVsbG8g\r\nd29ybGQ=",
+			want: "aGVsbG8gd29ybGQ=",
+		},
+		{
+			name: "with spaces",
+			data: "aGVsbG8g d29ybGQ=",
+			want: "aGVsbG8gd29ybGQ=",
+		},
+		{
+			name: "with tabs",
+			data: "aGVsbG8g\td29ybGQ=",
+			want: "aGVsbG8gd29ybGQ=",
+		},
+		{
+			name: "empty",
+			data: "",
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := UnchunkBase64(tt.data)
+			if got != tt.want {
+				t.Errorf("UnchunkBase64() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestChunkUnchunkRoundTrip(t *testing.T) {
+	// Test that chunking and unchunking is reversible
+	original := strings.Repeat("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", 10) + "=="
+
+	chunked := ChunkBase64(original, 80)
+	unchunked := UnchunkBase64(chunked)
+
+	if unchunked != original {
+		t.Errorf("Round trip failed: got %q, want %q", unchunked, original)
+	}
+}
+
+func TestIsFullFileEncrypted(t *testing.T) {
+	tests := []struct {
+		name    string
+		content []byte
+		want    bool
+	}{
+		{
+			name:    "valid full file encrypted",
+			content: []byte("$CONFCRYPT_ENCRYPTED;ENC[AES256_GCM,data:test,iv:abc,tag:xyz,type:bytes]"),
+			want:    true,
+		},
+		{
+			name:    "regular encrypted value",
+			content: []byte("ENC[AES256_GCM,data:test,iv:abc,tag:xyz,type:str]"),
+			want:    false,
+		},
+		{
+			name:    "plain text",
+			content: []byte("hello world"),
+			want:    false,
+		},
+		{
+			name:    "empty",
+			content: []byte(""),
+			want:    false,
+		},
+		{
+			name:    "partial header",
+			content: []byte("$CONFCRYPT"),
+			want:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := IsFullFileEncrypted(tt.content)
+			if got != tt.want {
+				t.Errorf("IsFullFileEncrypted() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFormatParseFullFileRoundTrip(t *testing.T) {
+	// Create a test encrypted value
+	ev := &EncryptedValue{
+		Data: []byte("hello world this is some test data that will be encrypted"),
+		IV:   []byte("123456789012"),     // 12 bytes
+		Tag:  []byte("1234567890123456"), // 16 bytes
+		Type: TypeBytes,
+	}
+
+	// Format it
+	formatted := FormatFullFileEncrypted(ev)
+
+	// Check it has the header
+	if !strings.HasPrefix(formatted, FullFileHeader) {
+		t.Errorf("Missing header prefix")
+	}
+
+	// Check it has newlines (chunked)
+	if !strings.Contains(formatted, "\n") {
+		// Only check for long data that would need chunking
+		if len(ev.Data) > 50 { // Base64 of 50 bytes is > 66 chars
+			t.Errorf("Expected chunked output with newlines")
+		}
+	}
+
+	// Parse it back
+	parsed, err := ParseFullFileEncrypted(formatted)
+	if err != nil {
+		t.Fatalf("ParseFullFileEncrypted() error = %v", err)
+	}
+
+	// Compare
+	if string(parsed.Data) != string(ev.Data) {
+		t.Errorf("Data mismatch: got %q, want %q", parsed.Data, ev.Data)
+	}
+	if string(parsed.IV) != string(ev.IV) {
+		t.Errorf("IV mismatch: got %q, want %q", parsed.IV, ev.IV)
+	}
+	if string(parsed.Tag) != string(ev.Tag) {
+		t.Errorf("Tag mismatch: got %q, want %q", parsed.Tag, ev.Tag)
+	}
+	if parsed.Type != ev.Type {
+		t.Errorf("Type mismatch: got %q, want %q", parsed.Type, ev.Type)
+	}
+}
+
+func TestFormatFullFileEncryptedChunking(t *testing.T) {
+	// Create a large encrypted value that will need chunking
+	largeData := make([]byte, 1000)
+	for i := range largeData {
+		largeData[i] = byte(i % 256)
+	}
+
+	ev := &EncryptedValue{
+		Data: largeData,
+		IV:   []byte("123456789012"),
+		Tag:  []byte("1234567890123456"),
+		Type: TypeBytes,
+	}
+
+	formatted := FormatFullFileEncrypted(ev)
+
+	// Count newlines in the data section (between "data:\n" and "\n,iv:")
+	dataStart := strings.Index(formatted, "data:\n") + 6
+	dataEnd := strings.Index(formatted, "\n,iv:")
+	dataSection := formatted[dataStart:dataEnd]
+
+	lines := strings.Split(dataSection, "\n")
+	for i, line := range lines {
+		if i < len(lines)-1 { // Not the last line
+			if len(line) != 80 {
+				t.Errorf("Line %d has length %d, expected 80", i, len(line))
+			}
+		}
+		// Last line can be shorter (remainder)
+	}
+
+	// Verify the format has ,iv: on its own line
+	if !strings.Contains(formatted, "\n,iv:") {
+		t.Error("Expected ,iv: to be on its own line")
+	}
+}
+
+func TestParseFullFileEncryptedInvalid(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{
+			name:    "missing header",
+			content: "ENC[AES256_GCM,data:dGVzdA==,iv:MTIzNDU2Nzg5MDEy,tag:MTIzNDU2Nzg5MDEyMzQ1Ng==,type:bytes]",
+		},
+		{
+			name:    "invalid IV length",
+			content: "$CONFCRYPT_ENCRYPTED;ENC[AES256_GCM,data:dGVzdA==,iv:MTIz,tag:MTIzNDU2Nzg5MDEyMzQ1Ng==,type:bytes]",
+		},
+		{
+			name:    "invalid tag length",
+			content: "$CONFCRYPT_ENCRYPTED;ENC[AES256_GCM,data:dGVzdA==,iv:MTIzNDU2Nzg5MDEy,tag:MTIz,type:bytes]",
+		},
+		{
+			name:    "invalid base64",
+			content: "$CONFCRYPT_ENCRYPTED;ENC[AES256_GCM,data:!!!invalid!!!,iv:MTIzNDU2Nzg5MDEy,tag:MTIzNDU2Nzg5MDEyMzQ1Ng==,type:bytes]",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ParseFullFileEncrypted(tt.content)
+			if err == nil {
+				t.Error("Expected error but got nil")
+			}
+		})
+	}
+}
+
+// --- Restored core ENC[...] value tests ---
 
 func TestIsEncrypted(t *testing.T) {
 	testCases := []struct {
@@ -55,7 +337,6 @@ func TestFormatEncryptedValue(t *testing.T) {
 }
 
 func TestParseEncryptedValue(t *testing.T) {
-	// Create a valid encrypted value
 	ev := &EncryptedValue{
 		Data: []byte("test data"),
 		IV:   []byte("123456789012"),

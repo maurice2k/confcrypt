@@ -40,32 +40,36 @@ func runCheck(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Get files to process
-	files, err := GetFilesToProcess(cfg)
+	// Get files to process (with format information)
+	filesWithFormat, err := GetFilesToProcessWithFormat(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
-	if len(files) == 0 {
+	if len(filesWithFormat) == 0 {
 		fmt.Fprintf(os.Stderr, "Warning: No files matched the configured patterns\n")
 		os.Exit(0)
 	}
 
 	foundUnencrypted := false
 
-	for _, file := range files {
-		unencrypted, err := proc.CheckFile(file)
+	for _, f := range filesWithFormat {
+		unencrypted, err := proc.CheckFile(f.Path, f.Format)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error checking %s: %v\n", file, err)
+			fmt.Fprintf(os.Stderr, "Error checking %s: %v\n", f.Path, err)
 			os.Exit(1)
 		}
 
 		if len(unencrypted) > 0 {
 			foundUnencrypted = true
-			fmt.Printf("%s:\n", file)
+			fmt.Printf("%s:\n", f.Path)
 			for _, r := range unencrypted {
-				fmt.Printf("  - %s\n", strings.Join(r.Path, "."))
+				name := strings.Join(r.Path, ".")
+				if name == "" {
+					name = r.KeyName
+				}
+				fmt.Printf("  - %s\n", name)
 			}
 		}
 	}

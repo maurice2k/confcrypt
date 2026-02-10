@@ -25,6 +25,7 @@ const (
 	FormatYAML FileFormat = iota
 	FormatJSON
 	FormatEnv
+	FormatFull // Full file encryption (binary or text)
 )
 
 // IdentityLoader is a function that loads age identities
@@ -170,16 +171,27 @@ func (p *Processor) SaveEncryptedSecrets() error {
 }
 
 // ProcessFile processes a single file for encryption or decryption
-func (p *Processor) ProcessFile(filePath string, encrypt bool) ([]byte, bool, error) {
-	fileFormat := DetectFormat(filePath)
+// The optional formatOverride parameter can be used to force a specific format
+func (p *Processor) ProcessFile(filePath string, encrypt bool, formatOverride ...string) ([]byte, bool, error) {
+	var override string
+	if len(formatOverride) > 0 {
+		override = formatOverride[0]
+	}
+	fileFormat := DetectFormat(filePath, override)
 
 	content, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to read file: %w", err)
 	}
 
+	return p.ProcessContent(content, filePath, encrypt, fileFormat)
+}
+
+// ProcessContent processes content with a specific format for encryption or decryption
+func (p *Processor) ProcessContent(content []byte, filePath string, encrypt bool, fileFormat FileFormat) ([]byte, bool, error) {
 	var output []byte
 	var modified bool
+	var err error
 
 	switch fileFormat {
 	case FormatYAML:
@@ -213,6 +225,14 @@ func (p *Processor) ProcessFile(filePath string, encrypt bool) ([]byte, bool, er
 			return content, false, nil
 		}
 		output = envFile.Marshal()
+	case FormatFull:
+		output, modified, err = p.processFullFile(content, encrypt)
+		if err != nil {
+			return nil, false, err
+		}
+		if !modified {
+			return content, false, nil
+		}
 	default:
 		return nil, false, fmt.Errorf("unsupported file format")
 	}
@@ -454,6 +474,49 @@ func (p *Processor) processEnv(content []byte, encrypt bool) (*EnvFile, bool, er
 	return envFile, modified, nil
 }
 
+// processFullFile processes a file for full file encryption/decryption
+func (p *Processor) processFullFile(content []byte, encrypt bool) ([]byte, bool, error) {
+	if encrypt {
+		// Check if already encrypted
+		if format.IsFullFileEncrypted(content) {
+			return content, false, nil
+		}
+
+		// Encrypt the entire content
+		ciphertext, iv, tag, err := crypto.EncryptAESGCM(p.aesKey, content)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to encrypt file: %w", err)
+		}
+
+		ev := &format.EncryptedValue{
+			Data: ciphertext,
+			IV:   iv,
+			Tag:  tag,
+			Type: format.TypeBytes,
+		}
+
+		output := format.FormatFullFileEncrypted(ev)
+		return []byte(output), true, nil
+	}
+
+	// Decrypt
+	if !format.IsFullFileEncrypted(content) {
+		return content, false, nil
+	}
+
+	ev, err := format.ParseFullFileEncrypted(string(content))
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to parse encrypted file: %w", err)
+	}
+
+	plaintext, err := crypto.DecryptAESGCM(p.aesKey, ev.Data, ev.IV, ev.Tag)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to decrypt file: %w", err)
+	}
+
+	return plaintext, true, nil
+}
+
 // transformData recursively transforms data for encryption/decryption
 func (p *Processor) transformData(data *interface{}, path []string, encrypt bool) (bool, error) {
 	modified := false
@@ -552,12 +615,30 @@ func (p *Processor) decryptValue(encStr string) (interface{}, error) {
 }
 
 // CheckFile checks a file for unencrypted keys that should be encrypted
-func (p *Processor) CheckFile(filePath string) ([]MatchResult, error) {
-	fileFormat := DetectFormat(filePath)
+// The optional formatOverride parameter can be used to force a specific format
+func (p *Processor) CheckFile(filePath string, formatOverride ...string) ([]MatchResult, error) {
+	var override string
+	if len(formatOverride) > 0 {
+		override = formatOverride[0]
+	}
+	fileFormat := DetectFormat(filePath, override)
 
 	content, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read file: %w", err)
+	}
+
+	// For full file encryption, check if file is already encrypted
+	if fileFormat == FormatFull {
+		if format.IsFullFileEncrypted(content) {
+			return nil, nil // Already encrypted
+		}
+		// Return a single result indicating the entire file should be encrypted
+		return []MatchResult{{
+			KeyName:   "(full file)",
+			Path:      []string{},
+			Encrypted: false,
+		}}, nil
 	}
 
 	var data interface{}
@@ -608,6 +689,16 @@ func (p *Processor) WriteFile(filePath string, content []byte) error {
 
 // ComputeMAC computes the MAC (SHA256 hash of all encrypted values) for a file
 func (p *Processor) ComputeMAC(content []byte, fileFormat FileFormat) ([]byte, error) {
+	// For full file encryption, the MAC is the hash of the entire encrypted content
+	if fileFormat == FormatFull {
+		if !format.IsFullFileEncrypted(content) {
+			return nil, fmt.Errorf("file is not encrypted")
+		}
+		h := sha256.New()
+		h.Write(content)
+		return h.Sum(nil), nil
+	}
+
 	var data interface{}
 
 	switch fileFormat {
@@ -686,8 +777,13 @@ func (p *Processor) EncryptMAC(hash []byte) (string, error) {
 }
 
 // VerifyMAC verifies the MAC for a file
-func (p *Processor) VerifyMAC(filePath string, content []byte) error {
-	fileFormat := DetectFormat(filePath)
+// The optional formatOverride parameter can be used to force a specific format
+func (p *Processor) VerifyMAC(filePath string, content []byte, formatOverride ...string) error {
+	var override string
+	if len(formatOverride) > 0 {
+		override = formatOverride[0]
+	}
+	fileFormat := DetectFormat(filePath, override)
 
 	// Get relative path for MAC lookup
 	relPath, err := filepath.Rel(p.config.ConfigDir(), filePath)
@@ -727,8 +823,18 @@ func (p *Processor) VerifyMAC(filePath string, content []byte) error {
 }
 
 // HasEncryptedValues checks if file content contains any encrypted values
-func (p *Processor) HasEncryptedValues(content []byte, filePath string) bool {
-	fileFormat := DetectFormat(filePath)
+// The optional formatOverride parameter can be used to force a specific format
+func (p *Processor) HasEncryptedValues(content []byte, filePath string, formatOverride ...string) bool {
+	var override string
+	if len(formatOverride) > 0 {
+		override = formatOverride[0]
+	}
+	fileFormat := DetectFormat(filePath, override)
+
+	// For full file encryption, check for the header
+	if fileFormat == FormatFull {
+		return format.IsFullFileEncrypted(content)
+	}
 
 	var data interface{}
 	switch fileFormat {
@@ -761,8 +867,18 @@ func (p *Processor) HasEncryptedValues(content []byte, filePath string) bool {
 }
 
 // HasUnencryptedValues checks if file content contains any unencrypted values that match encryption rules
-func (p *Processor) HasUnencryptedValues(content []byte, filePath string) bool {
-	fileFormat := DetectFormat(filePath)
+// The optional formatOverride parameter can be used to force a specific format
+func (p *Processor) HasUnencryptedValues(content []byte, filePath string, formatOverride ...string) bool {
+	var override string
+	if len(formatOverride) > 0 {
+		override = formatOverride[0]
+	}
+	fileFormat := DetectFormat(filePath, override)
+
+	// For full file encryption, check if NOT encrypted (entire file should be encrypted)
+	if fileFormat == FormatFull {
+		return !format.IsFullFileEncrypted(content)
+	}
 
 	var data interface{}
 	switch fileFormat {
@@ -824,8 +940,13 @@ func (p *Processor) hasUnencryptedValuesRecursive(data interface{}, path []strin
 }
 
 // UpdateMAC computes and stores the MAC for a file
-func (p *Processor) UpdateMAC(filePath string, content []byte) error {
-	fileFormat := DetectFormat(filePath)
+// The optional formatOverride parameter can be used to force a specific format
+func (p *Processor) UpdateMAC(filePath string, content []byte, formatOverride ...string) error {
+	var override string
+	if len(formatOverride) > 0 {
+		override = formatOverride[0]
+	}
+	fileFormat := DetectFormat(filePath, override)
 
 	// Compute MAC
 	hash, err := p.ComputeMAC(content, fileFormat)
@@ -849,10 +970,40 @@ func (p *Processor) UpdateMAC(filePath string, content []byte) error {
 	return nil
 }
 
-// DetectFormat determines the file format from extension
-func DetectFormat(filePath string) FileFormat {
+// DetectFormat determines the file format from extension and optional override
+// The override parameter can be "full", "yaml", "json", or "env" to force a specific format
+func DetectFormat(filePath string, override ...string) FileFormat {
+	// Check for explicit override
+	if len(override) > 0 && override[0] != "" {
+		switch strings.ToLower(override[0]) {
+		case "full":
+			return FormatFull
+		case "yaml":
+			return FormatYAML
+		case "json":
+			return FormatJSON
+		case "env":
+			return FormatEnv
+		}
+	}
+
 	base := filepath.Base(filePath)
 	ext := strings.ToLower(filepath.Ext(filePath))
+
+	// Implicit full encryption for known sensitive file patterns
+	// Extension-based: *.key, *.pem, *.p12, *.pfx, *.p8, *.keystore, *.jks
+	switch ext {
+	case ".key", ".pem", ".p12", ".pfx", ".p8", ".keystore", ".jks":
+		return FormatFull
+	}
+
+	// SSH keys: id_ed25519*, id_rsa*, id_ecdsa*, id_dsa*
+	if strings.HasPrefix(base, "id_ed25519") ||
+		strings.HasPrefix(base, "id_rsa") ||
+		strings.HasPrefix(base, "id_ecdsa") ||
+		strings.HasPrefix(base, "id_dsa") {
+		return FormatFull
+	}
 
 	// Check for .env files: .env, *.env (e.g., database.env), .env.* (e.g., .env.local)
 	if base == ".env" || ext == ".env" || strings.HasPrefix(base, ".env.") {

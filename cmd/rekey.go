@@ -71,29 +71,35 @@ func runRekey(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Get all files
-	files, err := cfg.GetMatchingFiles()
+	// Get all files (with format information)
+	filesWithFormat, err := cfg.GetMatchingFilesWithFormat()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
+	// Build file formats map
+	fileFormats := make(map[string]string)
+	for _, f := range filesWithFormat {
+		fileFormats[f.Path] = f.Format
+	}
+
 	// Decrypt all files first
 	decryptedFiles := make(map[string][]byte)
-	for _, file := range files {
-		content, err := os.ReadFile(file)
+	for _, f := range filesWithFormat {
+		content, err := os.ReadFile(f.Path)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading %s: %v\n", file, err)
+			fmt.Fprintf(os.Stderr, "Error reading %s: %v\n", f.Path, err)
 			os.Exit(1)
 		}
 
-		if proc.HasEncryptedValues(content, file) {
-			output, _, err := proc.ProcessFile(file, false) // decrypt
+		if proc.HasEncryptedValues(content, f.Path, f.Format) {
+			output, _, err := proc.ProcessFile(f.Path, false, f.Format) // decrypt
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error decrypting %s: %v\n", file, err)
+				fmt.Fprintf(os.Stderr, "Error decrypting %s: %v\n", f.Path, err)
 				os.Exit(1)
 			}
-			decryptedFiles[file] = output
+			decryptedFiles[f.Path] = output
 		}
 	}
 
@@ -128,7 +134,7 @@ func runRekey(cmd *cobra.Command, args []string) {
 		}
 
 		// Re-encrypt with new key
-		output, _, err := proc2.ProcessFile(file, true) // encrypt
+		output, _, err := proc2.ProcessFile(file, true, fileFormats[file]) // encrypt
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error re-encrypting %s: %v\n", file, err)
 			os.Exit(1)
@@ -140,7 +146,7 @@ func runRekey(cmd *cobra.Command, args []string) {
 		}
 
 		// Update MAC
-		if err := proc2.UpdateMAC(file, output); err != nil {
+		if err := proc2.UpdateMAC(file, output, fileFormats[file]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error updating MAC for %s: %v\n", file, err)
 			os.Exit(1)
 		}

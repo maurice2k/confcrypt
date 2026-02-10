@@ -4,3 +4,5 @@ build/
 test*/
 .confcrypt.yml
 .idea/
+.cursor/
+

@@ -77,13 +77,11 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Get files to process
-	var files []string
+	// Get files to process (with format information)
+	var filesWithFormat []FileWithFormat
 	if singleFile != "" {
-		files = []string{singleFile}
-
-		// Check if file matches existing patterns
-		matches, err := cfg.MatchesFile(singleFile)
+		// Check if file matches existing patterns and get format
+		format, matches, err := cfg.MatchesFileWithFormat(singleFile)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error checking file pattern: %v\n", err)
 			os.Exit(1)
@@ -98,12 +96,21 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 			}
 			os.Exit(1)
 		}
+		filesWithFormat = []FileWithFormat{{Path: singleFile, Format: format}}
 	} else {
-		files, err = GetFilesToProcess(cfg)
+		filesWithFormat, err = GetFilesToProcessWithFormat(cfg)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+	}
+
+	// Extract file paths for backwards compatibility
+	files := make([]string, len(filesWithFormat))
+	fileFormats := make(map[string]string)
+	for i, f := range filesWithFormat {
+		files[i] = f.Path
+		fileFormats[f.Path] = f.Format
 	}
 
 	if len(files) == 0 {
@@ -117,7 +124,7 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 
 	// Handle dry-run mode (preview only, no changes)
 	if dryRun {
-		runEncryptDryRun(proc, cfg, files)
+		runEncryptDryRun(proc, cfg, files, fileFormats)
 		return
 	}
 
@@ -128,9 +135,41 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 		if err != nil {
 			continue
 		}
-		if proc.HasUnencryptedValues(content, file) {
+		if proc.HasUnencryptedValues(content, file, fileFormats[file]) {
 			hasUnencrypted = true
 			break
+		}
+	}
+
+	// Clean up stale MACs for files that no longer exist (even if nothing to encrypt)
+	if !toStdout && cfg.Confcrypt != nil && cfg.Confcrypt.MACs != nil {
+		allMatchingFiles, err := cfg.GetMatchingFiles()
+		if err == nil {
+			// Build set of valid relative paths
+			validPaths := make(map[string]bool)
+			for _, absPath := range allMatchingFiles {
+				relPath, _ := filepath.Rel(cfg.ConfigDir(), absPath)
+				if relPath != "" {
+					validPaths[relPath] = true
+				}
+			}
+
+			// Remove MACs for files that no longer exist
+			macsRemoved := false
+			for macPath := range cfg.Confcrypt.MACs {
+				if !validPaths[macPath] {
+					cfg.RemoveMAC(macPath)
+					macsRemoved = true
+				}
+			}
+
+			// Save config if MACs were removed
+			if macsRemoved {
+				if err := cfg.Save(); err != nil {
+					fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
+					os.Exit(1)
+				}
+			}
 		}
 	}
 
@@ -148,16 +187,20 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 	if jsonOutput {
 		encryptedFields = make(map[string][]string)
 		for _, file := range files {
-			unencrypted, err := proc.CheckFile(file)
+			unencrypted, err := proc.CheckFile(file, fileFormats[file])
 			if err != nil {
 				continue
 			}
-			if len(unencrypted) > 0 {
-				var fields []string
-				for _, r := range unencrypted {
-					fields = append(fields, strings.Join(r.Path, "."))
+		if len(unencrypted) > 0 {
+			var fields []string
+			for _, r := range unencrypted {
+				name := strings.Join(r.Path, ".")
+				if name == "" {
+					name = r.KeyName
 				}
-				encryptedFields[file] = fields
+				fields = append(fields, name)
+			}
+			encryptedFields[file] = fields
 			}
 		}
 	}
@@ -177,7 +220,7 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 			relPath = file
 		}
 
-		output, modified, err := proc.ProcessFile(file, true)
+		output, modified, err := proc.ProcessFile(file, true, fileFormats[file])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error processing %s: %v\n", relPath, err)
 			os.Exit(1)
@@ -216,7 +259,7 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 				if renamedRelPath == "" {
 					renamedRelPath = renamedFile
 				}
-				if err := proc.UpdateMAC(renamedFile, output); err != nil {
+				if err := proc.UpdateMAC(renamedFile, output, fileFormats[file]); err != nil {
 					fmt.Fprintf(os.Stderr, "Error updating MAC for %s: %v\n", renamedRelPath, err)
 					os.Exit(1)
 				}
@@ -227,6 +270,30 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 						fmt.Printf("Encrypted: %s -> %s\n", filepath.Join(baseDir, relPath), filepath.Join(baseDir, renamedRelPath))
 					} else {
 						fmt.Printf("Encrypted: %s\n", filepath.Join(baseDir, relPath))
+					}
+				}
+			}
+		}
+	}
+
+	// Clean up stale MACs for files that no longer exist
+	if anyModified && !toStdout {
+		allMatchingFiles, err := cfg.GetMatchingFiles()
+		if err == nil {
+			// Build set of valid relative paths
+			validPaths := make(map[string]bool)
+			for _, absPath := range allMatchingFiles {
+				relPath, _ := filepath.Rel(cfg.ConfigDir(), absPath)
+				if relPath != "" {
+					validPaths[relPath] = true
+				}
+			}
+
+			// Remove MACs for files that no longer exist
+			if cfg.Confcrypt != nil && cfg.Confcrypt.MACs != nil {
+				for macPath := range cfg.Confcrypt.MACs {
+					if !validPaths[macPath] {
+						cfg.RemoveMAC(macPath)
 					}
 				}
 			}
@@ -267,13 +334,13 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 }
 
 // runEncryptDryRun handles --dry-run and --json output modes
-func runEncryptDryRun(proc *processor.Processor, cfg *config.Config, files []string) {
+func runEncryptDryRun(proc *processor.Processor, cfg *config.Config, files []string, fileFormats map[string]string) {
 	// Collect unencrypted keys per file (with renamed paths)
 	result := make(map[string][]string)
 	renames := make(map[string]string) // original -> renamed
 
 	for _, file := range files {
-		unencrypted, err := proc.CheckFile(file)
+		unencrypted, err := proc.CheckFile(file, fileFormats[file])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error checking %s: %v\n", file, err)
 			os.Exit(1)
@@ -282,7 +349,11 @@ func runEncryptDryRun(proc *processor.Processor, cfg *config.Config, files []str
 		if len(unencrypted) > 0 {
 			var fields []string
 			for _, r := range unencrypted {
-				fields = append(fields, strings.Join(r.Path, "."))
+				name := strings.Join(r.Path, ".")
+				if name == "" {
+					name = r.KeyName
+				}
+				fields = append(fields, name)
 			}
 
 			// Compute renamed path for output

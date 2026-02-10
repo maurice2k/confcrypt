@@ -31,8 +31,17 @@ type EncryptedValue struct {
 const encPrefix = "ENC[AES256_GCM,"
 const encSuffix = "]"
 
+// FullFileHeader is the marker at the start of fully encrypted files
+const FullFileHeader = "$CONFCRYPT_ENCRYPTED;"
+
+// ChunkLineLength is the number of characters per line for chunked base64 output
+const ChunkLineLength = 80
+
 // encRegex matches the ENC[...] format
 var encRegex = regexp.MustCompile(`^ENC\[AES256_GCM,data:([A-Za-z0-9+/=]*),iv:([A-Za-z0-9+/=]+),tag:([A-Za-z0-9+/=]+),type:(str|int|float|bool|null|bytes)\]$`)
+
+// fullFileRegex matches the full file encrypted format (with optional newlines in data and before ,iv:)
+var fullFileRegex = regexp.MustCompile(`^\$CONFCRYPT_ENCRYPTED;ENC\[AES256_GCM,data:\n?([\s\S]*?)\n?,iv:([A-Za-z0-9+/=]+),tag:([A-Za-z0-9+/=]+),type:(str|int|float|bool|null|bytes)\]$`)
 
 // IsEncrypted checks if a string value is already encrypted
 func IsEncrypted(s string) bool {
@@ -153,4 +162,99 @@ func StringToValue(s string, t ValueType) (interface{}, error) {
 	default:
 		return s, nil
 	}
+}
+
+// IsFullFileEncrypted checks if content is a fully encrypted file
+func IsFullFileEncrypted(content []byte) bool {
+	return len(content) > len(FullFileHeader) && string(content[:len(FullFileHeader)]) == FullFileHeader
+}
+
+// FormatFullFileEncrypted formats an encrypted value for full file encryption
+// The output includes the header and chunked base64 data
+func FormatFullFileEncrypted(ev *EncryptedValue) string {
+	dataB64 := base64.StdEncoding.EncodeToString(ev.Data)
+	chunkedData := ChunkBase64(dataB64, ChunkLineLength)
+
+	return fmt.Sprintf("%s%sdata:\n%s\n,iv:%s,tag:%s,type:%s%s",
+		FullFileHeader,
+		encPrefix,
+		chunkedData,
+		base64.StdEncoding.EncodeToString(ev.IV),
+		base64.StdEncoding.EncodeToString(ev.Tag),
+		ev.Type,
+		encSuffix,
+	)
+}
+
+// ParseFullFileEncrypted parses a fully encrypted file content
+func ParseFullFileEncrypted(content string) (*EncryptedValue, error) {
+	matches := fullFileRegex.FindStringSubmatch(content)
+	if matches == nil {
+		return nil, fmt.Errorf("invalid full file encrypted format")
+	}
+
+	// Unchunk the base64 data (remove newlines)
+	dataB64 := UnchunkBase64(matches[1])
+
+	data, err := base64.StdEncoding.DecodeString(dataB64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid base64 in data field: %w", err)
+	}
+
+	iv, err := base64.StdEncoding.DecodeString(matches[2])
+	if err != nil {
+		return nil, fmt.Errorf("invalid base64 in iv field: %w", err)
+	}
+
+	tag, err := base64.StdEncoding.DecodeString(matches[3])
+	if err != nil {
+		return nil, fmt.Errorf("invalid base64 in tag field: %w", err)
+	}
+
+	if len(iv) != 12 {
+		return nil, fmt.Errorf("invalid IV length: expected 12, got %d", len(iv))
+	}
+
+	if len(tag) != 16 {
+		return nil, fmt.Errorf("invalid tag length: expected 16, got %d", len(tag))
+	}
+
+	return &EncryptedValue{
+		Data: data,
+		IV:   iv,
+		Tag:  tag,
+		Type: ValueType(matches[4]),
+	}, nil
+}
+
+// ChunkBase64 splits a base64 string into lines of the specified length
+func ChunkBase64(data string, lineLen int) string {
+	if lineLen <= 0 || len(data) <= lineLen {
+		return data
+	}
+
+	var result strings.Builder
+	for i := 0; i < len(data); i += lineLen {
+		end := i + lineLen
+		if end > len(data) {
+			end = len(data)
+		}
+		if i > 0 {
+			result.WriteByte('\n')
+		}
+		result.WriteString(data[i:end])
+	}
+	return result.String()
+}
+
+// UnchunkBase64 removes newlines and whitespace from chunked base64 data
+func UnchunkBase64(data string) string {
+	// Remove all whitespace (newlines, spaces, tabs)
+	var result strings.Builder
+	for _, c := range data {
+		if c != '\n' && c != '\r' && c != ' ' && c != '\t' {
+			result.WriteRune(c)
+		}
+	}
+	return result.String()
 }

@@ -47,7 +47,7 @@ func init() {
 	decryptCmd.Flags().StringVar(&decryptSSHKeyFile, "ssh-key", "", "Path to SSH private key file (use without value to force SSH auto-detect)")
 	decryptCmd.Flags().BoolVar(&decryptYubiKeyFlag, "yubikey-key", false, "Use YubiKey HMAC challenge-response")
 	decryptCmd.Flags().BoolVar(&decryptFIDO2Flag, "fido2-key", false, "Use FIDO2 hmac-secret (requires CGO build)")
-	decryptCmd.Flags().StringVar(&decryptOutputPath, "output-path", "", "Write decrypted files to this directory (relative to .confcrypt.yml if not absolute)")
+	decryptCmd.Flags().StringVar(&decryptOutputPath, "output-path", "", "Write decrypted files to this directory (relative to current working directory if not absolute)")
 	decryptCmd.Flags().StringVar(&decryptOutputTar, "output-tar", "", "Write decrypted files to tar archive (use '-' for stdout)")
 	// Allow --age-key and --ssh-key without a value (sets to "auto")
 	decryptCmd.Flags().Lookup("age-key").NoOptDefVal = AutoDetectMarker
@@ -101,16 +101,26 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Get files to process
-	var files []string
+	// Get files to process (with format information)
+	var filesWithFormat []FileWithFormat
 	if singleFile != "" {
-		files = []string{singleFile}
+		// Get format from config if the file matches a pattern
+		format, _, _ := cfg.MatchesFileWithFormat(singleFile)
+		filesWithFormat = []FileWithFormat{{Path: singleFile, Format: format}}
 	} else {
-		files, err = GetFilesToProcess(cfg)
+		filesWithFormat, err = GetFilesToProcessWithFormat(cfg)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+	}
+
+	// Extract file paths for backwards compatibility
+	files := make([]string, len(filesWithFormat))
+	fileFormats := make(map[string]string)
+	for i, f := range filesWithFormat {
+		files[i] = f.Path
+		fileFormats[f.Path] = f.Format
 	}
 
 	if len(files) == 0 {
@@ -125,7 +135,7 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 		if err != nil {
 			continue
 		}
-		if proc.HasEncryptedValues(content, file) {
+		if proc.HasEncryptedValues(content, file, fileFormats[file]) {
 			hasEncrypted = true
 			break
 		}
@@ -222,8 +232,8 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 		}
 
 		// Only verify MAC if file has encrypted values
-		if proc.HasEncryptedValues(content, file) {
-			if err := proc.VerifyMAC(file, content); err != nil {
+		if proc.HasEncryptedValues(content, file, fileFormats[file]) {
+			if err := proc.VerifyMAC(file, content, fileFormats[file]); err != nil {
 				if forceDecrypt {
 					fmt.Fprintf(os.Stderr, "Warning: %s: %v (continuing due to --force)\n", relPath, err)
 				} else {
@@ -234,7 +244,7 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 			}
 		}
 
-		output, modified, err := proc.ProcessFile(file, false)
+		output, modified, err := proc.ProcessFile(file, false, fileFormats[file])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error processing %s: %v\n", relPath, err)
 			os.Exit(1)
@@ -282,10 +292,15 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 			originalFile := file
 			if decryptOutputPath != "" {
 				// Resolve output path (relative to config dir if not absolute)
-				outDir := decryptOutputPath
-				if !filepath.IsAbs(outDir) {
-					outDir = filepath.Join(cfg.ConfigDir(), outDir)
+			outDir := decryptOutputPath
+			if !filepath.IsAbs(outDir) {
+				cwd, err := os.Getwd()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
+					os.Exit(1)
 				}
+				outDir = filepath.Join(cwd, outDir)
+			}
 				outputFile = filepath.Join(outDir, relPath)
 
 				// Apply rename rules to output path
@@ -359,15 +374,15 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 	// Skip this check for non-destructive exports (--output-tar, --output-path)
 	if !toStdout && decryptOutputTar == "" && decryptOutputPath == "" {
 		// Get ALL matching files (not just the ones processed via --file flag)
-		allFiles, err := cfg.GetMatchingFiles()
-		if err == nil && len(allFiles) > 0 {
+		allFilesWithFormat, err := cfg.GetMatchingFilesWithFormat()
+		if err == nil && len(allFilesWithFormat) > 0 {
 			hasAnyEncrypted := false
-			for _, file := range allFiles {
-				content, err := os.ReadFile(file)
+			for _, f := range allFilesWithFormat {
+				content, err := os.ReadFile(f.Path)
 				if err != nil {
 					continue
 				}
-				if proc.HasEncryptedValues(content, file) {
+				if proc.HasEncryptedValues(content, f.Path, f.Format) {
 					hasAnyEncrypted = true
 					break
 				}

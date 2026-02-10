@@ -147,6 +147,36 @@ func GetFilesToProcess(cfg *config.Config) ([]string, error) {
 	return cfg.GetMatchingFiles()
 }
 
+// FileWithFormat represents a file to process along with its format override
+type FileWithFormat struct {
+	Path   string
+	Format string
+}
+
+// GetFilesToProcessWithFormat returns files with their format overrides
+func GetFilesToProcessWithFormat(cfg *config.Config) ([]FileWithFormat, error) {
+	if filePath != "" {
+		absPath, err := filepath.Abs(filePath)
+		if err != nil {
+			return nil, err
+		}
+		// Get format from config if the file matches a pattern
+		format, _, _ := cfg.MatchesFileWithFormat(absPath)
+		return []FileWithFormat{{Path: absPath, Format: format}}, nil
+	}
+
+	matched, err := cfg.GetMatchingFilesWithFormat()
+	if err != nil {
+		return nil, err
+	}
+
+	files := make([]FileWithFormat, len(matched))
+	for i, m := range matched {
+		files[i] = FileWithFormat{Path: m.Path, Format: m.Format}
+	}
+	return files, nil
+}
+
 // ResolveTarget resolves a target path (file or folder) to a config path and optional single file.
 // For a file: searches upward from the file's directory to find .confcrypt.yml
 // For a folder: the folder must contain .confcrypt.yml directly (no upward search)
