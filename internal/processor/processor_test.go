@@ -1296,3 +1296,144 @@ NORMAL_VAR=value
 		t.Errorf("Decrypted QUOTED_SECRET should be quoted, got:\n%s", decryptedStr)
 	}
 }
+
+func TestMatchFile(t *testing.T) {
+	dir := t.TempDir()
+
+	// Generate a real key pair for encryption
+	identity, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatalf("Failed to generate identity: %v", err)
+	}
+
+	cfg := createTestConfig(t, dir, []config.RecipientConfig{
+		{Name: "test", Age: identity.Recipient().String()},
+	})
+
+	proc, err := NewProcessor(cfg, func() ([]age.Identity, error) {
+		return []age.Identity{identity}, nil
+	})
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+
+	// Write a YAML file with mixed encrypted/unencrypted keys
+	yamlContent := `database:
+  host: localhost
+  password: supersecret
+api:
+  endpoint: https://api.example.com
+  api_key: sk_live_12345
+`
+	yamlFile := filepath.Join(dir, "config.yml")
+	if err := os.WriteFile(yamlFile, []byte(yamlContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// MatchFile should return all matching keys (unencrypted)
+	results, err := proc.MatchFile(yamlFile)
+	if err != nil {
+		t.Fatalf("MatchFile error: %v", err)
+	}
+
+	if len(results) != 2 {
+		t.Fatalf("Expected 2 matching keys, got %d: %+v", len(results), results)
+	}
+
+	foundKeys := map[string]bool{}
+	for _, r := range results {
+		name := strings.Join(r.Path, ".")
+		foundKeys[name] = true
+		if r.Encrypted {
+			t.Errorf("Key %q should not be encrypted yet", name)
+		}
+	}
+	if !foundKeys["database.password"] {
+		t.Error("Expected database.password in results")
+	}
+	if !foundKeys["api.api_key"] {
+		t.Error("Expected api.api_key in results")
+	}
+
+	// Now encrypt the file
+	if err := proc.SetupEncryption(); err != nil {
+		t.Fatalf("SetupEncryption error: %v", err)
+	}
+	output, _, err := proc.ProcessFile(yamlFile, true)
+	if err != nil {
+		t.Fatalf("ProcessFile error: %v", err)
+	}
+	if err := os.WriteFile(yamlFile, output, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// MatchFile should still return all matching keys, now marked encrypted
+	results, err = proc.MatchFile(yamlFile)
+	if err != nil {
+		t.Fatalf("MatchFile error after encrypt: %v", err)
+	}
+
+	if len(results) != 2 {
+		t.Fatalf("Expected 2 matching keys after encrypt, got %d", len(results))
+	}
+	for _, r := range results {
+		if !r.Encrypted {
+			t.Errorf("Key %q should be encrypted", strings.Join(r.Path, "."))
+		}
+	}
+}
+
+func TestMatchFile_RelativePaths(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create subdirectories
+	sub1 := filepath.Join(dir, "sub1")
+	sub2 := filepath.Join(dir, "sub1", "sub2")
+	if err := os.MkdirAll(sub2, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create test files at various depths
+	files := map[string]string{
+		filepath.Join(dir, "root.yml"):          "password: secret1\n",
+		filepath.Join(sub1, "nested.yml"):       "password: secret2\n",
+		filepath.Join(sub2, "deep.json"):        `{"password": "secret3"}`,
+	}
+	for path, content := range files {
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfg := createTestConfig(t, dir, []config.RecipientConfig{
+		{Name: "test", Age: "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"},
+	})
+
+	matched, err := cfg.GetMatchingFilesWithFormat()
+	if err != nil {
+		t.Fatalf("GetMatchingFilesWithFormat error: %v", err)
+	}
+
+	// Verify all matched paths are absolute and produce correct relative paths
+	relPaths := map[string]bool{}
+	for _, m := range matched {
+		if !filepath.IsAbs(m.Path) {
+			t.Errorf("Expected absolute path, got %q", m.Path)
+		}
+		rel, err := filepath.Rel(cfg.ConfigDir(), m.Path)
+		if err != nil {
+			t.Fatalf("filepath.Rel error: %v", err)
+		}
+		if strings.HasPrefix(rel, "..") {
+			t.Errorf("Relative path %q escapes config dir", rel)
+		}
+		relPaths[rel] = true
+	}
+
+	expected := []string{"root.yml", filepath.Join("sub1", "nested.yml"), filepath.Join("sub1", "sub2", "deep.json")}
+	for _, e := range expected {
+		if !relPaths[e] {
+			t.Errorf("Expected %q in matched files, got: %v", e, relPaths)
+		}
+	}
+}

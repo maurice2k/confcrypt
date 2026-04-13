@@ -748,3 +748,331 @@ keys_include:
 		t.Error("Expected encrypted secret in saved file")
 	}
 }
+
+func TestFilesExclude_GetMatchingFilesWithFormat(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create test files
+	for _, name := range []string{"config.yml", "secret.yml", "debug.yml"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("test: true"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	subdir := filepath.Join(dir, "subdir")
+	if err := os.MkdirAll(subdir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subdir, "nested.yml"), []byte("test: true"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Create deeper nesting for recursive exclude tests
+	subdeep := filepath.Join(dir, "subdir", "deep")
+	if err := os.MkdirAll(subdeep, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subdeep, "deep.yml"), []byte("test: true"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Create dot-directories
+	dotdir := filepath.Join(dir, ".hidden")
+	if err := os.MkdirAll(filepath.Join(dotdir, "sub"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dotdir, "inside.yml"), []byte("test: true"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dotdir, "sub", "deep.yml"), []byte("test: true"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name         string
+		files        []string
+		filesExclude []string
+		wantFiles    []string
+		wantExcluded []string
+	}{
+		{
+			name:         "exclude specific file",
+			files:        []string{"*.yml"},
+			filesExclude: []string{"secret.yml"},
+			wantFiles:    []string{"config.yml", "debug.yml", filepath.Join("subdir", "nested.yml"), filepath.Join("subdir", "deep", "deep.yml")},
+			wantExcluded: []string{"secret.yml"},
+		},
+		{
+			name:         "exclude with glob pattern",
+			files:        []string{"*.yml"},
+			filesExclude: []string{"debug*"},
+			wantFiles:    []string{"config.yml", "secret.yml", filepath.Join("subdir", "nested.yml"), filepath.Join("subdir", "deep", "deep.yml")},
+			wantExcluded: []string{"debug.yml"},
+		},
+		{
+			name:         "exclude subdirectory with wildcard (recursive)",
+			files:        []string{"*.yml"},
+			filesExclude: []string{"subdir/*"},
+			wantFiles:    []string{"config.yml", "secret.yml", "debug.yml"},
+			wantExcluded: []string{filepath.Join("subdir", "nested.yml"), filepath.Join("subdir", "deep", "deep.yml")},
+		},
+		{
+			name:         "exclude subdirectory with trailing slash (recursive)",
+			files:        []string{"*.yml"},
+			filesExclude: []string{"subdir/"},
+			wantFiles:    []string{"config.yml", "secret.yml", "debug.yml"},
+			wantExcluded: []string{filepath.Join("subdir", "nested.yml"), filepath.Join("subdir", "deep", "deep.yml")},
+		},
+		{
+			name:         "exclude multiple patterns",
+			files:        []string{"*.yml"},
+			filesExclude: []string{"secret.yml", "debug.yml"},
+			wantFiles:    []string{"config.yml", filepath.Join("subdir", "nested.yml"), filepath.Join("subdir", "deep", "deep.yml")},
+			wantExcluded: []string{"secret.yml", "debug.yml"},
+		},
+		{
+			name:         "empty exclude list",
+			files:        []string{"*.yml"},
+			filesExclude: []string{},
+			wantFiles:    []string{"config.yml", "secret.yml", "debug.yml", filepath.Join("subdir", "nested.yml"), filepath.Join("subdir", "deep", "deep.yml"), filepath.Join(".hidden", "inside.yml"), filepath.Join(".hidden", "sub", "deep.yml")},
+			wantExcluded: []string{},
+		},
+		{
+			name:         "exclude dot-directories with .*",
+			files:        []string{"*.yml"},
+			filesExclude: []string{".*"},
+			wantFiles:    []string{"config.yml", "secret.yml", "debug.yml", filepath.Join("subdir", "nested.yml"), filepath.Join("subdir", "deep", "deep.yml")},
+			wantExcluded: []string{filepath.Join(".hidden", "inside.yml"), filepath.Join(".hidden", "sub", "deep.yml")},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configContent := "recipients:\n  - name: Test\n    age: age1test\nfiles:\n"
+			for _, f := range tt.files {
+				configContent += "  - '" + f + "'\n"
+			}
+			if len(tt.filesExclude) > 0 {
+				configContent += "files_exclude:\n"
+				for _, f := range tt.filesExclude {
+					configContent += "  - '" + f + "'\n"
+				}
+			}
+			configContent += "keys_include:\n  - password\n"
+
+			configPath := filepath.Join(dir, ".confcrypt.yml")
+			if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			cfg, err := Load(configPath)
+			if err != nil {
+				t.Fatalf("Failed to load config: %v", err)
+			}
+
+			files, err := cfg.GetMatchingFilesWithFormat()
+			if err != nil {
+				t.Fatalf("GetMatchingFilesWithFormat error: %v", err)
+			}
+
+			relFiles := make(map[string]bool)
+			for _, f := range files {
+				rel, _ := filepath.Rel(dir, f.Path)
+				relFiles[rel] = true
+			}
+
+			for _, want := range tt.wantFiles {
+				if !relFiles[want] {
+					t.Errorf("expected file %q to be included, got files: %v", want, relFiles)
+				}
+			}
+			for _, excluded := range tt.wantExcluded {
+				if relFiles[excluded] {
+					t.Errorf("expected file %q to be excluded, but it was included", excluded)
+				}
+			}
+		})
+	}
+}
+
+func TestFilesExclude_MatchesFileWithFormat(t *testing.T) {
+	dir := t.TempDir()
+
+	configContent := `recipients:
+  - name: Test
+    age: age1test
+files:
+  - "*.yml"
+  - "*.json"
+files_exclude:
+  - "secret.yml"
+  - "testdata/*"
+  - "vendor/"
+keys_include:
+  - password
+`
+	configPath := filepath.Join(dir, ".confcrypt.yml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create subdirs
+	for _, sub := range []string{"testdata", "testdata/sub", "vendor", "vendor/pkg"} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		filePath  string
+		wantMatch bool
+	}{
+		{"included yml", filepath.Join(dir, "config.yml"), true},
+		{"included json", filepath.Join(dir, "data.json"), true},
+		{"excluded specific file", filepath.Join(dir, "secret.yml"), false},
+		{"excluded by dir/* (direct child)", filepath.Join(dir, "testdata", "fixture.yml"), false},
+		{"excluded by dir/* (nested child)", filepath.Join(dir, "testdata", "sub", "deep.yml"), false},
+		{"excluded by dir/ (direct child)", filepath.Join(dir, "vendor", "lib.json"), false},
+		{"excluded by dir/ (nested child)", filepath.Join(dir, "vendor", "pkg", "util.yml"), false},
+		{"unmatched extension", filepath.Join(dir, "readme.txt"), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, matched, err := cfg.MatchesFileWithFormat(tt.filePath)
+			if err != nil {
+				t.Fatalf("MatchesFileWithFormat error: %v", err)
+			}
+			if matched != tt.wantMatch {
+				t.Errorf("MatchesFileWithFormat(%q) matched=%v, want %v", tt.filePath, matched, tt.wantMatch)
+			}
+		})
+	}
+}
+
+func TestFilesRename_NewFieldName(t *testing.T) {
+	dir := t.TempDir()
+
+	configContent := `recipients:
+  - name: Test
+    age: age1test
+files:
+  - "*.yml"
+files_rename:
+  encrypt:
+    - /(\.\w+)$/.enc$1/
+  decrypt:
+    - /\.enc(\.\w+)$/$1/
+keys_include:
+  - password
+`
+	configPath := filepath.Join(dir, ".confcrypt.yml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	// files_rename should be populated
+	if cfg.FilesRename == nil {
+		t.Fatal("FilesRename should not be nil")
+	}
+	// RenameFiles should also be populated (BC sync)
+	if cfg.RenameFiles == nil {
+		t.Fatal("RenameFiles should not be nil after BC merge")
+	}
+
+	got, err := cfg.GetEncryptRename("/path/to/config.yml")
+	if err != nil {
+		t.Fatalf("GetEncryptRename error: %v", err)
+	}
+	if got != "/path/to/config.enc.yml" {
+		t.Errorf("GetEncryptRename = %q, want %q", got, "/path/to/config.enc.yml")
+	}
+}
+
+func TestFilesRename_OldFieldName(t *testing.T) {
+	dir := t.TempDir()
+
+	configContent := `recipients:
+  - name: Test
+    age: age1test
+files:
+  - "*.yml"
+rename_files:
+  encrypt:
+    - /(\.\w+)$/.enc$1/
+  decrypt:
+    - /\.enc(\.\w+)$/$1/
+keys_include:
+  - password
+`
+	configPath := filepath.Join(dir, ".confcrypt.yml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	if cfg.RenameFiles == nil {
+		t.Fatal("RenameFiles should not be nil")
+	}
+	if cfg.FilesRename == nil {
+		t.Fatal("FilesRename should not be nil after BC merge")
+	}
+
+	got, err := cfg.GetEncryptRename("/path/to/config.yml")
+	if err != nil {
+		t.Fatalf("GetEncryptRename error: %v", err)
+	}
+	if got != "/path/to/config.enc.yml" {
+		t.Errorf("GetEncryptRename = %q, want %q", got, "/path/to/config.enc.yml")
+	}
+}
+
+func TestFilesRename_BothFields(t *testing.T) {
+	dir := t.TempDir()
+
+	// When both are set, files_rename (new) takes precedence
+	configContent := `recipients:
+  - name: Test
+    age: age1test
+files:
+  - "*.yml"
+rename_files:
+  encrypt:
+    - /(\.\w+)$/.old$1/
+files_rename:
+  encrypt:
+    - /(\.\w+)$/.enc$1/
+keys_include:
+  - password
+`
+	configPath := filepath.Join(dir, ".confcrypt.yml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	got, err := cfg.GetEncryptRename("/path/to/config.yml")
+	if err != nil {
+		t.Fatalf("GetEncryptRename error: %v", err)
+	}
+	// files_rename should win
+	if got != "/path/to/config.enc.yml" {
+		t.Errorf("GetEncryptRename = %q, want %q (files_rename should take precedence)", got, "/path/to/config.enc.yml")
+	}
+}

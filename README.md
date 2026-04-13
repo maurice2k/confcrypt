@@ -195,13 +195,21 @@ recipients:
     yubikey: age1yubikey1q94ldgcz...  # YubiKey-derived key
 
 # Files to process (glob patterns)
+# Append :full, :yaml, :json, or :env to override format detection
 files:
   - "*.yml"
   - "*.yaml"
   - "*.json"
+  - "certs/*.pem:full"         # full-file encryption
+  - "secrets/token.txt:full"   # full-file encryption
 
-# Optional: Rename files during encrypt/decrypt
-rename_files:
+# Optional: Exclude files/folders from processing
+files_exclude:
+  - "*.enc.yml"
+  - "testdata/*"
+
+# Optional: Rename files during encrypt/decrypt (alias: rename_files)
+files_rename:
   encrypt:
     - /(\.\w+)$/.enc\1/     # config.yml -> config.enc.yml
   decrypt:
@@ -391,12 +399,51 @@ When using `--output-tar`:
 - Source files remain encrypted
 - Use `-` to stream the tar to stdout (info messages go to stderr)
 
-### Automatic file renaming
+### File format overrides
 
-You can configure *confcrypt* to rename files during encryption/decryption using regex patterns:
+By default, *confcrypt* detects file formats by extension (`.yml`/`.yaml` = YAML, `.json` = JSON, `.env` = env). You can override this by appending a format suffix to file patterns:
 
 ```yaml
-rename_files:
+files:
+  - "*.yml"                    # auto-detected as YAML
+  - "*.dat:json"               # treat .dat files as JSON
+  - "certs/*.pem:full"         # full-file encryption
+  - "secrets/token.txt:full"   # full-file encryption
+```
+
+Supported format overrides: `:full`, `:yaml`, `:json`, `:env`.
+
+**Full-file encryption** encrypts the entire file contents (not individual keys). This is useful for binary or opaque content like private keys, certificates, and keystores. Encrypted files use a chunked base64 format with a `$CONFCRYPT_ENCRYPTED;` header.
+
+**Auto-detected full-file formats:** The following extensions are automatically treated as full-file encryption without needing `:full`:
+- `.key`, `.pem`, `.p12`, `.pfx`, `.p8`, `.keystore`, `.jks`
+- SSH keys: `id_ed25519*`, `id_rsa*`, `id_ecdsa*`, `id_dsa*`
+
+If a file matches multiple patterns, an explicit format override (e.g., `:full`) takes precedence over auto-detection.
+
+### File exclusion
+
+Use `files_exclude` to skip specific files or folders that would otherwise match `files` patterns:
+
+```yaml
+files:
+  - "*.yml"
+  - "*.json"
+
+files_exclude:
+  - "*.enc.yml"       # skip already-renamed encrypted files
+  - "testdata/*"      # skip test fixtures
+  - "vendor/*"        # skip vendored configs
+```
+
+Exclude patterns use the same glob semantics as `files` patterns. A file matching any exclude pattern is skipped regardless of how many include patterns it matches.
+
+### Automatic file renaming
+
+You can configure *confcrypt* to rename files during encryption/decryption using regex patterns. The preferred config key is `files_rename` (the old name `rename_files` is still supported for backward compatibility):
+
+```yaml
+files_rename:
   encrypt:
     - /(\.\w+)$/.enc\1/     # config.yml -> config.enc.yml
   decrypt:

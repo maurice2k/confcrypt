@@ -21,12 +21,14 @@ var Version = "1.0.0" // Set by main package at startup
 
 // Config represents the .confcrypt.yml configuration file
 type Config struct {
-	Recipients  []RecipientConfig  `yaml:"recipients"`
-	Files       []string           `yaml:"files"`
-	RenameFiles *RenameFilesConfig `yaml:"rename_files,omitempty"`
-	KeysInclude []interface{}      `yaml:"keys_include"` // Can be string or KeyRule
-	KeysExclude []interface{}      `yaml:"keys_exclude"` // Can be string or KeyRule
-	Confcrypt   *ConfcryptSection  `yaml:".confcrypt,omitempty"`
+	Recipients   []RecipientConfig  `yaml:"recipients"`
+	Files        []string           `yaml:"files"`
+	FilesExclude []string           `yaml:"files_exclude,omitempty"`
+	RenameFiles  *RenameFilesConfig `yaml:"rename_files,omitempty"`
+	FilesRename  *RenameFilesConfig `yaml:"files_rename,omitempty"`
+	KeysInclude  []interface{}      `yaml:"keys_include"` // Can be string or KeyRule
+	KeysExclude  []interface{}      `yaml:"keys_exclude"` // Can be string or KeyRule
+	Confcrypt    *ConfcryptSection  `yaml:".confcrypt,omitempty"`
 
 	// Internal fields (not serialized)
 	configPath string
@@ -131,6 +133,14 @@ func Load(configPath string) (*Config, error) {
 	config.configPath = absPath
 	config.configDir = filepath.Dir(absPath)
 	config.rawNode = &node
+
+	// Merge files_rename / rename_files for backward compatibility
+	// files_rename (new name) takes precedence over rename_files (old name)
+	if config.FilesRename != nil {
+		config.RenameFiles = config.FilesRename
+	} else if config.RenameFiles != nil {
+		config.FilesRename = config.RenameFiles
+	}
 
 	return &config, nil
 }
@@ -555,6 +565,32 @@ func (c *Config) GetMatchingFilesWithFormat() ([]MatchedFile, error) {
 		}
 	}
 
+	// Apply files_exclude patterns
+	if len(c.FilesExclude) > 0 {
+		filtered := files[:0]
+		for _, f := range files {
+			relPath, err := filepath.Rel(c.configDir, f.Path)
+			if err != nil {
+				return nil, err
+			}
+			excluded := false
+			for _, exclPattern := range c.FilesExclude {
+				matched, err := matchExcludePattern(exclPattern, relPath)
+				if err != nil {
+					return nil, fmt.Errorf("invalid exclude pattern %q: %w", exclPattern, err)
+				}
+				if matched {
+					excluded = true
+					break
+				}
+			}
+			if !excluded {
+				filtered = append(filtered, f)
+			}
+		}
+		files = filtered
+	}
+
 	return files, nil
 }
 
@@ -570,6 +606,54 @@ func matchPattern(pattern, path string) (bool, error) {
 
 	// Otherwise, match against full relative path
 	return filepath.Match(pattern, path)
+}
+
+// matchExcludePattern checks if a file path matches an exclude pattern.
+// In addition to matchPattern semantics, it supports:
+//   - "dir/" trailing slash matches all files under that directory (recursive)
+//   - "dir/*" matches all files under that directory (recursive, not just one level)
+//   - patterns matching a directory component exclude everything inside (e.g. ".*" excludes .git/...)
+func matchExcludePattern(pattern, path string) (bool, error) {
+	// Trailing slash: match any file whose path starts with this directory prefix
+	if strings.HasSuffix(pattern, "/") {
+		dir := pattern[:len(pattern)-1]
+		return path == dir || strings.HasPrefix(path, dir+"/"), nil
+	}
+
+	// "dir/*" style: also match recursively into subdirectories
+	if strings.HasSuffix(pattern, "/*") {
+		dir := pattern[:len(pattern)-2]
+		if strings.HasPrefix(path, dir+"/") {
+			return true, nil
+		}
+	}
+
+	// Standard match against the full path
+	matched, err := matchPattern(pattern, path)
+	if err != nil {
+		return false, err
+	}
+	if matched {
+		return true, nil
+	}
+
+	// If the pattern doesn't contain a path separator, also try matching against
+	// each leading directory component — if a directory name matches, exclude
+	// everything inside it recursively (e.g. ".*" matches ".git" in ".git/foo.yml")
+	if !strings.Contains(pattern, "/") {
+		parts := strings.Split(path, "/")
+		for _, part := range parts[:len(parts)-1] {
+			m, err := filepath.Match(pattern, part)
+			if err != nil {
+				return false, err
+			}
+			if m {
+				return true, nil
+			}
+		}
+	}
+
+	return false, nil
 }
 
 // GetSecretForRecipient returns the encrypted secret for a specific recipient
@@ -708,6 +792,20 @@ func (c *Config) MatchesFileWithFormat(absFilePath string) (string, bool, error)
 			}
 		}
 	}
+
+	// Check files_exclude patterns
+	if anyMatched {
+		for _, exclPattern := range c.FilesExclude {
+			excluded, err := matchExcludePattern(exclPattern, relPath)
+			if err != nil {
+				return "", false, fmt.Errorf("invalid exclude pattern %q: %w", exclPattern, err)
+			}
+			if excluded {
+				return "", false, nil
+			}
+		}
+	}
+
 	return matchedFormat, anyMatched, nil
 }
 

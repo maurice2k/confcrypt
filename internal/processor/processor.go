@@ -682,6 +682,58 @@ func (p *Processor) CheckFile(filePath string, formatOverride ...string) ([]Matc
 	return unencrypted, nil
 }
 
+// MatchFile returns all keys matching the configured patterns, regardless of encryption state.
+func (p *Processor) MatchFile(filePath string, formatOverride ...string) ([]MatchResult, error) {
+	var override string
+	if len(formatOverride) > 0 {
+		override = formatOverride[0]
+	}
+	fileFormat := DetectFormat(filePath, override)
+
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file: %w", err)
+	}
+
+	if fileFormat == FormatFull {
+		encrypted := format.IsFullFileEncrypted(content)
+		return []MatchResult{{
+			KeyName:   "(full file)",
+			Path:      []string{},
+			Encrypted: encrypted,
+		}}, nil
+	}
+
+	var data interface{}
+
+	switch fileFormat {
+	case FormatYAML:
+		if err := yaml.Unmarshal(content, &data); err != nil {
+			return nil, fmt.Errorf("failed to parse YAML: %w", err)
+		}
+	case FormatJSON:
+		if err := json.Unmarshal(content, &data); err != nil {
+			return nil, fmt.Errorf("failed to parse JSON: %w", err)
+		}
+	case FormatEnv:
+		envFile, err := ParseEnvFile(content)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse .env file: %w", err)
+		}
+		m := make(map[string]interface{})
+		for _, line := range envFile.Lines {
+			if line.Type == EnvLineKeyValue {
+				m[line.Key] = line.Value
+			}
+		}
+		data = m
+	default:
+		return nil, fmt.Errorf("unsupported file format")
+	}
+
+	return p.matcher.FindMatchingKeys(data), nil
+}
+
 // WriteFile writes content to a file
 func (p *Processor) WriteFile(filePath string, content []byte) error {
 	return os.WriteFile(filePath, content, 0644)
