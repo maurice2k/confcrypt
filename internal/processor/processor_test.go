@@ -1095,10 +1095,310 @@ next_section:
 	}
 }
 
+func TestYAMLFlowSequenceBlankLinesBeforeNextItemAreStable(t *testing.T) {
+	dir := t.TempDir()
+
+	identity, err := crypto.GenerateAgeKeypair()
+	if err != nil {
+		t.Fatalf("Failed to generate keypair: %v", err)
+	}
+
+	cfg := createTestConfig(t, dir, []config.RecipientConfig{
+		{Name: "test", Age: identity.Recipient().String()},
+	})
+
+	testFile := filepath.Join(dir, "test.yml")
+	testContent := `secret: supersecret
+
+base_settings: &baseSettings
+  enabled: true
+  mode: default
+
+entries:
+  - name: first
+    !!merge <<: *baseSettings
+    values: ["alpha", # first value
+      "beta", # second value
+
+      "gamma", # third value
+    ]
+
+
+
+
+  - name: second
+    !!merge <<: *baseSettings
+    value: delta
+`
+	if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
+	}
+
+	const expectedBlankLines = 4
+	if got := blankLinesBeforeLine(testContent, "  - name: second"); got != expectedBlankLines {
+		t.Fatalf("Test fixture should have %d blank lines before second entry, got %d", expectedBlankLines, got)
+	}
+
+	proc, err := NewProcessor(cfg, nil)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+	if err := proc.SetupEncryption(); err != nil {
+		t.Fatalf("Failed to setup encryption: %v", err)
+	}
+
+	encrypted, modified, err := proc.ProcessFile(testFile, true)
+	if err != nil {
+		t.Fatalf("Failed to encrypt: %v", err)
+	}
+	if !modified {
+		t.Fatal("Expected file to be modified")
+	}
+
+	if got := blankLinesBeforeLine(string(encrypted), "  - name: second"); got != expectedBlankLines {
+		t.Fatalf("Expected %d blank lines before second entry after encryption, got %d:\n%s", expectedBlankLines, got, encrypted)
+	}
+
+	if err := os.WriteFile(testFile, encrypted, 0644); err != nil {
+		t.Fatalf("Failed to write encrypted file: %v", err)
+	}
+	if err := proc.SaveEncryptedSecrets(); err != nil {
+		t.Fatalf("Failed to save secrets: %v", err)
+	}
+	if _, err := proc.SetupDecryption([]age.Identity{identity}); err != nil {
+		t.Fatalf("Failed to setup decryption: %v", err)
+	}
+
+	decrypted, modified, err := proc.ProcessFile(testFile, false)
+	if err != nil {
+		t.Fatalf("Failed to decrypt: %v", err)
+	}
+	if !modified {
+		t.Fatal("Expected file to be modified during decryption")
+	}
+
+	if got := blankLinesBeforeLine(string(decrypted), "  - name: second"); got != expectedBlankLines {
+		t.Fatalf("Expected %d blank lines before second entry after decryption, got %d:\n%s", expectedBlankLines, got, decrypted)
+	}
+}
+
+func TestYAMLLiteralBlockDoesNotAddBlankLineBeforeNextKey(t *testing.T) {
+	dir := t.TempDir()
+
+	identity, err := crypto.GenerateAgeKeypair()
+	if err != nil {
+		t.Fatalf("Failed to generate keypair: %v", err)
+	}
+
+	cfg := createTestConfig(t, dir, []config.RecipientConfig{
+		{Name: "test", Age: identity.Recipient().String()},
+	})
+
+	testFile := filepath.Join(dir, "test.yml")
+	testContent := `primary_password: |
+  example-value
+
+secondary_password: another-value
+`
+	if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
+	}
+
+	if got := blankLinesBeforeLine(testContent, "secondary_password: another-value"); got != 1 {
+		t.Fatalf("Test fixture should have 1 blank line before secondary password, got %d", got)
+	}
+
+	proc, err := NewProcessor(cfg, nil)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+	if err := proc.SetupEncryption(); err != nil {
+		t.Fatalf("Failed to setup encryption: %v", err)
+	}
+
+	encrypted, modified, err := proc.ProcessFile(testFile, true)
+	if err != nil {
+		t.Fatalf("Failed to encrypt: %v", err)
+	}
+	if !modified {
+		t.Fatal("Expected file to be modified")
+	}
+
+	if got := blankLinesBeforeLinePrefix(string(encrypted), "secondary_password:"); got != 1 {
+		t.Fatalf("Expected exactly 1 blank line before secondary password after encryption, got %d:\n%s", got, encrypted)
+	}
+
+	if err := os.WriteFile(testFile, encrypted, 0644); err != nil {
+		t.Fatalf("Failed to write encrypted file: %v", err)
+	}
+	if err := proc.SaveEncryptedSecrets(); err != nil {
+		t.Fatalf("Failed to save secrets: %v", err)
+	}
+	if _, err := proc.SetupDecryption([]age.Identity{identity}); err != nil {
+		t.Fatalf("Failed to setup decryption: %v", err)
+	}
+
+	decrypted, modified, err := proc.ProcessFile(testFile, false)
+	if err != nil {
+		t.Fatalf("Failed to decrypt: %v", err)
+	}
+	if !modified {
+		t.Fatal("Expected file to be modified during decryption")
+	}
+
+	if got := blankLinesBeforeLine(string(decrypted), "secondary_password: another-value"); got != 1 {
+		t.Fatalf("Expected exactly 1 blank line before secondary password after decryption, got %d:\n%s", got, decrypted)
+	}
+}
+
+func TestYAMLMergeKeyDoesNotGainExplicitTag(t *testing.T) {
+	dir := t.TempDir()
+
+	identity, err := crypto.GenerateAgeKeypair()
+	if err != nil {
+		t.Fatalf("Failed to generate keypair: %v", err)
+	}
+
+	cfg := createTestConfig(t, dir, []config.RecipientConfig{
+		{Name: "test", Age: identity.Recipient().String()},
+	})
+
+	testFile := filepath.Join(dir, "test.yml")
+	testContent := `secret: supersecret
+
+base_settings: &baseSettings
+  enabled: true
+
+entries:
+  - name: example
+    <<: *baseSettings
+`
+	if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
+	}
+
+	proc, err := NewProcessor(cfg, nil)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+	if err := proc.SetupEncryption(); err != nil {
+		t.Fatalf("Failed to setup encryption: %v", err)
+	}
+
+	encrypted, modified, err := proc.ProcessFile(testFile, true)
+	if err != nil {
+		t.Fatalf("Failed to encrypt: %v", err)
+	}
+	if !modified {
+		t.Fatal("Expected file to be modified")
+	}
+
+	encryptedStr := string(encrypted)
+	if strings.Contains(encryptedStr, "!!merge <<:") {
+		t.Fatalf("Expected merge key to remain plain after encryption:\n%s", encryptedStr)
+	}
+	if !strings.Contains(encryptedStr, "<<: *baseSettings") {
+		t.Fatalf("Expected plain merge key after encryption:\n%s", encryptedStr)
+	}
+
+	if err := os.WriteFile(testFile, encrypted, 0644); err != nil {
+		t.Fatalf("Failed to write encrypted file: %v", err)
+	}
+	if err := proc.SaveEncryptedSecrets(); err != nil {
+		t.Fatalf("Failed to save secrets: %v", err)
+	}
+	if _, err := proc.SetupDecryption([]age.Identity{identity}); err != nil {
+		t.Fatalf("Failed to setup decryption: %v", err)
+	}
+
+	decrypted, modified, err := proc.ProcessFile(testFile, false)
+	if err != nil {
+		t.Fatalf("Failed to decrypt: %v", err)
+	}
+	if !modified {
+		t.Fatal("Expected file to be modified during decryption")
+	}
+
+	decryptedStr := string(decrypted)
+	if strings.Contains(decryptedStr, "!!merge <<:") {
+		t.Fatalf("Expected merge key to remain plain after decryption:\n%s", decryptedStr)
+	}
+	if !strings.Contains(decryptedStr, "<<: *baseSettings") {
+		t.Fatalf("Expected plain merge key after decryption:\n%s", decryptedStr)
+	}
+}
+
+func TestYAMLExplicitMergeKeyTagIsRemoved(t *testing.T) {
+	dir := t.TempDir()
+
+	identity, err := crypto.GenerateAgeKeypair()
+	if err != nil {
+		t.Fatalf("Failed to generate keypair: %v", err)
+	}
+
+	cfg := createTestConfig(t, dir, []config.RecipientConfig{
+		{Name: "test", Age: identity.Recipient().String()},
+	})
+
+	testFile := filepath.Join(dir, "test.yml")
+	testContent := `secret: supersecret
+
+base_settings: &baseSettings
+  enabled: true
+
+entries:
+  - name: example
+    !!merge <<: *baseSettings
+`
+	if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
+	}
+
+	proc, err := NewProcessor(cfg, nil)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+	if err := proc.SetupEncryption(); err != nil {
+		t.Fatalf("Failed to setup encryption: %v", err)
+	}
+
+	encrypted, modified, err := proc.ProcessFile(testFile, true)
+	if err != nil {
+		t.Fatalf("Failed to encrypt: %v", err)
+	}
+	if !modified {
+		t.Fatal("Expected file to be modified")
+	}
+
+	encryptedStr := string(encrypted)
+	if strings.Contains(encryptedStr, "!!merge <<:") || strings.Contains(encryptedStr, "!!str <<:") {
+		t.Fatalf("Expected explicit merge key tag to be removed after encryption:\n%s", encryptedStr)
+	}
+	if !strings.Contains(encryptedStr, "<<: *baseSettings") {
+		t.Fatalf("Expected plain merge key after encryption:\n%s", encryptedStr)
+	}
+}
+
 func blankLinesBeforeKey(content, key string) int {
+	return blankLinesBeforeLine(content, key)
+}
+
+func blankLinesBeforeLine(content, target string) int {
+	return blankLinesBeforeLineMatch(content, func(line string) bool {
+		return line == target
+	})
+}
+
+func blankLinesBeforeLinePrefix(content, prefix string) int {
+	return blankLinesBeforeLineMatch(content, func(line string) bool {
+		return strings.HasPrefix(line, prefix)
+	})
+}
+
+func blankLinesBeforeLineMatch(content string, match func(string) bool) int {
 	lines := strings.Split(content, "\n")
 	for i, line := range lines {
-		if line == key {
+		if match(line) {
 			count := 0
 			for j := i - 1; j >= 0 && strings.TrimSpace(lines[j]) == ""; j-- {
 				count++

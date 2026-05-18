@@ -252,7 +252,7 @@ func (p *Processor) processYAMLNode(content []byte, encrypt bool) (*yaml.Node, b
 	}
 
 	// Preserve blank lines from original before any modifications
-	preserveBlankLines(&node)
+	preserveBlankLines(&node, content)
 
 	// Transform nodes in-place, preserving comments
 	modified, err := p.transformYAMLNode(&node, nil, encrypt)
@@ -1083,12 +1083,28 @@ func DetectFormat(filePath string, override ...string) FileFormat {
 // marshalYAMLNode marshals a yaml.Node to YAML, preserving comments and structure
 func marshalYAMLNode(node *yaml.Node) ([]byte, error) {
 	var buf bytes.Buffer
+	normalizeMergeKeyTags(node)
 	encoder := yaml.NewEncoder(&buf)
 	encoder.SetIndent(2)
 	if err := encoder.Encode(node); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+func normalizeMergeKeyTags(node *yaml.Node) {
+	if node == nil {
+		return
+	}
+
+	if node.Kind == yaml.ScalarNode && node.Tag == "!!merge" && node.Value == "<<" {
+		node.Tag = "!!str"
+		node.Style &^= yaml.TaggedStyle
+	}
+
+	for _, child := range node.Content {
+		normalizeMergeKeyTags(child)
+	}
 }
 
 // marshalJSON marshals data to JSON, preserving indentation style from original
@@ -1119,13 +1135,13 @@ func marshalJSON(original []byte, data interface{}) ([]byte, error) {
 
 // preserveBlankLines detects gaps in line numbers and adds newlines to HeadComment
 // to preserve blank lines from the original YAML file
-func preserveBlankLines(node *yaml.Node) {
-	preserveBlankLinesRecursive(node, 0)
+func preserveBlankLines(node *yaml.Node, content []byte) {
+	preserveBlankLinesRecursive(node, 0, strings.Split(string(content), "\n"))
 }
 
 // preserveBlankLinesRecursive walks the node tree and adds newlines to HeadComment
 // where there are gaps in line numbers between siblings
-func preserveBlankLinesRecursive(node *yaml.Node, prevEndLine int) int {
+func preserveBlankLinesRecursive(node *yaml.Node, prevEndLine int, sourceLines []string) int {
 	if node == nil {
 		return prevEndLine
 	}
@@ -1155,10 +1171,10 @@ func preserveBlankLinesRecursive(node *yaml.Node, prevEndLine int) int {
 	childEndLine := 0
 	if node.Kind == yaml.MappingNode {
 		for i := 0; i < len(node.Content); i += 2 {
-			keyEndLine := preserveBlankLinesRecursive(node.Content[i], childEndLine)
+			keyEndLine := preserveBlankLinesRecursive(node.Content[i], childEndLine, sourceLines)
 			valueEndLine := keyEndLine
 			if i+1 < len(node.Content) {
-				valueEndLine = preserveBlankLinesRecursive(node.Content[i+1], keyEndLine)
+				valueEndLine = preserveBlankLinesRecursive(node.Content[i+1], keyEndLine, sourceLines)
 			}
 			if keyEndLine > valueEndLine {
 				childEndLine = keyEndLine
@@ -1168,7 +1184,7 @@ func preserveBlankLinesRecursive(node *yaml.Node, prevEndLine int) int {
 		}
 	} else {
 		for _, child := range node.Content {
-			childEndLine = preserveBlankLinesRecursive(child, childEndLine)
+			childEndLine = preserveBlankLinesRecursive(child, childEndLine, sourceLines)
 		}
 	}
 
@@ -1177,9 +1193,153 @@ func preserveBlankLinesRecursive(node *yaml.Node, prevEndLine int) int {
 		currentEndLine = childEndLine
 	}
 
+	if flowEndLine := findFlowCollectionEndLine(node, sourceLines); flowEndLine > currentEndLine {
+		currentEndLine = flowEndLine
+	}
+	if blockScalarEndLine := findBlockScalarEndLine(node, sourceLines); blockScalarEndLine > currentEndLine {
+		currentEndLine = blockScalarEndLine
+	}
+
 	currentEndLine += commentLineCount(node.FootComment)
 
 	return currentEndLine
+}
+
+func findBlockScalarEndLine(node *yaml.Node, sourceLines []string) int {
+	if node.Kind != yaml.ScalarNode || (node.Style != yaml.LiteralStyle && node.Style != yaml.FoldedStyle) || node.Line <= 0 {
+		return 0
+	}
+
+	lineIdx := node.Line
+	if lineIdx >= len(sourceLines) {
+		return node.Line
+	}
+
+	contentIndent := -1
+	lastContentLine := node.Line
+	pendingBlankLine := 0
+
+	for ; lineIdx < len(sourceLines); lineIdx++ {
+		line := sourceLines[lineIdx]
+		if strings.TrimSpace(line) == "" {
+			if contentIndent >= 0 {
+				pendingBlankLine = lineIdx + 1
+			}
+			continue
+		}
+
+		indent := leadingSpaces(line)
+		if contentIndent < 0 {
+			contentIndent = indent
+		}
+		if indent < contentIndent {
+			break
+		}
+
+		if pendingBlankLine > lastContentLine {
+			lastContentLine = pendingBlankLine
+		}
+		lastContentLine = lineIdx + 1
+		pendingBlankLine = 0
+	}
+
+	return lastContentLine
+}
+
+func leadingSpaces(line string) int {
+	count := 0
+	for _, r := range line {
+		if r != ' ' {
+			break
+		}
+		count++
+	}
+	return count
+}
+
+func findFlowCollectionEndLine(node *yaml.Node, sourceLines []string) int {
+	if node.Line <= 0 || node.Column <= 0 || node.Style&yaml.FlowStyle == 0 {
+		return 0
+	}
+
+	var open, close rune
+	switch node.Kind {
+	case yaml.SequenceNode:
+		open, close = '[', ']'
+	case yaml.MappingNode:
+		open, close = '{', '}'
+	default:
+		return 0
+	}
+
+	lineIdx := node.Line - 1
+	if lineIdx >= len(sourceLines) {
+		return 0
+	}
+
+	depth := 0
+	started := false
+	inSingleQuote := false
+	inDoubleQuote := false
+	escaped := false
+
+	for ; lineIdx < len(sourceLines); lineIdx++ {
+		line := sourceLines[lineIdx]
+		colIdx := 0
+		if !started && lineIdx == node.Line-1 {
+			colIdx = node.Column - 1
+			if colIdx >= len(line) {
+				colIdx = len(line)
+			}
+		}
+
+		for _, r := range line[colIdx:] {
+			if inDoubleQuote {
+				if escaped {
+					escaped = false
+					continue
+				}
+				if r == '\\' {
+					escaped = true
+					continue
+				}
+				if r == '"' {
+					inDoubleQuote = false
+				}
+				continue
+			}
+
+			if inSingleQuote {
+				if r == '\'' {
+					inSingleQuote = false
+				}
+				continue
+			}
+
+			switch r {
+			case '#':
+				goto nextLine
+			case '"':
+				inDoubleQuote = true
+			case '\'':
+				inSingleQuote = true
+			case open:
+				depth++
+				started = true
+			case close:
+				if started {
+					depth--
+					if depth == 0 {
+						return lineIdx + 1
+					}
+				}
+			}
+		}
+
+	nextLine:
+	}
+
+	return 0
 }
 
 func commentLineCount(comment string) int {
