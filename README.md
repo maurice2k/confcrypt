@@ -258,6 +258,7 @@ Decrypt Options:
   --output-path string Write decrypted files to this directory
   --output-tar string  Write decrypted files to tar archive (use '-' for stdout)
   --force              Continue decryption even if MAC verification fails
+  --clear-secrets      Clear encrypted AES key store after all in-place encrypted values are removed
 ```
 
 ## Examples
@@ -363,6 +364,22 @@ confcrypt check
 # Exit code 0: All matching keys are encrypted
 # Exit code 1: Found unencrypted keys
 ```
+
+### Decrypt in place
+
+```bash
+confcrypt decrypt
+```
+
+By default, decrypting in place keeps the encrypted AES key store in `.confcrypt.yml` as recovery metadata. This allows any missed `ENC[...]` value to remain recoverable with the same recipient identity.
+
+To remove the store after all encrypted values have been removed from matching source files:
+
+```bash
+confcrypt decrypt --clear-secrets
+```
+
+`--clear-secrets` is irreversible for any remaining encrypted value unless you can restore the previous `.confcrypt.yml` from git or another backup. It is only allowed for in-place decrypts, not with `--stdout`, `--output-path`, or `--output-tar`. Before clearing, *confcrypt* scans all matching files structurally and also checks for raw encrypted markers like `ENC[AES256_GCM,` and `$CONFCRYPT_ENCRYPTED;`.
 
 ### Decrypt to stdout
 
@@ -691,6 +708,8 @@ After encryption, *confcrypt* adds a `.confcrypt` section to your `.confcrypt.ym
 - `updated_at`: Last encryption timestamp (UTC)
 - `store`: AES-256 key encrypted for each recipient
 - `macs`: Per-file Message Authentication Codes (SHA256 hash of encrypted values, encrypted)
+
+The `store` is retained by default after decrypting files in place. Use `confcrypt decrypt --clear-secrets` only when you intentionally want the next encryption to generate a fresh AES key and you have verified no old `ENC[...]` values remain.
 
 ## Tamper Detection
 

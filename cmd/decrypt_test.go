@@ -49,19 +49,18 @@ func createTestConfigWithSecrets(t *testing.T, dir string, identity *age.X25519I
 	return loaded
 }
 
-func TestClearSecretsAfterFullDecryption(t *testing.T) {
+func createEncryptedYAMLFixture(t *testing.T) (*config.Config, *age.X25519Identity, string) {
+	t.Helper()
+
 	dir := t.TempDir()
 
-	// Generate keypair
 	identity, err := crypto.GenerateAgeKeypair()
 	if err != nil {
 		t.Fatalf("Failed to generate keypair: %v", err)
 	}
 
-	// Create config
 	cfg := createTestConfigWithSecrets(t, dir, identity)
 
-	// Create test file with sensitive data
 	testFile := filepath.Join(dir, "test.yml")
 	testContent := `database:
   host: localhost
@@ -72,95 +71,207 @@ api_key: myapikey
 		t.Fatalf("Failed to write test file: %v", err)
 	}
 
-	// Create processor and encrypt
+	proc, err := processor.NewProcessor(cfg, nil)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+	if err := proc.SetupEncryption(); err != nil {
+		t.Fatalf("Failed to setup encryption: %v", err)
+	}
+	output, _, err := proc.ProcessFile(testFile, true)
+	if err != nil {
+		t.Fatalf("Failed to encrypt: %v", err)
+	}
+	if err := os.WriteFile(testFile, output, 0644); err != nil {
+		t.Fatalf("Failed to write encrypted file: %v", err)
+	}
+	if err := proc.SaveEncryptedSecrets(); err != nil {
+		t.Fatalf("Failed to save secrets: %v", err)
+	}
+	if !cfg.HasSecrets() {
+		t.Fatal("Expected secrets to exist after encryption")
+	}
+
+	return cfg, identity, testFile
+}
+
+func decryptYAMLFixtureInPlace(t *testing.T, cfg *config.Config, identity age.Identity, testFile string) *processor.Processor {
+	t.Helper()
+
+	proc2, err := processor.NewProcessor(cfg, nil)
+	if err != nil {
+		t.Fatalf("Failed to create processor for decryption: %v", err)
+	}
+	if _, err := proc2.SetupDecryption([]age.Identity{identity}); err != nil {
+		t.Fatalf("Failed to setup decryption: %v", err)
+	}
+	decrypted, _, err := proc2.ProcessFile(testFile, false)
+	if err != nil {
+		t.Fatalf("Failed to decrypt: %v", err)
+	}
+	if err := os.WriteFile(testFile, decrypted, 0644); err != nil {
+		t.Fatalf("Failed to write decrypted file: %v", err)
+	}
+
+	return proc2
+}
+
+func TestSecretsRetainedAfterFullDecryptionByDefault(t *testing.T) {
+	cfg, identity, testFile := createEncryptedYAMLFixture(t)
+	proc := decryptYAMLFixtureInPlace(t, cfg, identity, testFile)
+
+	message, err := finishSecretStoreAfterInPlaceDecrypt(cfg, proc, false)
+	if err != nil {
+		t.Fatalf("Failed to finish secret store handling: %v", err)
+	}
+	if !strings.Contains(message, "secret store retained for recovery") {
+		t.Fatalf("Expected retained-store message, got %q", message)
+	}
+
+	if !cfg.HasSecrets() {
+		t.Error("Expected secrets to be retained after full decryption by default")
+	}
+
+	reloaded, err := config.Load(cfg.ConfigPath())
+	if err != nil {
+		t.Fatalf("Failed to reload config: %v", err)
+	}
+	if !reloaded.HasSecrets() {
+		t.Error("Expected secrets to be retained in reloaded config")
+	}
+}
+
+func TestClearSecretsFlagClearsAfterFullDecryption(t *testing.T) {
+	cfg, identity, testFile := createEncryptedYAMLFixture(t)
+	proc := decryptYAMLFixtureInPlace(t, cfg, identity, testFile)
+
+	message, err := finishSecretStoreAfterInPlaceDecrypt(cfg, proc, true)
+	if err != nil {
+		t.Fatalf("Failed to clear secret store: %v", err)
+	}
+	if !strings.Contains(message, "secret store cleared") {
+		t.Fatalf("Expected cleared-store message, got %q", message)
+	}
+	if cfg.HasSecrets() {
+		t.Error("Expected secrets to be cleared with --clear-secrets")
+	}
+
+	reloaded, err := config.Load(cfg.ConfigPath())
+	if err != nil {
+		t.Fatalf("Failed to reload config: %v", err)
+	}
+	if reloaded.HasSecrets() {
+		t.Error("Expected secrets to be cleared in reloaded config")
+	}
+}
+
+func TestValidateDecryptOptionsRejectsClearSecretsWithExportModes(t *testing.T) {
+	tests := []struct {
+		name       string
+		stdout     bool
+		outputPath string
+		outputTar  string
+		want       string
+	}{
+		{
+			name:   "stdout",
+			stdout: true,
+			want:   "cannot use --clear-secrets with --stdout",
+		},
+		{
+			name:       "output path",
+			outputPath: "decrypted",
+			want:       "cannot use --clear-secrets with --output-path",
+		},
+		{
+			name:      "output tar",
+			outputTar: "decrypted.tar",
+			want:      "cannot use --clear-secrets with --output-tar",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateDecryptOptions(tt.stdout, tt.outputPath, tt.outputTar, true)
+			if err == nil {
+				t.Fatal("Expected validation error")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Expected error containing %q, got %q", tt.want, err)
+			}
+		})
+	}
+}
+
+func TestClearSecretsRefusesRawEncryptedMarker(t *testing.T) {
+	dir := t.TempDir()
+	identity, err := crypto.GenerateAgeKeypair()
+	if err != nil {
+		t.Fatalf("Failed to generate keypair: %v", err)
+	}
+	cfg := createTestConfigWithSecrets(t, dir, identity)
+	cfg.Confcrypt = &config.ConfcryptSection{
+		Store: []config.SecretEntry{{Recipient: identity.Recipient().String(), Secret: "placeholder"}},
+	}
+
+	testFile := filepath.Join(dir, "raw-marker.yml")
+	if err := os.WriteFile(testFile, []byte("# ENC[AES256_GCM,\nplain: value\n"), 0644); err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
+	}
+
 	proc, err := processor.NewProcessor(cfg, nil)
 	if err != nil {
 		t.Fatalf("Failed to create processor: %v", err)
 	}
 
-	if err := proc.SetupEncryption(); err != nil {
-		t.Fatalf("Failed to setup encryption: %v", err)
+	message, err := finishSecretStoreAfterInPlaceDecrypt(cfg, proc, true)
+	if err == nil {
+		t.Fatal("Expected --clear-secrets to fail when raw encrypted marker remains")
 	}
-
-	output, _, err := proc.ProcessFile(testFile, true)
-	if err != nil {
-		t.Fatalf("Failed to encrypt: %v", err)
+	if message != "" {
+		t.Fatalf("Expected no message on failure, got %q", message)
 	}
-
-	// Write encrypted file
-	if err := os.WriteFile(testFile, output, 0644); err != nil {
-		t.Fatalf("Failed to write encrypted file: %v", err)
+	if !strings.Contains(err.Error(), "encrypted values remain") {
+		t.Fatalf("Expected encrypted values remain error, got %q", err)
 	}
-
-	// Save secrets
-	if err := proc.SaveEncryptedSecrets(); err != nil {
-		t.Fatalf("Failed to save secrets: %v", err)
-	}
-
-	// Verify secrets exist
 	if !cfg.HasSecrets() {
-		t.Fatal("Expected secrets to exist after encryption")
+		t.Error("Expected secret store to remain after failed clear")
 	}
+}
 
-	// Now decrypt the file in-place
-	proc2, err := processor.NewProcessor(cfg, nil)
+func TestClearSecretsRefusesParseError(t *testing.T) {
+	dir := t.TempDir()
+	identity, err := crypto.GenerateAgeKeypair()
 	if err != nil {
-		t.Fatalf("Failed to create processor for decryption: %v", err)
+		t.Fatalf("Failed to generate keypair: %v", err)
+	}
+	cfg := createTestConfigWithSecrets(t, dir, identity)
+	cfg.Confcrypt = &config.ConfcryptSection{
+		Store: []config.SecretEntry{{Recipient: identity.Recipient().String(), Secret: "placeholder"}},
 	}
 
-	if _, err := proc2.SetupDecryption([]age.Identity{identity}); err != nil {
-		t.Fatalf("Failed to setup decryption: %v", err)
+	testFile := filepath.Join(dir, "broken.yml")
+	if err := os.WriteFile(testFile, []byte("broken: [\n"), 0644); err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
 	}
 
-	decrypted, _, err := proc2.ProcessFile(testFile, false)
+	proc, err := processor.NewProcessor(cfg, nil)
 	if err != nil {
-		t.Fatalf("Failed to decrypt: %v", err)
+		t.Fatalf("Failed to create processor: %v", err)
 	}
 
-	// Write decrypted file (overwriting source)
-	if err := os.WriteFile(testFile, decrypted, 0644); err != nil {
-		t.Fatalf("Failed to write decrypted file: %v", err)
+	message, err := finishSecretStoreAfterInPlaceDecrypt(cfg, proc, true)
+	if err == nil {
+		t.Fatal("Expected --clear-secrets to fail on parse error")
 	}
-
-	// Check if any encrypted values remain in all files
-	allFiles, err := cfg.GetMatchingFiles()
-	if err != nil {
-		t.Fatalf("Failed to get matching files: %v", err)
+	if message != "" {
+		t.Fatalf("Expected no message on failure, got %q", message)
 	}
-
-	hasAnyEncrypted := false
-	for _, file := range allFiles {
-		content, err := os.ReadFile(file)
-		if err != nil {
-			continue
-		}
-		if proc2.HasEncryptedValues(content, file) {
-			hasAnyEncrypted = true
-			break
-		}
+	if !strings.Contains(err.Error(), "cannot clear secret store") {
+		t.Fatalf("Expected clear failure, got %q", err)
 	}
-
-	// Simulate the ClearSecrets logic from decrypt command
-	if !hasAnyEncrypted && cfg.HasSecrets() {
-		cfg.ClearSecrets()
-		if err := cfg.Save(); err != nil {
-			t.Fatalf("Failed to save config: %v", err)
-		}
-	}
-
-	// Verify secrets are cleared
-	if cfg.HasSecrets() {
-		t.Error("Expected secrets to be cleared after full decryption")
-	}
-
-	// Reload config and verify secrets are gone
-	reloaded, err := config.Load(cfg.ConfigPath())
-	if err != nil {
-		t.Fatalf("Failed to reload config: %v", err)
-	}
-
-	if reloaded.HasSecrets() {
-		t.Error("Expected secrets to be cleared in reloaded config")
+	if !cfg.HasSecrets() {
+		t.Error("Expected secret store to remain after failed clear")
 	}
 }
 
@@ -305,69 +416,16 @@ api_key: myapikey
 	}
 }
 
-func TestClearSecretsWithOutputPathSameAsSource(t *testing.T) {
-	dir := t.TempDir()
+func TestSecretsRetainedWithOutputPathSameAsSource(t *testing.T) {
+	cfg, identity, testFile := createEncryptedYAMLFixture(t)
 
-	// Generate keypair
-	identity, err := crypto.GenerateAgeKeypair()
-	if err != nil {
-		t.Fatalf("Failed to generate keypair: %v", err)
-	}
-
-	// Create config
-	cfg := createTestConfigWithSecrets(t, dir, identity)
-
-	// Create test file with sensitive data
-	testFile := filepath.Join(dir, "test.yml")
-	testContent := `database:
-  host: localhost
-  password: secret123
-api_key: myapikey
-`
-	if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
-		t.Fatalf("Failed to write test file: %v", err)
-	}
-
-	// Create processor and encrypt
-	proc, err := processor.NewProcessor(cfg, nil)
-	if err != nil {
-		t.Fatalf("Failed to create processor: %v", err)
-	}
-
-	if err := proc.SetupEncryption(); err != nil {
-		t.Fatalf("Failed to setup encryption: %v", err)
-	}
-
-	output, _, err := proc.ProcessFile(testFile, true)
-	if err != nil {
-		t.Fatalf("Failed to encrypt: %v", err)
-	}
-
-	// Write encrypted file
-	if err := os.WriteFile(testFile, output, 0644); err != nil {
-		t.Fatalf("Failed to write encrypted file: %v", err)
-	}
-
-	// Save secrets
-	if err := proc.SaveEncryptedSecrets(); err != nil {
-		t.Fatalf("Failed to save secrets: %v", err)
-	}
-
-	// Verify secrets exist
-	if !cfg.HasSecrets() {
-		t.Fatal("Expected secrets to exist after encryption")
-	}
-
-	// Now decrypt with output-path="./" (same as source directory)
 	proc2, err := processor.NewProcessor(cfg, nil)
 	if err != nil {
 		t.Fatalf("Failed to create processor for decryption: %v", err)
 	}
-
 	if _, err := proc2.SetupDecryption([]age.Identity{identity}); err != nil {
 		t.Fatalf("Failed to setup decryption: %v", err)
 	}
-
 	decrypted, _, err := proc2.ProcessFile(testFile, false)
 	if err != nil {
 		t.Fatalf("Failed to decrypt: %v", err)
@@ -410,17 +468,8 @@ api_key: myapikey
 		t.Error("Expected source files to be decrypted when output-path='./'")
 	}
 
-	// Simulate the ClearSecrets logic - should clear because source files are now decrypted
-	if !hasAnyEncrypted && cfg.HasSecrets() {
-		cfg.ClearSecrets()
-		if err := cfg.Save(); err != nil {
-			t.Fatalf("Failed to save config: %v", err)
-		}
-	}
-
-	// Verify secrets are cleared
-	if cfg.HasSecrets() {
-		t.Error("Expected secrets to be cleared when output-path='./' (same as source)")
+	if !cfg.HasSecrets() {
+		t.Error("Expected secrets to be retained when using --output-path")
 	}
 }
 

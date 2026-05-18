@@ -1023,6 +1023,92 @@ api:
 	}
 }
 
+func TestYAMLIndentedCommentsDoNotAddBlankLinesBetweenTopLevelKeys(t *testing.T) {
+	dir := t.TempDir()
+
+	identity, err := crypto.GenerateAgeKeypair()
+	if err != nil {
+		t.Fatalf("Failed to generate keypair: %v", err)
+	}
+
+	cfg := createTestConfig(t, dir, []config.RecipientConfig{
+		{Name: "test", Age: identity.Recipient().String()},
+	})
+
+	testFile := filepath.Join(dir, "test.yml")
+	testContent := `secret: supersecret
+
+example_mapping:
+  first: [one]
+  second: [two] # inline note
+  third: [three] # another inline note
+  # Additional notes for this mapping.
+  # These should stay attached to the mapping.
+
+next_section:
+  - item # inline note
+`
+	if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
+	}
+
+	proc, err := NewProcessor(cfg, nil)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+	if err := proc.SetupEncryption(); err != nil {
+		t.Fatalf("Failed to setup encryption: %v", err)
+	}
+
+	encrypted, modified, err := proc.ProcessFile(testFile, true)
+	if err != nil {
+		t.Fatalf("Failed to encrypt: %v", err)
+	}
+	if !modified {
+		t.Fatal("Expected file to be modified")
+	}
+
+	if got := blankLinesBeforeKey(string(encrypted), "next_section:"); got != 1 {
+		t.Fatalf("Expected exactly 1 blank line before next top-level key after encryption, got %d:\n%s", got, encrypted)
+	}
+
+	if err := os.WriteFile(testFile, encrypted, 0644); err != nil {
+		t.Fatalf("Failed to write encrypted file: %v", err)
+	}
+	if err := proc.SaveEncryptedSecrets(); err != nil {
+		t.Fatalf("Failed to save secrets: %v", err)
+	}
+	if _, err := proc.SetupDecryption([]age.Identity{identity}); err != nil {
+		t.Fatalf("Failed to setup decryption: %v", err)
+	}
+
+	decrypted, modified, err := proc.ProcessFile(testFile, false)
+	if err != nil {
+		t.Fatalf("Failed to decrypt: %v", err)
+	}
+	if !modified {
+		t.Fatal("Expected file to be modified during decryption")
+	}
+
+	if got := blankLinesBeforeKey(string(decrypted), "next_section:"); got != 1 {
+		t.Fatalf("Expected exactly 1 blank line before next top-level key after decryption, got %d:\n%s", got, decrypted)
+	}
+}
+
+func blankLinesBeforeKey(content, key string) int {
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		if line == key {
+			count := 0
+			for j := i - 1; j >= 0 && strings.TrimSpace(lines[j]) == ""; j-- {
+				count++
+			}
+			return count
+		}
+	}
+	return -1
+}
+
 func TestProcessorEnvFileEncryptDecrypt(t *testing.T) {
 	dir := t.TempDir()
 
@@ -1395,9 +1481,9 @@ func TestMatchFile_RelativePaths(t *testing.T) {
 
 	// Create test files at various depths
 	files := map[string]string{
-		filepath.Join(dir, "root.yml"):          "password: secret1\n",
-		filepath.Join(sub1, "nested.yml"):       "password: secret2\n",
-		filepath.Join(sub2, "deep.json"):        `{"password": "secret3"}`,
+		filepath.Join(dir, "root.yml"):    "password: secret1\n",
+		filepath.Join(sub1, "nested.yml"): "password: secret2\n",
+		filepath.Join(sub2, "deep.json"):  `{"password": "secret3"}`,
 	}
 	for path, content := range files {
 		if err := os.WriteFile(path, []byte(content), 0644); err != nil {

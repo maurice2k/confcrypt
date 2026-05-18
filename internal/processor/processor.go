@@ -877,6 +877,14 @@ func (p *Processor) VerifyMAC(filePath string, content []byte, formatOverride ..
 // HasEncryptedValues checks if file content contains any encrypted values
 // The optional formatOverride parameter can be used to force a specific format
 func (p *Processor) HasEncryptedValues(content []byte, filePath string, formatOverride ...string) bool {
+	hasEncrypted, err := p.HasEncryptedValuesStrict(content, filePath, formatOverride...)
+	return err == nil && hasEncrypted
+}
+
+// HasEncryptedValuesStrict checks if file content contains any encrypted values
+// and returns parse errors instead of treating them as "no encrypted values".
+// The optional formatOverride parameter can be used to force a specific format.
+func (p *Processor) HasEncryptedValuesStrict(content []byte, filePath string, formatOverride ...string) (bool, error) {
 	var override string
 	if len(formatOverride) > 0 {
 		override = formatOverride[0]
@@ -885,23 +893,23 @@ func (p *Processor) HasEncryptedValues(content []byte, filePath string, formatOv
 
 	// For full file encryption, check for the header
 	if fileFormat == FormatFull {
-		return format.IsFullFileEncrypted(content)
+		return format.IsFullFileEncrypted(content), nil
 	}
 
 	var data interface{}
 	switch fileFormat {
 	case FormatYAML:
 		if err := yaml.Unmarshal(content, &data); err != nil {
-			return false
+			return false, fmt.Errorf("failed to parse YAML: %w", err)
 		}
 	case FormatJSON:
 		if err := json.Unmarshal(content, &data); err != nil {
-			return false
+			return false, fmt.Errorf("failed to parse JSON: %w", err)
 		}
 	case FormatEnv:
 		envFile, err := ParseEnvFile(content)
 		if err != nil {
-			return false
+			return false, fmt.Errorf("failed to parse .env file: %w", err)
 		}
 		m := make(map[string]interface{})
 		for _, line := range envFile.Lines {
@@ -911,11 +919,11 @@ func (p *Processor) HasEncryptedValues(content []byte, filePath string, formatOv
 		}
 		data = m
 	default:
-		return false
+		return false, fmt.Errorf("unsupported file format")
 	}
 
 	values := collectEncryptedValues(data, nil)
-	return len(values) > 0
+	return len(values) > 0, nil
 }
 
 // HasUnencryptedValues checks if file content contains any unencrypted values that match encryption rules
@@ -1129,10 +1137,7 @@ func preserveBlankLinesRecursive(node *yaml.Node, prevEndLine int) int {
 		if node.HeadComment != "" {
 			// Strip any leading newlines we may have added previously
 			comment := strings.TrimLeft(node.HeadComment, "\n")
-			if comment != "" {
-				// Count actual comment lines (each line of comment text)
-				headCommentLines = strings.Count(comment, "\n") + 1
-			}
+			headCommentLines = commentLineCount(comment)
 			node.HeadComment = comment // Remove accumulated leading newlines
 		}
 
@@ -1148,8 +1153,23 @@ func preserveBlankLinesRecursive(node *yaml.Node, prevEndLine int) int {
 
 	// Process children - track line numbers across siblings
 	childEndLine := 0
-	for _, child := range node.Content {
-		childEndLine = preserveBlankLinesRecursive(child, childEndLine)
+	if node.Kind == yaml.MappingNode {
+		for i := 0; i < len(node.Content); i += 2 {
+			keyEndLine := preserveBlankLinesRecursive(node.Content[i], childEndLine)
+			valueEndLine := keyEndLine
+			if i+1 < len(node.Content) {
+				valueEndLine = preserveBlankLinesRecursive(node.Content[i+1], keyEndLine)
+			}
+			if keyEndLine > valueEndLine {
+				childEndLine = keyEndLine
+			} else {
+				childEndLine = valueEndLine
+			}
+		}
+	} else {
+		for _, child := range node.Content {
+			childEndLine = preserveBlankLinesRecursive(child, childEndLine)
+		}
 	}
 
 	// The end line is the maximum of current node's line and its children's end line
@@ -1157,5 +1177,15 @@ func preserveBlankLinesRecursive(node *yaml.Node, prevEndLine int) int {
 		currentEndLine = childEndLine
 	}
 
+	currentEndLine += commentLineCount(node.FootComment)
+
 	return currentEndLine
+}
+
+func commentLineCount(comment string) int {
+	comment = strings.Trim(comment, "\n")
+	if comment == "" {
+		return 0
+	}
+	return strings.Count(comment, "\n") + 1
 }

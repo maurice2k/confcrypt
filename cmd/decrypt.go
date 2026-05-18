@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"archive/tar"
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -16,13 +17,14 @@ import (
 )
 
 var (
-	forceDecrypt       bool
-	decryptAgeKeyFile  string
-	decryptSSHKeyFile  string
-	decryptYubiKeyFlag bool
-	decryptFIDO2Flag   bool
-	decryptOutputPath  string
-	decryptOutputTar   string
+	forceDecrypt        bool
+	decryptAgeKeyFile   string
+	decryptSSHKeyFile   string
+	decryptYubiKeyFlag  bool
+	decryptFIDO2Flag    bool
+	decryptOutputPath   string
+	decryptOutputTar    string
+	decryptClearSecrets bool
 )
 
 var decryptCmd = &cobra.Command{
@@ -49,6 +51,7 @@ func init() {
 	decryptCmd.Flags().BoolVar(&decryptFIDO2Flag, "fido2-key", false, "Use FIDO2 hmac-secret (requires CGO build)")
 	decryptCmd.Flags().StringVar(&decryptOutputPath, "output-path", "", "Write decrypted files to this directory (relative to current working directory if not absolute)")
 	decryptCmd.Flags().StringVar(&decryptOutputTar, "output-tar", "", "Write decrypted files to tar archive (use '-' for stdout)")
+	decryptCmd.Flags().BoolVar(&decryptClearSecrets, "clear-secrets", false, "Clear encrypted AES key store after all in-place encrypted values are removed")
 	// Allow --age-key and --ssh-key without a value (sets to "auto")
 	decryptCmd.Flags().Lookup("age-key").NoOptDefVal = AutoDetectMarker
 	decryptCmd.Flags().Lookup("ssh-key").NoOptDefVal = AutoDetectMarker
@@ -57,12 +60,8 @@ func init() {
 
 func runDecrypt(cmd *cobra.Command, args []string) {
 	// Check mutually exclusive flags
-	if decryptOutputTar != "" && decryptOutputPath != "" {
-		fmt.Fprintf(os.Stderr, "Error: cannot use both --output-tar and --output-path\n")
-		os.Exit(1)
-	}
-	if decryptOutputTar != "" && toStdout {
-		fmt.Fprintf(os.Stderr, "Error: cannot use both --output-tar and --stdout\n")
+	if err := validateDecryptOptions(toStdout, decryptOutputPath, decryptOutputTar, decryptClearSecrets); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -292,15 +291,15 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 			originalFile := file
 			if decryptOutputPath != "" {
 				// Resolve output path (relative to config dir if not absolute)
-			outDir := decryptOutputPath
-			if !filepath.IsAbs(outDir) {
-				cwd, err := os.Getwd()
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
-					os.Exit(1)
+				outDir := decryptOutputPath
+				if !filepath.IsAbs(outDir) {
+					cwd, err := os.Getwd()
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
+						os.Exit(1)
+					}
+					outDir = filepath.Join(cwd, outDir)
 				}
-				outDir = filepath.Join(cwd, outDir)
-			}
 				outputFile = filepath.Join(outDir, relPath)
 
 				// Apply rename rules to output path
@@ -369,33 +368,109 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	// Check if all files are now fully decrypted (no encrypted values remain)
-	// If so, clear the secret store to trigger fresh key generation on next encrypt
-	// Skip this check for non-destructive exports (--output-tar, --output-path)
+	// Check if all files are now fully decrypted. By default the secret store is
+	// retained as recovery metadata; --clear-secrets removes it only after strict
+	// validation confirms no encrypted values remain.
 	if !toStdout && decryptOutputTar == "" && decryptOutputPath == "" {
-		// Get ALL matching files (not just the ones processed via --file flag)
-		allFilesWithFormat, err := cfg.GetMatchingFilesWithFormat()
-		if err == nil && len(allFilesWithFormat) > 0 {
-			hasAnyEncrypted := false
-			for _, f := range allFilesWithFormat {
-				content, err := os.ReadFile(f.Path)
-				if err != nil {
-					continue
-				}
-				if proc.HasEncryptedValues(content, f.Path, f.Format) {
-					hasAnyEncrypted = true
-					break
-				}
-			}
-
-			if !hasAnyEncrypted && cfg.HasSecrets() {
-				cfg.ClearSecrets()
-				if err := cfg.Save(); err != nil {
-					fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
-					os.Exit(1)
-				}
-				fmt.Println("All values decrypted, secret store cleared (new key will be generated on next encrypt)")
-			}
+		message, err := finishSecretStoreAfterInPlaceDecrypt(cfg, proc, decryptClearSecrets)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if message != "" {
+			fmt.Println(message)
 		}
 	}
+}
+
+func validateDecryptOptions(stdout bool, outputPath, outputTar string, clearSecrets bool) error {
+	if outputTar != "" && outputPath != "" {
+		return fmt.Errorf("cannot use both --output-tar and --output-path")
+	}
+	if outputTar != "" && stdout {
+		return fmt.Errorf("cannot use both --output-tar and --stdout")
+	}
+	if clearSecrets && stdout {
+		return fmt.Errorf("cannot use --clear-secrets with --stdout")
+	}
+	if clearSecrets && outputPath != "" {
+		return fmt.Errorf("cannot use --clear-secrets with --output-path")
+	}
+	if clearSecrets && outputTar != "" {
+		return fmt.Errorf("cannot use --clear-secrets with --output-tar")
+	}
+	return nil
+}
+
+func finishSecretStoreAfterInPlaceDecrypt(cfg *config.Config, proc *processor.Processor, clearSecrets bool) (string, error) {
+	if !cfg.HasSecrets() {
+		return "", nil
+	}
+
+	hasAnyEncrypted, err := encryptedContentRemains(cfg, proc)
+	if err != nil {
+		if clearSecrets {
+			return "", fmt.Errorf("cannot clear secret store: %w", err)
+		}
+		return "", nil
+	}
+
+	if hasAnyEncrypted {
+		if clearSecrets {
+			return "", fmt.Errorf("cannot clear secret store: encrypted values remain")
+		}
+		return "", nil
+	}
+
+	if !clearSecrets {
+		return "All values decrypted; secret store retained for recovery. Use --clear-secrets to remove it.", nil
+	}
+
+	cfg.ClearSecrets()
+	if err := cfg.Save(); err != nil {
+		return "", fmt.Errorf("saving config: %w", err)
+	}
+
+	return "All values decrypted, secret store cleared (new key will be generated on next encrypt)", nil
+}
+
+func encryptedContentRemains(cfg *config.Config, proc *processor.Processor) (bool, error) {
+	allFilesWithFormat, err := cfg.GetMatchingFilesWithFormat()
+	if err != nil {
+		return false, err
+	}
+
+	for _, f := range allFilesWithFormat {
+		content, err := os.ReadFile(f.Path)
+		if err != nil {
+			return false, fmt.Errorf("reading %s: %w", displayConfigRelativePath(cfg, f.Path), err)
+		}
+
+		if hasRawEncryptedMarker(content) {
+			return true, nil
+		}
+
+		hasEncrypted, err := proc.HasEncryptedValuesStrict(content, f.Path, f.Format)
+		if err != nil {
+			return false, fmt.Errorf("checking %s: %w", displayConfigRelativePath(cfg, f.Path), err)
+		}
+		if hasEncrypted {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func hasRawEncryptedMarker(content []byte) bool {
+	return bytes.Contains(content, []byte("ENC[AES256_GCM,")) ||
+		bytes.Contains(content, []byte("$CONFCRYPT_ENCRYPTED;"))
+}
+
+func displayConfigRelativePath(cfg *config.Config, path string) string {
+	relPath, err := filepath.Rel(cfg.ConfigDir(), path)
+	if err == nil && relPath != "" {
+		return relPath
+	}
+	return path
 }
