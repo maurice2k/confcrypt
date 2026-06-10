@@ -3,6 +3,8 @@ package processor
 import (
 	"strings"
 	"testing"
+
+	"filippo.io/age"
 )
 
 func TestParseEnvFile(t *testing.T) {
@@ -300,5 +302,152 @@ KEY3=value3`
 		} else if got != v {
 			t.Errorf("m[%s] = %q, want %q", k, got, v)
 		}
+	}
+}
+
+func TestEnvHashInValueIsNotComment(t *testing.T) {
+	envFile, err := ParseEnvFile([]byte("PASSWORD=p@ss#w0rd\n"))
+	if err != nil {
+		t.Fatalf("ParseEnvFile failed: %v", err)
+	}
+
+	value, ok := envFile.Get("PASSWORD")
+	if !ok {
+		t.Fatal("PASSWORD not found")
+	}
+	if value != "p@ss#w0rd" {
+		t.Errorf("Expected value %q, got %q - # without preceding whitespace must not start a comment", "p@ss#w0rd", value)
+	}
+
+	// Round-trip must be lossless
+	if got := string(envFile.Marshal()); got != "PASSWORD=p@ss#w0rd\n" {
+		t.Errorf("Round-trip changed content: %q", got)
+	}
+}
+
+func TestEnvHashAfterWhitespaceIsComment(t *testing.T) {
+	for _, tc := range []struct {
+		line, wantValue, wantComment string
+	}{
+		{"KEY=value # comment", "value", "# comment"},
+		{"KEY=value\t# comment", "value", "# comment"},
+		{"KEY=#leading-hash", "#leading-hash", ""},
+	} {
+		envFile, err := ParseEnvFile([]byte(tc.line))
+		if err != nil {
+			t.Fatalf("ParseEnvFile(%q) failed: %v", tc.line, err)
+		}
+		line := envFile.Lines[0]
+		if line.Value != tc.wantValue {
+			t.Errorf("%q: expected value %q, got %q", tc.line, tc.wantValue, line.Value)
+		}
+		if line.Comment != tc.wantComment {
+			t.Errorf("%q: expected comment %q, got %q", tc.line, tc.wantComment, line.Comment)
+		}
+	}
+}
+
+func TestEnvMultilineQuotedValue(t *testing.T) {
+	content := "SECRET=\"line1\nline2\"\nOTHER=plain\n"
+	envFile, err := ParseEnvFile([]byte(content))
+	if err != nil {
+		t.Fatalf("ParseEnvFile failed: %v", err)
+	}
+
+	value, ok := envFile.Get("SECRET")
+	if !ok {
+		t.Fatal("SECRET not found")
+	}
+	if value != "\"line1\nline2\"" {
+		t.Errorf("Expected full multiline value, got %q", value)
+	}
+
+	other, ok := envFile.Get("OTHER")
+	if !ok || other != "plain" {
+		t.Errorf("Line after multiline value mis-parsed: %q (found=%v)", other, ok)
+	}
+
+	// Round-trip must be lossless
+	if got := string(envFile.Marshal()); got != content {
+		t.Errorf("Round-trip changed content:\n%q\nwant:\n%q", got, content)
+	}
+}
+
+func TestEnvMultilineUnterminatedQuoteFallsBack(t *testing.T) {
+	content := "BROKEN=\"never-closed\nOTHER=plain\n"
+	envFile, err := ParseEnvFile([]byte(content))
+	if err != nil {
+		t.Fatalf("ParseEnvFile failed: %v", err)
+	}
+
+	// Without a closing quote anywhere, lines must be parsed individually
+	if v, _ := envFile.Get("BROKEN"); v != "\"never-closed" {
+		t.Errorf("Expected single-line fallback, got %q", v)
+	}
+	if v, ok := envFile.Get("OTHER"); !ok || v != "plain" {
+		t.Errorf("Following line mis-parsed: %q (found=%v)", v, ok)
+	}
+}
+
+func TestEnvMultilineValueEncryptsCompletely(t *testing.T) {
+	// processEnv must encrypt the entire multiline value; no continuation
+	// line may stay in the encrypted output
+	content := "PASSWORD=\"line1\nline2\"\n"
+
+	proc, identity, cfg := newMultiDocProcessor(t)
+	encrypted, modified, err := proc.ProcessContent([]byte(content), ".env", true, FormatEnv)
+	if err != nil {
+		t.Fatalf("Failed to encrypt: %v", err)
+	}
+	if !modified {
+		t.Fatal("Expected env value to be encrypted")
+	}
+	for _, leak := range []string{"line1", "line2"} {
+		if strings.Contains(string(encrypted), leak) {
+			t.Errorf("Plaintext %q leaked into encrypted output:\n%s", leak, encrypted)
+		}
+	}
+
+	proc2, err := NewProcessor(cfg, nil)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+	if _, err := proc2.SetupDecryption([]age.Identity{identity}); err != nil {
+		t.Fatalf("Failed to setup decryption: %v", err)
+	}
+	decrypted, _, err := proc2.ProcessContent(encrypted, ".env", false, FormatEnv)
+	if err != nil {
+		t.Fatalf("Failed to decrypt: %v", err)
+	}
+	if string(decrypted) != content {
+		t.Errorf("Round-trip changed content:\n%q\nwant:\n%q", decrypted, content)
+	}
+}
+
+func TestEnvHashValueEncryptsCompletely(t *testing.T) {
+	content := "PASSWORD=p@ss#w0rd\n"
+
+	proc, identity, cfg := newMultiDocProcessor(t)
+	encrypted, _, err := proc.ProcessContent([]byte(content), ".env", true, FormatEnv)
+	if err != nil {
+		t.Fatalf("Failed to encrypt: %v", err)
+	}
+	if strings.Contains(string(encrypted), "w0rd") {
+		t.Errorf("Tail of value leaked into encrypted output:\n%s", encrypted)
+	}
+
+	proc2, err := NewProcessor(cfg, nil)
+	if err != nil {
+		t.Fatalf("Failed to create processor: %v", err)
+	}
+	if _, err := proc2.SetupDecryption([]age.Identity{identity}); err != nil {
+		t.Fatalf("Failed to setup decryption: %v", err)
+	}
+	decrypted, _, err := proc2.ProcessContent(encrypted, ".env", false, FormatEnv)
+	if err != nil {
+		t.Fatalf("Failed to decrypt: %v", err)
+	}
+	if string(decrypted) != content {
+		t.Errorf("Round-trip changed content:\n%q\nwant:\n%q", decrypted, content)
 	}
 }

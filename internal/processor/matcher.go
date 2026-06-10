@@ -200,7 +200,7 @@ func (m *Matcher) traverse(data interface{}, path []string, results *[]MatchResu
 	switch v := data.(type) {
 	case map[string]interface{}:
 		for key, val := range v {
-			currentPath := append(path, key)
+			currentPath := clonePath(path, key)
 
 			// Check if this is a leaf value that should be encrypted
 			if IsLeafValue(val) {
@@ -216,6 +216,9 @@ func (m *Matcher) traverse(data interface{}, path []string, results *[]MatchResu
 						Encrypted: encrypted,
 					})
 				}
+			} else if arr, ok := val.([]interface{}); ok && m.ShouldEncrypt(key, currentPath) {
+				// A matched key whose value is a list: report the leaf items
+				m.traverseMatchedSlice(arr, path, key, results)
 			} else {
 				// Recurse into nested structures
 				m.traverse(val, currentPath, results)
@@ -223,13 +226,43 @@ func (m *Matcher) traverse(data interface{}, path []string, results *[]MatchResu
 		}
 
 	case []interface{}:
-		for i, item := range v {
+		for _, item := range v {
 			// For arrays, we don't add to path for matching purposes
 			// but we do recurse into objects within arrays
 			m.traverse(item, path, results)
-			_ = i // Index not used in path
 		}
 	}
+}
+
+// traverseMatchedSlice reports the leaf items of a list whose key matched
+func (m *Matcher) traverseMatchedSlice(arr []interface{}, parentPath []string, key string, results *[]MatchResult) {
+	for i, item := range arr {
+		switch nested := item.(type) {
+		case []interface{}:
+			m.traverseMatchedSlice(nested, parentPath, fmt.Sprintf("%s[%d]", key, i), results)
+		case map[string]interface{}:
+			m.traverse(nested, clonePath(parentPath, key), results)
+		default:
+			encrypted := false
+			if s, ok := item.(string); ok {
+				encrypted = format.IsEncrypted(s)
+			}
+			*results = append(*results, MatchResult{
+				Path:      clonePath(parentPath, fmt.Sprintf("%s[%d]", key, i)),
+				KeyName:   key,
+				Value:     item,
+				Encrypted: encrypted,
+			})
+		}
+	}
+}
+
+// clonePath appends a path element without aliasing the parent's backing array
+func clonePath(path []string, key string) []string {
+	currentPath := make([]string, len(path)+1)
+	copy(currentPath, path)
+	currentPath[len(path)] = key
+	return currentPath
 }
 
 // IsLeafValue checks if a value is a leaf (not a map or slice)

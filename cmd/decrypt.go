@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/maurice2k/confcrypt/internal/config"
+	"github.com/maurice2k/confcrypt/internal/fileutil"
 	"github.com/maurice2k/confcrypt/internal/processor"
 )
 
@@ -251,6 +252,10 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 			os.Exit(1)
 		}
 
+		// Decrypted full-file content is typically key material (id_rsa,
+		// *.pem, ...) and must not be world-readable
+		isFullFile := processor.DetectFormat(file, fileFormats[file]) == processor.FormatFull
+
 		if toStdout {
 			fmt.Print(string(output))
 		} else if tarWriter != nil {
@@ -266,10 +271,19 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 			baseDir := filepath.Base(cfg.ConfigDir())
 			tarPath := filepath.Join(baseDir, outputName)
 
+			// Preserve the source file's permissions in the archive
+			tarMode := int64(0644)
+			if fi, err := os.Stat(file); err == nil {
+				tarMode = int64(fi.Mode().Perm())
+			}
+			if isFullFile {
+				tarMode = 0600
+			}
+
 			header := &tar.Header{
 				Name:    tarPath,
 				Size:    int64(len(output)),
-				Mode:    0644,
+				Mode:    tarMode,
 				ModTime: time.Now(),
 			}
 			if err := tarWriter.WriteHeader(header); err != nil {
@@ -327,8 +341,14 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 				outputFile = renamedFile
 			}
 
-			if err := proc.WriteFile(outputFile, output); err != nil {
-				fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", outputFile, err)
+			var writeErr error
+			if isFullFile {
+				writeErr = fileutil.WriteFileAtomicMode(outputFile, output, 0600)
+			} else {
+				writeErr = proc.WriteFile(outputFile, output)
+			}
+			if writeErr != nil {
+				fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", outputFile, writeErr)
 				os.Exit(1)
 			}
 

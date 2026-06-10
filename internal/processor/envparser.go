@@ -35,12 +35,80 @@ func ParseEnvFile(content []byte) (*EnvFile, error) {
 		Lines: make([]EnvLine, 0, len(lines)),
 	}
 
-	for _, line := range lines {
-		envLine := parseLine(line)
-		envFile.Lines = append(envFile.Lines, envLine)
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+
+		// A quoted value whose closing quote is not on the same line spans
+		// multiple physical lines; merge them into one logical line so the
+		// whole value is treated (and encrypted) as a unit instead of
+		// leaving the continuation lines in plaintext
+		if rawValue, ok := keyValueRawValue(line); ok && hasUnterminatedQuote(rawValue) {
+			merged := line
+			mergedValue := rawValue
+			closed := false
+			j := i
+			for j+1 < len(lines) {
+				j++
+				merged += "\n" + lines[j]
+				mergedValue += "\n" + lines[j]
+				if !hasUnterminatedQuote(mergedValue) {
+					closed = true
+					break
+				}
+			}
+			if closed {
+				envFile.Lines = append(envFile.Lines, parseLine(merged))
+				i = j
+				continue
+			}
+			// No closing quote anywhere in the file - fall through and
+			// treat the line as a single-line value
+		}
+
+		envFile.Lines = append(envFile.Lines, parseLine(line))
 	}
 
 	return envFile, nil
+}
+
+// keyValueRawValue extracts the raw value part of a key-value line, applying
+// the same prefix handling as parseLine. Returns false for blank/comment or
+// malformed lines.
+func keyValueRawValue(line string) (string, bool) {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+		return "", false
+	}
+
+	workLine := trimmed
+	if strings.HasPrefix(workLine, "export ") {
+		workLine = strings.TrimSpace(strings.TrimPrefix(workLine, "export "))
+	}
+
+	eqIdx := strings.Index(workLine, "=")
+	if eqIdx == -1 {
+		return "", false
+	}
+
+	return workLine[eqIdx+1:], true
+}
+
+// hasUnterminatedQuote reports whether a raw value starts with a quote that
+// is never closed (escaped double quotes don't count as closing)
+func hasUnterminatedQuote(rawValue string) bool {
+	if len(rawValue) == 0 || (rawValue[0] != '"' && rawValue[0] != '\'') {
+		return false
+	}
+	quote := rawValue[0]
+	for i := 1; i < len(rawValue); i++ {
+		if rawValue[i] == quote {
+			if quote == '"' && rawValue[i-1] == '\\' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
 }
 
 // parseLine parses a single .env line
@@ -126,15 +194,12 @@ func splitValueAndComment(s string) (value, comment string) {
 		return s, ""
 	}
 
-	// Unquoted value - look for # comment marker
-	// Check for " #" first (space before #)
-	if idx := strings.Index(s, " #"); idx >= 0 {
-		return strings.TrimRight(s[:idx], " \t"), s[idx+1:]
-	}
-
-	// Check for "#" without space (less common)
-	if idx := strings.Index(s, "#"); idx > 0 {
-		return strings.TrimRight(s[:idx], " \t"), s[idx:]
+	// Unquoted value - a comment starts only at a # preceded by whitespace;
+	// a # embedded in the value (e.g. p@ss#w0rd) is part of the value
+	for i := 1; i < len(s); i++ {
+		if s[i] == '#' && (s[i-1] == ' ' || s[i-1] == '\t') {
+			return strings.TrimRight(s[:i], " \t"), s[i:]
+		}
 	}
 
 	return s, ""

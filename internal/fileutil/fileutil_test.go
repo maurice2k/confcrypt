@@ -80,3 +80,24 @@ func TestWriteFileAtomicLeavesNoTempFiles(t *testing.T) {
 		t.Errorf("Expected only out.txt in dir, got %v", names)
 	}
 }
+
+func TestWriteFileAtomicModeForcesMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "id_rsa")
+
+	// Existing world-readable file must end up with the forced mode
+	if err := os.WriteFile(path, []byte("old"), 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	if err := WriteFileAtomicMode(path, []byte("private key"), 0600); err != nil {
+		t.Fatalf("WriteFileAtomicMode failed: %v", err)
+	}
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat failed: %v", err)
+	}
+	if fi.Mode().Perm() != 0600 {
+		t.Errorf("Expected forced mode 0600, got %o", fi.Mode().Perm())
+	}
+}

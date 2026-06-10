@@ -17,7 +17,13 @@ func WriteFileAtomic(filePath string, data []byte, defaultMode os.FileMode) erro
 	if fi, err := os.Stat(filePath); err == nil {
 		mode = fi.Mode().Perm()
 	}
+	return WriteFileAtomicMode(filePath, data, mode)
+}
 
+// WriteFileAtomicMode is like WriteFileAtomic but always applies the given
+// permissions, even when the target file already exists with different ones
+// (e.g. decrypted private keys must end up 0600 regardless of prior mode).
+func WriteFileAtomicMode(filePath string, data []byte, mode os.FileMode) error {
 	dir := filepath.Dir(filePath)
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(filePath)+".tmp-*")
 	if err != nil {

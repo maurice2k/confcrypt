@@ -409,7 +409,8 @@ func (p *Processor) transformYAMLNode(node *yaml.Node, path []string, encrypt bo
 			key := keyNode.Value
 			currentPath := append(path, key)
 
-			if valueNode.Kind == yaml.ScalarNode {
+			switch {
+			case valueNode.Kind == yaml.ScalarNode:
 				// Leaf value - check if we should encrypt/decrypt
 				if encrypt {
 					if p.shouldEncryptString(key, currentPath, valueNode.Value) {
@@ -435,7 +436,30 @@ func (p *Processor) transformYAMLNode(node *yaml.Node, path []string, encrypt bo
 						modified = true
 					}
 				}
-			} else {
+
+			case encrypt && valueNode.Kind == yaml.SequenceNode && p.matcher.ShouldEncrypt(key, currentPath):
+				// A matched key whose value is a list: encrypt the scalar items
+				childModified, err := p.encryptMatchedYAMLSequence(valueNode, currentPath)
+				if err != nil {
+					return false, err
+				}
+				if childModified {
+					modified = true
+				}
+
+			case encrypt && valueNode.Kind == yaml.AliasNode && valueNode.Alias != nil && p.matcher.ShouldEncrypt(key, currentPath):
+				// A matched key referencing an anchor: encrypt the anchor
+				// target so the secret doesn't silently stay in plaintext
+				// (all aliases share the target, so they stay consistent)
+				childModified, err := p.encryptMatchedYAMLTarget(valueNode.Alias, currentPath)
+				if err != nil {
+					return false, err
+				}
+				if childModified {
+					modified = true
+				}
+
+			default:
 				// Recurse into nested structures
 				childModified, err := p.transformYAMLNode(valueNode, currentPath, encrypt)
 				if err != nil {
@@ -450,6 +474,22 @@ func (p *Processor) transformYAMLNode(node *yaml.Node, path []string, encrypt bo
 	case yaml.SequenceNode:
 		// Sequence nodes have items in Content
 		for _, item := range node.Content {
+			if item.Kind == yaml.ScalarNode {
+				// Scalar list items are encrypted only under a matched key
+				// (handled above), but any encrypted item must decrypt here
+				if !encrypt && format.IsEncrypted(item.Value) {
+					decrypted, originalTag, err := p.decryptScalarValue(item.Value)
+					if err != nil {
+						return false, fmt.Errorf("failed to decrypt %s: %w", strings.Join(path, "."), err)
+					}
+					item.Value = decrypted
+					item.Tag = originalTag
+					item.Style = 0
+					modified = true
+				}
+				continue
+			}
+
 			childModified, err := p.transformYAMLNode(item, path, encrypt)
 			if err != nil {
 				return false, err
@@ -461,6 +501,69 @@ func (p *Processor) transformYAMLNode(node *yaml.Node, path []string, encrypt bo
 	}
 
 	return modified, nil
+}
+
+// encryptMatchedYAMLSequence encrypts the scalar items of a sequence whose
+// key matched the encryption rules. Nested sequences inherit the match;
+// mappings inside the list are traversed with normal key matching.
+func (p *Processor) encryptMatchedYAMLSequence(node *yaml.Node, path []string) (bool, error) {
+	modified := false
+	for _, item := range node.Content {
+		switch item.Kind {
+		case yaml.ScalarNode:
+			if format.IsEncrypted(item.Value) {
+				continue
+			}
+			encrypted, err := p.encryptScalarValue(item.Value, item.Tag)
+			if err != nil {
+				return false, fmt.Errorf("failed to encrypt %s: %w", strings.Join(path, "."), err)
+			}
+			item.Value = encrypted
+			item.Tag = "!!str"
+			item.Style = 0
+			modified = true
+		case yaml.SequenceNode:
+			childModified, err := p.encryptMatchedYAMLSequence(item, path)
+			if err != nil {
+				return false, err
+			}
+			if childModified {
+				modified = true
+			}
+		default:
+			childModified, err := p.transformYAMLNode(item, path, true)
+			if err != nil {
+				return false, err
+			}
+			if childModified {
+				modified = true
+			}
+		}
+	}
+	return modified, nil
+}
+
+// encryptMatchedYAMLTarget encrypts the target node of an alias whose
+// referencing key matched the encryption rules
+func (p *Processor) encryptMatchedYAMLTarget(target *yaml.Node, path []string) (bool, error) {
+	switch target.Kind {
+	case yaml.ScalarNode:
+		if format.IsEncrypted(target.Value) {
+			return false, nil
+		}
+		encrypted, err := p.encryptScalarValue(target.Value, target.Tag)
+		if err != nil {
+			return false, fmt.Errorf("failed to encrypt %s: %w", strings.Join(path, "."), err)
+		}
+		target.Value = encrypted
+		target.Tag = "!!str"
+		target.Style = 0
+		return true, nil
+	case yaml.SequenceNode:
+		return p.encryptMatchedYAMLSequence(target, path)
+	default:
+		return p.transformYAMLNode(target, path, true)
+	}
 }
 
 // encryptScalarValue encrypts a scalar YAML value
@@ -510,11 +613,24 @@ func (p *Processor) decryptScalarValue(encStr string) (string, string, error) {
 	return string(plaintext), tag, nil
 }
 
+// decodeJSON parses JSON content with numbers kept as json.Number, so large
+// integers and exact decimal representations survive a re-marshal verbatim
+// instead of being corrupted by a float64 round-trip
+func decodeJSON(content []byte) (interface{}, error) {
+	decoder := json.NewDecoder(bytes.NewReader(content))
+	decoder.UseNumber()
+	var data interface{}
+	if err := decoder.Decode(&data); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON: %w", err)
+	}
+	return data, nil
+}
+
 // processJSON processes JSON content
 func (p *Processor) processJSON(content []byte, encrypt bool) (interface{}, bool, error) {
-	var data interface{}
-	if err := json.Unmarshal(content, &data); err != nil {
-		return nil, false, fmt.Errorf("failed to parse JSON: %w", err)
+	data, err := decodeJSON(content)
+	if err != nil {
+		return nil, false, err
 	}
 
 	modified, err := p.transformData(&data, nil, encrypt)
@@ -643,6 +759,15 @@ func (p *Processor) transformData(data *interface{}, path []string, encrypt bool
 						modified = true
 					}
 				}
+			} else if arr, ok := val.([]interface{}); ok && encrypt && p.matcher.ShouldEncrypt(key, currentPath) {
+				// A matched key whose value is a list: encrypt the leaf items
+				childModified, err := p.encryptMatchedSlice(arr, currentPath)
+				if err != nil {
+					return false, err
+				}
+				if childModified {
+					modified = true
+				}
 			} else {
 				// Recurse into nested structures
 				childModified, err := p.transformData(&val, currentPath, encrypt)
@@ -658,6 +783,20 @@ func (p *Processor) transformData(data *interface{}, path []string, encrypt bool
 
 	case []interface{}:
 		for i := range v {
+			// Leaf list items are encrypted only under a matched key
+			// (handled above), but any encrypted item must decrypt here
+			if !encrypt {
+				if s, ok := v[i].(string); ok && format.IsEncrypted(s) {
+					decrypted, err := p.decryptValue(s)
+					if err != nil {
+						return false, fmt.Errorf("failed to decrypt %s: %w", strings.Join(path, "."), err)
+					}
+					v[i] = decrypted
+					modified = true
+					continue
+				}
+			}
+
 			childModified, err := p.transformData(&v[i], path, encrypt)
 			if err != nil {
 				return false, err
@@ -668,6 +807,44 @@ func (p *Processor) transformData(data *interface{}, path []string, encrypt bool
 		}
 	}
 
+	return modified, nil
+}
+
+// encryptMatchedSlice encrypts the leaf items of a list whose key matched
+// the encryption rules. Nested lists inherit the match; maps inside the
+// list are traversed with normal key matching.
+func (p *Processor) encryptMatchedSlice(arr []interface{}, path []string) (bool, error) {
+	modified := false
+	for i := range arr {
+		switch item := arr[i].(type) {
+		case []interface{}:
+			childModified, err := p.encryptMatchedSlice(item, path)
+			if err != nil {
+				return false, err
+			}
+			if childModified {
+				modified = true
+			}
+		case map[string]interface{}:
+			childModified, err := p.transformData(&arr[i], path, true)
+			if err != nil {
+				return false, err
+			}
+			if childModified {
+				modified = true
+			}
+		default:
+			if s, ok := item.(string); ok && format.IsEncrypted(s) {
+				continue
+			}
+			encrypted, err := p.encryptValue(item)
+			if err != nil {
+				return false, fmt.Errorf("failed to encrypt %s: %w", strings.Join(path, "."), err)
+			}
+			arr[i] = encrypted
+			modified = true
+		}
+	}
 	return modified, nil
 }
 
@@ -765,9 +942,9 @@ func (p *Processor) CheckContent(content []byte, fileFormat FileFormat) ([]Match
 		return results, nil
 
 	case FormatJSON:
-		var data interface{}
-		if err := json.Unmarshal(content, &data); err != nil {
-			return nil, fmt.Errorf("failed to parse JSON: %w", err)
+		data, err := decodeJSON(content)
+		if err != nil {
+			return nil, err
 		}
 		var results []MatchResult
 		p.collectUnencryptedData(data, nil, &results)
@@ -812,9 +989,10 @@ func (p *Processor) collectUnencryptedYAMLNode(node *yaml.Node, path []string, r
 			keyNode := node.Content[i]
 			valueNode := node.Content[i+1]
 			key := keyNode.Value
-			currentPath := append(path, key)
+			currentPath := clonePath(path, key)
 
-			if valueNode.Kind == yaml.ScalarNode {
+			switch {
+			case valueNode.Kind == yaml.ScalarNode:
 				if p.shouldEncryptString(key, currentPath, valueNode.Value) {
 					*results = append(*results, MatchResult{
 						Path:      currentPath,
@@ -823,10 +1001,23 @@ func (p *Processor) collectUnencryptedYAMLNode(node *yaml.Node, path []string, r
 						Encrypted: false,
 					})
 				}
-				continue
-			}
 
-			p.collectUnencryptedYAMLNode(valueNode, currentPath, results)
+			case valueNode.Kind == yaml.SequenceNode && p.matcher.ShouldEncrypt(key, currentPath):
+				p.collectUnencryptedMatchedYAMLSequence(valueNode, path, key, results)
+
+			case valueNode.Kind == yaml.AliasNode && valueNode.Alias != nil && p.matcher.ShouldEncrypt(key, currentPath):
+				if valueNode.Alias.Kind == yaml.ScalarNode && !format.IsEncrypted(valueNode.Alias.Value) {
+					*results = append(*results, MatchResult{
+						Path:      currentPath,
+						KeyName:   key,
+						Value:     valueNode.Alias.Value,
+						Encrypted: false,
+					})
+				}
+
+			default:
+				p.collectUnencryptedYAMLNode(valueNode, currentPath, results)
+			}
 		}
 
 	case yaml.SequenceNode:
@@ -836,11 +1027,34 @@ func (p *Processor) collectUnencryptedYAMLNode(node *yaml.Node, path []string, r
 	}
 }
 
+// collectUnencryptedMatchedYAMLSequence reports unencrypted scalar items of
+// a sequence whose key matched the encryption rules
+func (p *Processor) collectUnencryptedMatchedYAMLSequence(node *yaml.Node, parentPath []string, key string, results *[]MatchResult) {
+	for i, item := range node.Content {
+		switch item.Kind {
+		case yaml.ScalarNode:
+			if !format.IsEncrypted(item.Value) {
+				*results = append(*results, MatchResult{
+					Path:      clonePath(parentPath, fmt.Sprintf("%s[%d]", key, i)),
+					KeyName:   key,
+					Value:     item.Value,
+					Encrypted: false,
+				})
+			}
+		case yaml.SequenceNode:
+			p.collectUnencryptedMatchedYAMLSequence(item, parentPath, fmt.Sprintf("%s[%d]", key, i), results)
+		default:
+			p.collectUnencryptedYAMLNode(item, clonePath(parentPath, key), results)
+		}
+	}
+}
+
+
 func (p *Processor) collectUnencryptedData(data interface{}, path []string, results *[]MatchResult) {
 	switch v := data.(type) {
 	case map[string]interface{}:
 		for key, val := range v {
-			currentPath := append(path, key)
+			currentPath := clonePath(path, key)
 
 			if IsLeafValue(val) {
 				if p.shouldEncryptValue(key, currentPath, val) {
@@ -854,12 +1068,40 @@ func (p *Processor) collectUnencryptedData(data interface{}, path []string, resu
 				continue
 			}
 
+			if arr, ok := val.([]interface{}); ok && p.matcher.ShouldEncrypt(key, currentPath) {
+				p.collectUnencryptedMatchedSlice(arr, path, key, results)
+				continue
+			}
+
 			p.collectUnencryptedData(val, currentPath, results)
 		}
 
 	case []interface{}:
 		for _, item := range v {
 			p.collectUnencryptedData(item, path, results)
+		}
+	}
+}
+
+// collectUnencryptedMatchedSlice reports unencrypted leaf items of a list
+// whose key matched the encryption rules
+func (p *Processor) collectUnencryptedMatchedSlice(arr []interface{}, parentPath []string, key string, results *[]MatchResult) {
+	for i, item := range arr {
+		switch nested := item.(type) {
+		case []interface{}:
+			p.collectUnencryptedMatchedSlice(nested, parentPath, fmt.Sprintf("%s[%d]", key, i), results)
+		case map[string]interface{}:
+			p.collectUnencryptedData(nested, clonePath(parentPath, key), results)
+		default:
+			if s, ok := item.(string); ok && format.IsEncrypted(s) {
+				continue
+			}
+			*results = append(*results, MatchResult{
+				Path:      clonePath(parentPath, fmt.Sprintf("%s[%d]", key, i)),
+				KeyName:   key,
+				Value:     item,
+				Encrypted: false,
+			})
 		}
 	}
 }
@@ -910,9 +1152,11 @@ func (p *Processor) MatchFile(filePath string, formatOverride ...string) ([]Matc
 		}
 		data = values
 	case FormatJSON:
-		if err := json.Unmarshal(content, &data); err != nil {
-			return nil, fmt.Errorf("failed to parse JSON: %w", err)
+		decoded, err := decodeJSON(content)
+		if err != nil {
+			return nil, err
 		}
+		data = decoded
 	case FormatEnv:
 		envFile, err := ParseEnvFile(content)
 		if err != nil {
@@ -960,9 +1204,11 @@ func (p *Processor) ComputeMAC(content []byte, fileFormat FileFormat) ([]byte, e
 		}
 		data = values
 	case FormatJSON:
-		if err := json.Unmarshal(content, &data); err != nil {
-			return nil, fmt.Errorf("failed to parse JSON: %w", err)
+		decoded, err := decodeJSON(content)
+		if err != nil {
+			return nil, err
 		}
+		data = decoded
 	case FormatEnv:
 		envFile, err := ParseEnvFile(content)
 		if err != nil {
@@ -1006,7 +1252,11 @@ func collectEncryptedValues(data interface{}, values []string) []string {
 		}
 	case []interface{}:
 		for _, item := range v {
-			values = collectEncryptedValues(item, values)
+			if s, ok := item.(string); ok && format.IsEncrypted(s) {
+				values = append(values, s)
+			} else {
+				values = collectEncryptedValues(item, values)
+			}
 		}
 	}
 	return values
@@ -1106,9 +1356,11 @@ func (p *Processor) HasEncryptedValuesStrict(content []byte, filePath string, fo
 		}
 		data = values
 	case FormatJSON:
-		if err := json.Unmarshal(content, &data); err != nil {
-			return false, fmt.Errorf("failed to parse JSON: %w", err)
+		decoded, err := decodeJSON(content)
+		if err != nil {
+			return false, err
 		}
+		data = decoded
 	case FormatEnv:
 		envFile, err := ParseEnvFile(content)
 		if err != nil {

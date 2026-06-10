@@ -8,6 +8,7 @@ import (
 	"filippo.io/age"
 
 	"github.com/maurice2k/confcrypt/internal/config"
+	"github.com/maurice2k/confcrypt/internal/fileutil"
 	"github.com/maurice2k/confcrypt/internal/processor"
 )
 
@@ -35,11 +36,16 @@ func stageMACs(proc *processor.Processor, stages []stagedWrite) error {
 }
 
 // writeStagedFiles writes all staged outputs atomically and removes renamed
-// originals only after their replacement is on disk. onWritten, if non-nil,
-// is called after each successful write (for progress output).
+// originals only after their replacement is on disk. New (renamed) outputs
+// inherit the original file's permissions. onWritten, if non-nil, is called
+// after each successful write (for progress output).
 func writeStagedFiles(proc *processor.Processor, stages []stagedWrite, onWritten func(stagedWrite)) error {
 	for _, s := range stages {
-		if err := proc.WriteFile(s.outputPath, s.content); err != nil {
+		defaultMode := os.FileMode(0644)
+		if fi, err := os.Stat(s.originalPath); err == nil {
+			defaultMode = fi.Mode().Perm()
+		}
+		if err := fileutil.WriteFileAtomic(s.outputPath, s.content, defaultMode); err != nil {
 			return fmt.Errorf("writing %s: %w", s.outputPath, err)
 		}
 		if s.outputPath != s.originalPath {

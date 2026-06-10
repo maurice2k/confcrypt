@@ -2,6 +2,8 @@ package format
 
 import (
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -103,13 +105,18 @@ func DetectValueType(v interface{}) ValueType {
 	if v == nil {
 		return TypeNull
 	}
-	switch v.(type) {
+	switch val := v.(type) {
 	case bool:
 		return TypeBool
 	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
 		return TypeInt
 	case float32, float64:
 		return TypeFloat
+	case json.Number:
+		if strings.ContainsAny(val.String(), ".eE") {
+			return TypeFloat
+		}
+		return TypeInt
 	case string:
 		return TypeString
 	default:
@@ -146,8 +153,13 @@ func StringToValue(s string, t ValueType) (interface{}, error) {
 		}
 		return nil, fmt.Errorf("invalid bool value: %q", s)
 	case TypeInt:
-		var i int64
-		if _, err := fmt.Sscanf(s, "%d", &i); err != nil {
+		i, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			// Integers beyond int64 are preserved exactly as json.Number
+			var numErr *strconv.NumError
+			if errors.As(err, &numErr) && numErr.Err == strconv.ErrRange {
+				return json.Number(s), nil
+			}
 			return nil, fmt.Errorf("invalid int value: %q", s)
 		}
 		return i, nil
