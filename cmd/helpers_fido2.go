@@ -4,6 +4,7 @@ package cmd
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -38,8 +39,10 @@ func loadFIDO2Identities(cfg *config.Config) ([]age.Identity, error) {
 			continue
 		}
 
-		// Find a device with matching AAGUID
-		device, err := fido2.FindDeviceByAAGUID(fido2Identity.AAGUID)
+		// Identify the exact device that owns this credential (no touch). The
+		// credential probe distinguishes two same-model keys; AAGUID narrows it to
+		// the right model first.
+		device, err := fido2.FindDeviceByCredential(fido2Identity.CredentialID, fido2Identity.RPID, fido2Identity.AAGUID)
 		if err != nil {
 			// No matching device connected
 			continue
@@ -57,6 +60,9 @@ func loadFIDO2Identities(cfg *config.Config) ([]age.Identity, error) {
 
 		ageIdentity, err := fido2Identity.ToAgeIdentity(device.Path, pin)
 		if err != nil {
+			if stopErr := fido2PINError(err, device.Path); stopErr != nil {
+				return nil, stopErr
+			}
 			fmt.Fprintf(os.Stderr, "Warning: failed to derive key from FIDO2 device: %v\n", err)
 			continue
 		}
@@ -79,8 +85,10 @@ func findFIDO2IdentityImpl(storeRecipients []string) ([]age.Identity, error) {
 			continue
 		}
 
-		// Check if device with matching AAGUID is connected (no touch required)
-		device, err := fido2.FindDeviceByAAGUID(fido2Identity.AAGUID)
+		// Identify the exact device that owns this credential (no touch required).
+		// The credential probe distinguishes two same-model keys; AAGUID narrows
+		// it to the right model first.
+		device, err := fido2.FindDeviceByCredential(fido2Identity.CredentialID, fido2Identity.RPID, fido2Identity.AAGUID)
 		if err != nil {
 			continue
 		}
@@ -97,11 +105,31 @@ func findFIDO2IdentityImpl(storeRecipients []string) ([]age.Identity, error) {
 
 		identity, err := fido2Identity.ToAgeIdentity(device.Path, pin)
 		if err != nil {
+			if stopErr := fido2PINError(err, device.Path); stopErr != nil {
+				return nil, stopErr
+			}
 			continue
 		}
 		return []age.Identity{identity}, nil
 	}
 	return nil, fmt.Errorf("no matching FIDO2 device found")
+}
+
+// fido2PINError maps a wrong/blocked PIN error into a user-facing fatal error
+// (with remaining attempts) that should stop the recipient loop. Returns nil for
+// other errors, which the caller treats as "try the next recipient".
+func fido2PINError(err error, devicePath string) error {
+	switch {
+	case errors.Is(err, fido2.ErrWrongPIN):
+		msg := "incorrect PIN"
+		if n, e := fido2.PINRetriesRemaining(devicePath); e == nil {
+			msg += fmt.Sprintf(" (%d attempt(s) left before the key locks)", n)
+		}
+		return errors.New(msg)
+	case errors.Is(err, fido2.ErrPINBlocked):
+		return errors.New("FIDO2 PIN is blocked; reinsert the key or reset the PIN")
+	}
+	return nil
 }
 
 // generateFIDO2Recipient generates a FIDO2-derived recipient with user interaction

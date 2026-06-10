@@ -612,6 +612,8 @@ confcrypt recipient add --name "Your Name" age1fido21qpzry9x8...
 4. **Key derivation**: The secret is used to derive an X25519 keypair
 5. **Decryption**: Touch the device (and enter PIN if configured) to re-derive the private key
 
+For the full credential/key-derivation flow, recipient encoding, and how the exact device is selected at decryption time, see [FIDO2.md](FIDO2.md).
+
 ### FIDO2 vs YubiKey OTP
 
 | Feature | FIDO2 hmac-secret | YubiKey OTP HMAC |

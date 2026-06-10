@@ -33,6 +33,12 @@ var (
 
 	// ErrCredentialNotFound is returned when credential assertion fails
 	ErrCredentialNotFound = errors.New("credential not found on device")
+
+	// ErrWrongPIN is returned when the device rejects the supplied PIN
+	ErrWrongPIN = errors.New("incorrect PIN")
+
+	// ErrPINBlocked is returned when too many wrong PIN attempts have blocked the device
+	ErrPINBlocked = errors.New("PIN blocked - too many wrong attempts")
 )
 
 // Device represents a connected FIDO2 device
@@ -94,8 +100,22 @@ func GetFirstDevice() (*Device, error) {
 	return &devices[0], nil
 }
 
-// FindDeviceByAAGUID finds a connected FIDO2 device by its AAGUID
-func FindDeviceByAAGUID(aaguid []byte) (*Device, error) {
+// isZeroAAGUID reports whether the AAGUID is empty or all-zero (no usable model filter)
+func isZeroAAGUID(aaguid []byte) bool {
+	if len(aaguid) != AAGUIDSize {
+		return true
+	}
+	for _, b := range aaguid {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// devicesMatchingAAGUID returns connected devices whose model (AAGUID) matches.
+// If aaguid is empty or all-zero, all connected devices are returned (no filter).
+func devicesMatchingAAGUID(aaguid []byte) ([]Device, error) {
 	devices, err := DetectDevices()
 	if err != nil {
 		return nil, err
@@ -105,6 +125,11 @@ func FindDeviceByAAGUID(aaguid []byte) (*Device, error) {
 		return nil, ErrNoDevice
 	}
 
+	if isZeroAAGUID(aaguid) {
+		return devices, nil
+	}
+
+	var matches []Device
 	for _, dev := range devices {
 		device, err := libfido2.NewDevice(dev.Path)
 		if err != nil {
@@ -117,8 +142,79 @@ func FindDeviceByAAGUID(aaguid []byte) (*Device, error) {
 		}
 
 		if len(info.AAGUID) == AAGUIDSize && bytesEqual(info.AAGUID, aaguid) {
-			return &dev, nil
+			matches = append(matches, dev)
 		}
+	}
+
+	return matches, nil
+}
+
+// FindDeviceByAAGUID finds a connected FIDO2 device by its AAGUID (model)
+func FindDeviceByAAGUID(aaguid []byte) (*Device, error) {
+	matches, err := devicesMatchingAAGUID(aaguid)
+	if err != nil {
+		return nil, err
+	}
+	if len(matches) == 0 {
+		return nil, ErrDeviceNotFound
+	}
+	d := matches[0]
+	return &d, nil
+}
+
+// FindDeviceByCredential identifies the exact device that owns a credential.
+// It first narrows candidates by AAGUID (a credential is model-bound, so a
+// different-model device cannot hold it), then performs a silent assertion probe
+// (UP=false, no PIN, no hmac-secret) to pick the exact device among same-model
+// keys. The probe requires no touch and never decrements the PIN retry counter.
+func FindDeviceByCredential(credentialID []byte, rpID string, aaguid []byte) (*Device, error) {
+	if rpID == "" {
+		rpID = DefaultRPID
+	}
+
+	candidates, err := devicesMatchingAAGUID(aaguid)
+	if err != nil {
+		return nil, err
+	}
+	if len(candidates) == 0 {
+		return nil, ErrDeviceNotFound
+	}
+
+	cdh := make([]byte, 32)
+	if _, err := rand.Read(cdh); err != nil {
+		return nil, fmt.Errorf("failed to generate client data hash: %w", err)
+	}
+
+	for _, dev := range candidates {
+		device, err := libfido2.NewDevice(dev.Path)
+		if err != nil {
+			continue
+		}
+
+		// Silent probe: up=false means the device reports credential ownership
+		// without requiring a touch. The credential is bound to this device, so a
+		// non-owning device returns a no-credentials/not-allowed error instead.
+		_, err = device.Assertion(rpID, cdh, [][]byte{credentialID}, "", &libfido2.AssertionOpts{
+			UP: libfido2.False,
+		})
+
+		// Success or "user presence required" both mean the device owns the
+		// credential (some authenticators always enforce UP and answer this way).
+		if err == nil ||
+			errors.Is(err, libfido2.ErrUserPresenceRequired) ||
+			errors.Is(err, libfido2.ErrUPRequired) {
+			d := dev
+			return &d, nil
+		}
+		// ErrNoCredentials / ErrNotAllowed / ErrInvalidCredential -> not this device.
+	}
+
+	// Probe inconclusive (e.g. an authenticator that refuses silent assertions).
+	// With a single same-model candidate it's safe to use it; with several we
+	// can't disambiguate without a touch, so refuse rather than guess.
+	if len(candidates) == 1 {
+		d := candidates[0]
+		return &d, nil
 	}
 
 	return nil, ErrDeviceNotFound
@@ -227,6 +323,16 @@ func DeviceRequiresPIN(devicePath string) bool {
 		return false
 	}
 	return info.RequiresPIN
+}
+
+// PINRetriesRemaining returns how many PIN attempts are left before the device
+// locks. Used to warn the user after a wrong PIN.
+func PINRetriesRemaining(devicePath string) (int, error) {
+	device, err := libfido2.NewDevice(devicePath)
+	if err != nil {
+		return 0, fmt.Errorf("failed to open device: %w", err)
+	}
+	return device.RetryCount()
 }
 
 // hashRPID returns the SHA256 hash of the relying party ID
@@ -379,6 +485,12 @@ func getHMACSecret(device *libfido2.Device, rpID string, credentialID, salt []by
 
 	assertion, err := device.Assertion(rpID, cdh, [][]byte{credentialID}, pin, opts)
 	if err != nil {
+		switch {
+		case errors.Is(err, libfido2.ErrPinInvalid):
+			return nil, ErrWrongPIN
+		case errors.Is(err, libfido2.ErrPinAuthBlocked):
+			return nil, ErrPINBlocked
+		}
 		return nil, fmt.Errorf("assertion failed: %w", err)
 	}
 
