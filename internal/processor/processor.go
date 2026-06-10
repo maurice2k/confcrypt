@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/maurice2k/confcrypt/internal/config"
 	"github.com/maurice2k/confcrypt/internal/crypto"
+	"github.com/maurice2k/confcrypt/internal/fileutil"
 	"github.com/maurice2k/confcrypt/internal/format"
 )
 
@@ -33,12 +35,15 @@ type IdentityLoader func() ([]age.Identity, error)
 
 // Processor handles encryption/decryption of config files
 type Processor struct {
-	config         *config.Config
-	matcher        *Matcher
-	aesKey         []byte
-	recipients     []age.Recipient
-	identities     []age.Identity
-	identityLoader IdentityLoader
+	config          *config.Config
+	matcher         *Matcher
+	aesKey          []byte
+	altKeys         [][]byte // additional decryption candidates (e.g. from an interrupted rekey)
+	altKeysLoaded   bool
+	recipients      []age.Recipient
+	identities      []age.Identity
+	identityLoader  IdentityLoader
+	encryptionReady bool
 }
 
 // NewProcessor creates a new Processor
@@ -103,6 +108,7 @@ func (p *Processor) SetupEncryptionWithIdentities(identities []age.Identity) err
 				if err == nil {
 					p.aesKey = key
 					p.identities = identities
+					p.encryptionReady = true
 					return nil
 				}
 			}
@@ -118,8 +124,16 @@ func (p *Processor) SetupEncryptionWithIdentities(identities []age.Identity) err
 		return err
 	}
 	p.aesKey = key
+	p.encryptionReady = true
 
 	return nil
+}
+
+func (p *Processor) ensureEncryptionSetup() error {
+	if p.encryptionReady {
+		return nil
+	}
+	return p.SetupEncryption()
 }
 
 // SetupDecryption prepares the processor for decryption.
@@ -143,27 +157,91 @@ func (p *Processor) SetupDecryption(identities []age.Identity) (string, error) {
 	return "", fmt.Errorf("could not decrypt AES key with provided identities")
 }
 
-// SaveEncryptedSecrets encrypts the AES key for all recipients and saves to config
-func (p *Processor) SaveEncryptedSecrets() error {
+// loadAltKeys decrypts all store entries with the current identities and
+// collects any AES keys that differ from the primary key. The store normally
+// wraps a single key, but during an interrupted rekey it transitionally holds
+// the old and the new key; trial decryption with all candidates makes that
+// state fully recoverable. Loaded lazily so the common single-key case never
+// touches the store (or hardware identities) more than once.
+func (p *Processor) loadAltKeys() {
+	if p.altKeysLoaded {
+		return
+	}
+	p.altKeysLoaded = true
+
+	if len(p.identities) == 0 || p.config.Confcrypt == nil {
+		return
+	}
+
+	for _, entry := range p.config.Confcrypt.Store {
+		key, err := crypto.DecryptWithIdentities([]byte(entry.Secret), p.identities)
+		if err != nil || bytes.Equal(key, p.aesKey) {
+			continue
+		}
+		known := false
+		for _, k := range p.altKeys {
+			if bytes.Equal(k, key) {
+				known = true
+				break
+			}
+		}
+		if !known {
+			p.altKeys = append(p.altKeys, key)
+		}
+	}
+}
+
+// decryptAESGCM decrypts with the primary AES key, falling back to any other
+// keys present in the store (AES-GCM authentication reliably rejects a wrong
+// key, so trial decryption cannot produce garbage).
+func (p *Processor) decryptAESGCM(data, iv, tag []byte) ([]byte, error) {
+	plaintext, err := crypto.DecryptAESGCM(p.aesKey, data, iv, tag)
+	if err == nil {
+		return plaintext, nil
+	}
+
+	p.loadAltKeys()
+	for _, key := range p.altKeys {
+		if pt, altErr := crypto.DecryptAESGCM(key, data, iv, tag); altErr == nil {
+			return pt, nil
+		}
+	}
+
+	return nil, err
+}
+
+// EncryptStoreEntries wraps the current AES key for every configured
+// recipient and returns the entries as a pubkey -> encrypted secret map.
+func (p *Processor) EncryptStoreEntries() (map[string]string, error) {
 	secrets := make(map[string]string)
 
 	for _, r := range p.config.Recipients {
 		pubKey := r.GetPublicKey()
 		if pubKey == "" {
-			return fmt.Errorf("recipient %q has no public key", r.Name)
+			return nil, fmt.Errorf("recipient %q has no public key", r.Name)
 		}
 
 		recipient, err := crypto.ParseRecipient(pubKey)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		encrypted, err := crypto.EncryptForRecipients(p.aesKey, []age.Recipient{recipient})
 		if err != nil {
-			return fmt.Errorf("failed to encrypt secret for %s: %w", pubKey, err)
+			return nil, fmt.Errorf("failed to encrypt secret for %s: %w", pubKey, err)
 		}
 
 		secrets[pubKey] = string(encrypted)
+	}
+
+	return secrets, nil
+}
+
+// SaveEncryptedSecrets encrypts the AES key for all recipients and saves to config
+func (p *Processor) SaveEncryptedSecrets() error {
+	secrets, err := p.EncryptStoreEntries()
+	if err != nil {
+		return err
 	}
 
 	p.config.SetSecrets(secrets)
@@ -196,15 +274,15 @@ func (p *Processor) ProcessContent(content []byte, filePath string, encrypt bool
 	switch fileFormat {
 	case FormatYAML:
 		// Use node-based processing to preserve comments
-		var node *yaml.Node
-		node, modified, err = p.processYAMLNode(content, encrypt)
+		var docs []*yaml.Node
+		docs, modified, err = p.processYAMLDocs(content, encrypt)
 		if err != nil {
 			return nil, false, err
 		}
 		if !modified {
 			return content, false, nil
 		}
-		output, err = marshalYAMLNode(node)
+		output, err = marshalYAMLDocs(docs)
 	case FormatJSON:
 		var data interface{}
 		data, modified, err = p.processJSON(content, encrypt)
@@ -244,23 +322,65 @@ func (p *Processor) ProcessContent(content []byte, filePath string, encrypt bool
 	return output, true, nil
 }
 
-// processYAMLNode processes YAML content while preserving comments
-func (p *Processor) processYAMLNode(content []byte, encrypt bool) (*yaml.Node, bool, error) {
-	var node yaml.Node
-	if err := yaml.Unmarshal(content, &node); err != nil {
-		return nil, false, fmt.Errorf("failed to parse YAML: %w", err)
-	}
-
-	// Preserve blank lines from original before any modifications
-	preserveBlankLines(&node, content)
-
-	// Transform nodes in-place, preserving comments
-	modified, err := p.transformYAMLNode(&node, nil, encrypt)
+// processYAMLDocs processes all documents of a (possibly multi-document)
+// YAML stream while preserving comments
+func (p *Processor) processYAMLDocs(content []byte, encrypt bool) ([]*yaml.Node, bool, error) {
+	docs, err := decodeYAMLDocs(content)
 	if err != nil {
 		return nil, false, err
 	}
 
-	return &node, modified, nil
+	modified := false
+	for _, node := range docs {
+		// Preserve blank lines from original before any modifications
+		preserveBlankLines(node, content)
+
+		// Transform nodes in-place, preserving comments
+		m, err := p.transformYAMLNode(node, nil, encrypt)
+		if err != nil {
+			return nil, false, err
+		}
+		modified = modified || m
+	}
+
+	return docs, modified, nil
+}
+
+// decodeYAMLDocs parses all documents of a YAML stream into nodes.
+// yaml.Unmarshal would silently drop every document after the first.
+func decodeYAMLDocs(content []byte) ([]*yaml.Node, error) {
+	decoder := yaml.NewDecoder(bytes.NewReader(content))
+	var docs []*yaml.Node
+	for {
+		var node yaml.Node
+		err := decoder.Decode(&node)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse YAML: %w", err)
+		}
+		docs = append(docs, &node)
+	}
+	return docs, nil
+}
+
+// decodeYAMLValues parses all documents of a YAML stream into plain values
+func decodeYAMLValues(content []byte) ([]interface{}, error) {
+	decoder := yaml.NewDecoder(bytes.NewReader(content))
+	var values []interface{}
+	for {
+		var v interface{}
+		err := decoder.Decode(&v)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse YAML: %w", err)
+		}
+		values = append(values, v)
+	}
+	return values, nil
 }
 
 // transformYAMLNode recursively transforms YAML nodes for encryption/decryption
@@ -292,17 +412,15 @@ func (p *Processor) transformYAMLNode(node *yaml.Node, path []string, encrypt bo
 			if valueNode.Kind == yaml.ScalarNode {
 				// Leaf value - check if we should encrypt/decrypt
 				if encrypt {
-					if p.matcher.ShouldEncrypt(key, currentPath) {
-						if !format.IsEncrypted(valueNode.Value) {
-							encrypted, err := p.encryptScalarValue(valueNode.Value, valueNode.Tag)
-							if err != nil {
-								return false, fmt.Errorf("failed to encrypt %s: %w", strings.Join(currentPath, "."), err)
-							}
-							valueNode.Value = encrypted
-							valueNode.Tag = "!!str"
-							valueNode.Style = 0 // Reset style to let encoder choose
-							modified = true
+					if p.shouldEncryptString(key, currentPath, valueNode.Value) {
+						encrypted, err := p.encryptScalarValue(valueNode.Value, valueNode.Tag)
+						if err != nil {
+							return false, fmt.Errorf("failed to encrypt %s: %w", strings.Join(currentPath, "."), err)
 						}
+						valueNode.Value = encrypted
+						valueNode.Tag = "!!str"
+						valueNode.Style = 0 // Reset style to let encoder choose
+						modified = true
 					}
 				} else {
 					// Decrypt if encrypted
@@ -358,16 +476,9 @@ func (p *Processor) encryptScalarValue(value string, tag string) (string, error)
 		valueType = format.TypeBool
 	}
 
-	ciphertext, iv, tagBytes, err := crypto.EncryptAESGCM(p.aesKey, []byte(value))
+	ev, err := p.encryptPlaintext([]byte(value), valueType)
 	if err != nil {
 		return "", err
-	}
-
-	ev := &format.EncryptedValue{
-		Data: ciphertext,
-		IV:   iv,
-		Tag:  tagBytes,
-		Type: valueType,
 	}
 
 	return format.FormatEncryptedValue(ev), nil
@@ -380,7 +491,7 @@ func (p *Processor) decryptScalarValue(encStr string) (string, string, error) {
 		return "", "", err
 	}
 
-	plaintext, err := crypto.DecryptAESGCM(p.aesKey, ev.Data, ev.IV, ev.Tag)
+	plaintext, err := p.decryptAESGCM(ev.Data, ev.IV, ev.Tag)
 	if err != nil {
 		return "", "", err
 	}
@@ -432,24 +543,15 @@ func (p *Processor) processEnv(content []byte, encrypt bool) (*EnvFile, bool, er
 		path := []string{key} // Flat structure - key is at root level
 
 		if encrypt {
-			if p.matcher.ShouldEncrypt(key, path) {
-				if !format.IsEncrypted(line.Value) {
-					// Encrypt raw value (including quotes if present)
-					ciphertext, iv, tag, err := crypto.EncryptAESGCM(p.aesKey, []byte(line.Value))
-					if err != nil {
-						return nil, false, fmt.Errorf("failed to encrypt %s: %w", key, err)
-					}
-
-					ev := &format.EncryptedValue{
-						Data: ciphertext,
-						IV:   iv,
-						Tag:  tag,
-						Type: format.TypeString,
-					}
-
-					envFile.Lines[i].Value = format.FormatEncryptedValue(ev)
-					modified = true
+			if p.shouldEncryptString(key, path, line.Value) {
+				// Encrypt raw value (including quotes if present)
+				ev, err := p.encryptPlaintext([]byte(line.Value), format.TypeString)
+				if err != nil {
+					return nil, false, fmt.Errorf("failed to encrypt %s: %w", key, err)
 				}
+
+				envFile.Lines[i].Value = format.FormatEncryptedValue(ev)
+				modified = true
 			}
 		} else {
 			// Decrypt if encrypted
@@ -459,7 +561,7 @@ func (p *Processor) processEnv(content []byte, encrypt bool) (*EnvFile, bool, er
 					return nil, false, fmt.Errorf("failed to parse encrypted value for %s: %w", key, err)
 				}
 
-				plaintext, err := crypto.DecryptAESGCM(p.aesKey, ev.Data, ev.IV, ev.Tag)
+				plaintext, err := p.decryptAESGCM(ev.Data, ev.IV, ev.Tag)
 				if err != nil {
 					return nil, false, fmt.Errorf("failed to decrypt %s: %w", key, err)
 				}
@@ -483,16 +585,9 @@ func (p *Processor) processFullFile(content []byte, encrypt bool) ([]byte, bool,
 		}
 
 		// Encrypt the entire content
-		ciphertext, iv, tag, err := crypto.EncryptAESGCM(p.aesKey, content)
+		ev, err := p.encryptPlaintext(content, format.TypeBytes)
 		if err != nil {
 			return nil, false, fmt.Errorf("failed to encrypt file: %w", err)
-		}
-
-		ev := &format.EncryptedValue{
-			Data: ciphertext,
-			IV:   iv,
-			Tag:  tag,
-			Type: format.TypeBytes,
 		}
 
 		output := format.FormatFullFileEncrypted(ev)
@@ -509,7 +604,7 @@ func (p *Processor) processFullFile(content []byte, encrypt bool) ([]byte, bool,
 		return nil, false, fmt.Errorf("failed to parse encrypted file: %w", err)
 	}
 
-	plaintext, err := crypto.DecryptAESGCM(p.aesKey, ev.Data, ev.IV, ev.Tag)
+	plaintext, err := p.decryptAESGCM(ev.Data, ev.IV, ev.Tag)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to decrypt file: %w", err)
 	}
@@ -529,10 +624,7 @@ func (p *Processor) transformData(data *interface{}, path []string, encrypt bool
 			if IsLeafValue(val) {
 				if encrypt {
 					// Check if should encrypt and not already encrypted
-					if p.matcher.ShouldEncrypt(key, currentPath) {
-						if s, ok := val.(string); ok && format.IsEncrypted(s) {
-							continue // Already encrypted
-						}
+					if p.shouldEncryptValue(key, currentPath, val) {
 						encrypted, err := p.encryptValue(val)
 						if err != nil {
 							return false, fmt.Errorf("failed to encrypt %s: %w", strings.Join(currentPath, "."), err)
@@ -584,9 +676,22 @@ func (p *Processor) encryptValue(val interface{}) (string, error) {
 	valueType := format.DetectValueType(val)
 	plaintext := format.ValueToString(val)
 
-	ciphertext, iv, tag, err := crypto.EncryptAESGCM(p.aesKey, []byte(plaintext))
+	ev, err := p.encryptPlaintext([]byte(plaintext), valueType)
 	if err != nil {
 		return "", err
+	}
+
+	return format.FormatEncryptedValue(ev), nil
+}
+
+func (p *Processor) encryptPlaintext(plaintext []byte, valueType format.ValueType) (*format.EncryptedValue, error) {
+	if err := p.ensureEncryptionSetup(); err != nil {
+		return nil, err
+	}
+
+	ciphertext, iv, tag, err := crypto.EncryptAESGCM(p.aesKey, plaintext)
+	if err != nil {
+		return nil, err
 	}
 
 	ev := &format.EncryptedValue{
@@ -596,7 +701,7 @@ func (p *Processor) encryptValue(val interface{}) (string, error) {
 		Type: valueType,
 	}
 
-	return format.FormatEncryptedValue(ev), nil
+	return ev, nil
 }
 
 // decryptValue decrypts a single ENC[...] value
@@ -606,7 +711,7 @@ func (p *Processor) decryptValue(encStr string) (interface{}, error) {
 		return nil, err
 	}
 
-	plaintext, err := crypto.DecryptAESGCM(p.aesKey, ev.Data, ev.IV, ev.Tag)
+	plaintext, err := p.decryptAESGCM(ev.Data, ev.IV, ev.Tag)
 	if err != nil {
 		return nil, err
 	}
@@ -628,6 +733,12 @@ func (p *Processor) CheckFile(filePath string, formatOverride ...string) ([]Matc
 		return nil, fmt.Errorf("failed to read file: %w", err)
 	}
 
+	return p.CheckContent(content, fileFormat)
+}
+
+// CheckContent checks already-loaded content for unencrypted values that would
+// be encrypted by ProcessContent, without initializing encryption keys.
+func (p *Processor) CheckContent(content []byte, fileFormat FileFormat) ([]MatchResult, error) {
 	// For full file encryption, check if file is already encrypted
 	if fileFormat == FormatFull {
 		if format.IsFullFileEncrypted(content) {
@@ -641,45 +752,130 @@ func (p *Processor) CheckFile(filePath string, formatOverride ...string) ([]Matc
 		}}, nil
 	}
 
-	var data interface{}
-
 	switch fileFormat {
 	case FormatYAML:
-		if err := yaml.Unmarshal(content, &data); err != nil {
-			return nil, fmt.Errorf("failed to parse YAML: %w", err)
+		docs, err := decodeYAMLDocs(content)
+		if err != nil {
+			return nil, err
 		}
+		var results []MatchResult
+		for _, node := range docs {
+			p.collectUnencryptedYAMLNode(node, nil, &results)
+		}
+		return results, nil
+
 	case FormatJSON:
+		var data interface{}
 		if err := json.Unmarshal(content, &data); err != nil {
 			return nil, fmt.Errorf("failed to parse JSON: %w", err)
 		}
+		var results []MatchResult
+		p.collectUnencryptedData(data, nil, &results)
+		return results, nil
+
 	case FormatEnv:
 		envFile, err := ParseEnvFile(content)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse .env file: %w", err)
 		}
-		// Convert to map[string]interface{} for matcher
-		m := make(map[string]interface{})
+		var results []MatchResult
 		for _, line := range envFile.Lines {
-			if line.Type == EnvLineKeyValue {
-				m[line.Key] = line.Value
+			if line.Type != EnvLineKeyValue {
+				continue
+			}
+			path := []string{line.Key}
+			if p.shouldEncryptString(line.Key, path, line.Value) {
+				results = append(results, MatchResult{
+					Path:      path,
+					KeyName:   line.Key,
+					Value:     line.Value,
+					Encrypted: false,
+				})
 			}
 		}
-		data = m
+		return results, nil
+
 	default:
 		return nil, fmt.Errorf("unsupported file format")
 	}
+}
 
-	results := p.matcher.FindMatchingKeys(data)
+func (p *Processor) collectUnencryptedYAMLNode(node *yaml.Node, path []string, results *[]MatchResult) {
+	switch node.Kind {
+	case yaml.DocumentNode:
+		for _, child := range node.Content {
+			p.collectUnencryptedYAMLNode(child, path, results)
+		}
 
-	// Filter to only unencrypted
-	var unencrypted []MatchResult
-	for _, r := range results {
-		if !r.Encrypted {
-			unencrypted = append(unencrypted, r)
+	case yaml.MappingNode:
+		for i := 0; i < len(node.Content); i += 2 {
+			keyNode := node.Content[i]
+			valueNode := node.Content[i+1]
+			key := keyNode.Value
+			currentPath := append(path, key)
+
+			if valueNode.Kind == yaml.ScalarNode {
+				if p.shouldEncryptString(key, currentPath, valueNode.Value) {
+					*results = append(*results, MatchResult{
+						Path:      currentPath,
+						KeyName:   key,
+						Value:     valueNode.Value,
+						Encrypted: false,
+					})
+				}
+				continue
+			}
+
+			p.collectUnencryptedYAMLNode(valueNode, currentPath, results)
+		}
+
+	case yaml.SequenceNode:
+		for _, item := range node.Content {
+			p.collectUnencryptedYAMLNode(item, path, results)
 		}
 	}
+}
 
-	return unencrypted, nil
+func (p *Processor) collectUnencryptedData(data interface{}, path []string, results *[]MatchResult) {
+	switch v := data.(type) {
+	case map[string]interface{}:
+		for key, val := range v {
+			currentPath := append(path, key)
+
+			if IsLeafValue(val) {
+				if p.shouldEncryptValue(key, currentPath, val) {
+					*results = append(*results, MatchResult{
+						Path:      currentPath,
+						KeyName:   key,
+						Value:     val,
+						Encrypted: false,
+					})
+				}
+				continue
+			}
+
+			p.collectUnencryptedData(val, currentPath, results)
+		}
+
+	case []interface{}:
+		for _, item := range v {
+			p.collectUnencryptedData(item, path, results)
+		}
+	}
+}
+
+func (p *Processor) shouldEncryptString(keyName string, path []string, value string) bool {
+	return p.matcher.ShouldEncrypt(keyName, path) && !format.IsEncrypted(value)
+}
+
+func (p *Processor) shouldEncryptValue(keyName string, path []string, val interface{}) bool {
+	if !p.matcher.ShouldEncrypt(keyName, path) {
+		return false
+	}
+	if s, ok := val.(string); ok && format.IsEncrypted(s) {
+		return false
+	}
+	return true
 }
 
 // MatchFile returns all keys matching the configured patterns, regardless of encryption state.
@@ -708,9 +904,11 @@ func (p *Processor) MatchFile(filePath string, formatOverride ...string) ([]Matc
 
 	switch fileFormat {
 	case FormatYAML:
-		if err := yaml.Unmarshal(content, &data); err != nil {
-			return nil, fmt.Errorf("failed to parse YAML: %w", err)
+		values, err := decodeYAMLValues(content)
+		if err != nil {
+			return nil, err
 		}
+		data = values
 	case FormatJSON:
 		if err := json.Unmarshal(content, &data); err != nil {
 			return nil, fmt.Errorf("failed to parse JSON: %w", err)
@@ -734,9 +932,10 @@ func (p *Processor) MatchFile(filePath string, formatOverride ...string) ([]Matc
 	return p.matcher.FindMatchingKeys(data), nil
 }
 
-// WriteFile writes content to a file
+// WriteFile writes content to a file atomically, preserving the permissions
+// of an existing target file
 func (p *Processor) WriteFile(filePath string, content []byte) error {
-	return os.WriteFile(filePath, content, 0644)
+	return fileutil.WriteFileAtomic(filePath, content, 0644)
 }
 
 // ComputeMAC computes the MAC (SHA256 hash of all encrypted values) for a file
@@ -755,9 +954,11 @@ func (p *Processor) ComputeMAC(content []byte, fileFormat FileFormat) ([]byte, e
 
 	switch fileFormat {
 	case FormatYAML:
-		if err := yaml.Unmarshal(content, &data); err != nil {
-			return nil, fmt.Errorf("failed to parse YAML: %w", err)
+		values, err := decodeYAMLValues(content)
+		if err != nil {
+			return nil, err
 		}
+		data = values
 	case FormatJSON:
 		if err := json.Unmarshal(content, &data); err != nil {
 			return nil, fmt.Errorf("failed to parse JSON: %w", err)
@@ -855,7 +1056,7 @@ func (p *Processor) VerifyMAC(filePath string, content []byte, formatOverride ..
 		return fmt.Errorf("failed to parse stored MAC: %w", err)
 	}
 
-	expectedHash, err := crypto.DecryptAESGCM(p.aesKey, ev.Data, ev.IV, ev.Tag)
+	expectedHash, err := p.decryptAESGCM(ev.Data, ev.IV, ev.Tag)
 	if err != nil {
 		return fmt.Errorf("failed to decrypt stored MAC: %w", err)
 	}
@@ -899,9 +1100,11 @@ func (p *Processor) HasEncryptedValuesStrict(content []byte, filePath string, fo
 	var data interface{}
 	switch fileFormat {
 	case FormatYAML:
-		if err := yaml.Unmarshal(content, &data); err != nil {
-			return false, fmt.Errorf("failed to parse YAML: %w", err)
+		values, err := decodeYAMLValues(content)
+		if err != nil {
+			return false, err
 		}
+		data = values
 	case FormatJSON:
 		if err := json.Unmarshal(content, &data); err != nil {
 			return false, fmt.Errorf("failed to parse JSON: %w", err)
@@ -935,68 +1138,11 @@ func (p *Processor) HasUnencryptedValues(content []byte, filePath string, format
 	}
 	fileFormat := DetectFormat(filePath, override)
 
-	// For full file encryption, check if NOT encrypted (entire file should be encrypted)
-	if fileFormat == FormatFull {
-		return !format.IsFullFileEncrypted(content)
-	}
-
-	var data interface{}
-	switch fileFormat {
-	case FormatYAML:
-		if err := yaml.Unmarshal(content, &data); err != nil {
-			return false
-		}
-	case FormatJSON:
-		if err := json.Unmarshal(content, &data); err != nil {
-			return false
-		}
-	case FormatEnv:
-		envFile, err := ParseEnvFile(content)
-		if err != nil {
-			return false
-		}
-		m := make(map[string]interface{})
-		for _, line := range envFile.Lines {
-			if line.Type == EnvLineKeyValue {
-				m[line.Key] = line.Value
-			}
-		}
-		data = m
-	default:
+	results, err := p.CheckContent(content, fileFormat)
+	if err != nil {
 		return false
 	}
-
-	return p.hasUnencryptedValuesRecursive(data, nil)
-}
-
-// hasUnencryptedValuesRecursive recursively checks for unencrypted values matching encryption rules
-func (p *Processor) hasUnencryptedValuesRecursive(data interface{}, path []string) bool {
-	switch v := data.(type) {
-	case map[string]interface{}:
-		for key, val := range v {
-			newPath := append(path, key)
-			if p.hasUnencryptedValuesRecursive(val, newPath) {
-				return true
-			}
-		}
-	case []interface{}:
-		for i, val := range v {
-			newPath := append(path, fmt.Sprintf("[%d]", i))
-			if p.hasUnencryptedValuesRecursive(val, newPath) {
-				return true
-			}
-		}
-	case string:
-		// Check if this value should be encrypted but isn't
-		keyName := ""
-		if len(path) > 0 {
-			keyName = path[len(path)-1]
-		}
-		if p.matcher.ShouldEncrypt(keyName, path) && !format.IsEncrypted(v) {
-			return true
-		}
-	}
-	return false
+	return len(results) > 0
 }
 
 // UpdateMAC computes and stores the MAC for a file
@@ -1080,13 +1226,20 @@ func DetectFormat(filePath string, override ...string) FileFormat {
 	}
 }
 
-// marshalYAMLNode marshals a yaml.Node to YAML, preserving comments and structure
-func marshalYAMLNode(node *yaml.Node) ([]byte, error) {
+// marshalYAMLDocs marshals all documents of a YAML stream, preserving
+// comments and structure; documents are separated with "---" by the encoder
+func marshalYAMLDocs(docs []*yaml.Node) ([]byte, error) {
 	var buf bytes.Buffer
-	normalizeMergeKeyTags(node)
 	encoder := yaml.NewEncoder(&buf)
 	encoder.SetIndent(2)
-	if err := encoder.Encode(node); err != nil {
+	for _, node := range docs {
+		normalizeMergeKeyTags(node)
+		if err := encoder.Encode(node); err != nil {
+			encoder.Close()
+			return nil, err
+		}
+	}
+	if err := encoder.Close(); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil

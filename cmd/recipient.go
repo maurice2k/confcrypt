@@ -3,7 +3,6 @@ package cmd
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"filippo.io/age"
@@ -313,100 +312,14 @@ func runRecipientRm(cmd *cobra.Command, args []string) {
 			}
 		} else {
 			// Rekey: decrypt all, generate new key, re-encrypt all
-			proc, err := processor.NewProcessor(cfg, func() ([]age.Identity, error) {
-				return LoadDecryptionIdentity(cfg, "", "", false, false)
-			})
+			rekeyedFiles, err := performRekey(cfg, identities)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
 
-			if _, err := proc.SetupDecryption(identities); err != nil {
-				fmt.Fprintf(os.Stderr, "Error setting up decryption: %v\n", err)
-				os.Exit(1)
-			}
-
-			// Get all files
-			files, err := cfg.GetMatchingFiles()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-
-			// Decrypt all files first
-			decryptedFiles := make(map[string][]byte)
-			for _, file := range files {
-				content, err := os.ReadFile(file)
-				if err != nil {
-					continue // Skip files that can't be read
-				}
-
-				if proc.HasEncryptedValues(content, file) {
-					output, _, err := proc.ProcessFile(file, false) // decrypt
-					if err != nil {
-						fmt.Fprintf(os.Stderr, "Error decrypting %s: %v\n", file, err)
-						os.Exit(1)
-					}
-					decryptedFiles[file] = output
-				}
-			}
-
-			// Clear existing secrets to force new key generation
-			cfg.Confcrypt.Store = nil
-
-			// Create new processor with fresh key
-			proc2, err := processor.NewProcessor(cfg, func() ([]age.Identity, error) {
-				return LoadDecryptionIdentity(cfg, "", "", false, false)
-			})
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-
-			if err := proc2.SetupEncryption(); err != nil {
-				fmt.Fprintf(os.Stderr, "Error setting up encryption with new key: %v\n", err)
-				os.Exit(1)
-			}
-
-			// Re-encrypt all files with new key
-			for file, content := range decryptedFiles {
-				if err := os.WriteFile(file, content, 0644); err != nil {
-					fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", file, err)
-					os.Exit(1)
-				}
-
-				output, _, err := proc2.ProcessFile(file, true) // encrypt
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error re-encrypting %s: %v\n", file, err)
-					os.Exit(1)
-				}
-
-				if err := os.WriteFile(file, output, 0644); err != nil {
-					fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", file, err)
-					os.Exit(1)
-				}
-
-				if err := proc2.UpdateMAC(file, output); err != nil {
-					fmt.Fprintf(os.Stderr, "Error updating MAC for %s: %v\n", file, err)
-					os.Exit(1)
-				}
-			}
-
-			if err := proc2.SaveEncryptedSecrets(); err != nil {
-				fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
-				os.Exit(1)
-			}
-
-			if len(decryptedFiles) > 0 {
-				relPaths := make([]string, 0, len(decryptedFiles))
-				for file := range decryptedFiles {
-					relPath, _ := filepath.Rel(cfg.ConfigDir(), file)
-					if relPath == "" {
-						relPath = file
-					}
-					relPaths = append(relPaths, relPath)
-				}
-				fmt.Printf("Rekeyed %d file(s) with new AES key\n", len(decryptedFiles))
+			if len(rekeyedFiles) > 0 {
+				fmt.Printf("Rekeyed %d file(s) with new AES key\n", len(rekeyedFiles))
 			}
 		}
 	} else {

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -14,6 +15,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/maurice2k/confcrypt/internal/crypto"
+	"github.com/maurice2k/confcrypt/internal/fileutil"
 )
 
 // Version is the current tool/config format version
@@ -193,7 +195,7 @@ func (c *Config) Save() error {
 		}
 		encoder.Close()
 
-		if err := os.WriteFile(c.configPath, []byte(buf.String()), 0644); err != nil {
+		if err := fileutil.WriteFileAtomic(c.configPath, []byte(buf.String()), 0644); err != nil {
 			return fmt.Errorf("failed to write config file: %w", err)
 		}
 		return nil
@@ -205,7 +207,7 @@ func (c *Config) Save() error {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
 
-	if err := os.WriteFile(c.configPath, data, 0644); err != nil {
+	if err := fileutil.WriteFileAtomic(c.configPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 
@@ -315,8 +317,12 @@ func (c *Config) syncFilesSection(root *yaml.Node) error {
 // syncConfcryptSection syncs the Confcrypt struct to its yaml.Node
 func (c *Config) syncConfcryptSection(node *yaml.Node) error {
 	if node.Kind != yaml.MappingNode {
-		// Convert to mapping node
+		// Convert to mapping node (a bare ".confcrypt:" key parses as a null
+		// scalar; the tag and style must be reset too, otherwise the encoder
+		// emits "!!null" with mapping children and the file no longer parses)
 		node.Kind = yaml.MappingNode
+		node.Tag = "!!map"
+		node.Style = 0
 		node.Content = nil
 	}
 
@@ -350,9 +356,14 @@ func (c *Config) syncConfcryptSection(node *yaml.Node) error {
 			macsNode.Kind = yaml.MappingNode
 			macsNode.Tag = "!!map"
 			macsNode.Content = nil
-			for path, mac := range c.Confcrypt.MACs {
+			paths := make([]string, 0, len(c.Confcrypt.MACs))
+			for path := range c.Confcrypt.MACs {
+				paths = append(paths, path)
+			}
+			sort.Strings(paths)
+			for _, path := range paths {
 				keyNode := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: path}
-				valNode := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: mac}
+				valNode := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: c.Confcrypt.MACs[path]}
 				macsNode.Content = append(macsNode.Content, keyNode, valNode)
 			}
 		}
@@ -687,10 +698,32 @@ func (c *Config) SetSecrets(secrets map[string]string) {
 	c.Confcrypt.Version = Version
 	c.Confcrypt.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	c.Confcrypt.Store = nil
-	for pubKey, secret := range secrets {
+	c.appendSecretEntries(secrets)
+}
+
+// AddSecrets appends store entries for the given recipients without removing
+// existing entries. Used during rekey to persist a transitional store that
+// holds both the old and the new AES key, so an interrupted rekey never
+// leaves files encrypted with a key that is not on disk.
+func (c *Config) AddSecrets(secrets map[string]string) {
+	if c.Confcrypt == nil {
+		c.Confcrypt = &ConfcryptSection{}
+	}
+	c.Confcrypt.Version = Version
+	c.Confcrypt.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	c.appendSecretEntries(secrets)
+}
+
+func (c *Config) appendSecretEntries(secrets map[string]string) {
+	pubKeys := make([]string, 0, len(secrets))
+	for pubKey := range secrets {
+		pubKeys = append(pubKeys, pubKey)
+	}
+	sort.Strings(pubKeys)
+	for _, pubKey := range pubKeys {
 		c.Confcrypt.Store = append(c.Confcrypt.Store, SecretEntry{
 			Recipient: pubKey,
-			Secret:    secret,
+			Secret:    secrets[pubKey],
 		})
 	}
 }

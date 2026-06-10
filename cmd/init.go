@@ -13,6 +13,7 @@ import (
 
 	"github.com/maurice2k/confcrypt/internal/config"
 	"github.com/maurice2k/confcrypt/internal/crypto"
+	"github.com/maurice2k/confcrypt/internal/fileutil"
 )
 
 var (
@@ -140,7 +141,7 @@ keys_exclude:
   version: "%s"
 `, escapedUserName, recipientField, version)
 
-	if err := os.WriteFile(cfgPath, []byte(configContent), 0644); err != nil {
+	if err := fileutil.WriteFileAtomic(cfgPath, []byte(configContent), 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "Error writing config file: %v\n", err)
 		os.Exit(1)
 	}

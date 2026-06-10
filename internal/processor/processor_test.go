@@ -347,6 +347,62 @@ func TestProcessorMixedEncrypted(t *testing.T) {
 	}
 }
 
+func TestProcessorLazySetupLoadsExistingKeyOnlyWhenEncrypting(t *testing.T) {
+	dir := t.TempDir()
+
+	identity, _ := crypto.GenerateAgeKeypair()
+	cfg := createTestConfig(t, dir, []config.RecipientConfig{
+		{Name: "test", Age: identity.Recipient().String()},
+	})
+
+	testFile := filepath.Join(dir, "test.yml")
+	testContent := `password: secret123`
+	os.WriteFile(testFile, []byte(testContent), 0644)
+
+	proc, _ := NewProcessor(cfg, nil)
+	proc.SetupEncryption()
+	output, _, _ := proc.ProcessFile(testFile, true)
+	os.WriteFile(testFile, output, 0644)
+	proc.SaveEncryptedSecrets()
+
+	cfg, _ = config.Load(cfg.ConfigPath())
+
+	loadCalls := 0
+	identityLoader := func() ([]age.Identity, error) {
+		loadCalls++
+		return []age.Identity{identity}, nil
+	}
+	proc2, _ := NewProcessor(cfg, identityLoader)
+
+	output, modified, err := proc2.ProcessFile(testFile, true)
+	if err != nil {
+		t.Fatalf("Processing already encrypted file failed: %v", err)
+	}
+	if modified {
+		t.Error("Expected already encrypted file to remain unmodified")
+	}
+	if loadCalls != 0 {
+		t.Fatalf("Identity loader called for no-op encryption: %d", loadCalls)
+	}
+
+	contentWithNewSecret := string(output) + "\napi_key: newkey\n"
+	os.WriteFile(testFile, []byte(contentWithNewSecret), 0644)
+
+	output, modified, err = proc2.ProcessFile(testFile, true)
+	if err != nil {
+		t.Fatalf("Lazy encryption of new value failed: %v", err)
+	}
+	if !modified {
+		t.Error("Expected new api_key to be encrypted")
+	}
+	if loadCalls != 1 {
+		t.Fatalf("Identity loader calls = %d, want 1", loadCalls)
+	}
+	if encCount := strings.Count(string(output), "ENC[AES256_GCM,"); encCount != 2 {
+		t.Fatalf("Encrypted value count = %d, want 2", encCount)
+	}
+}
+
 func TestProcessorTypePreservation(t *testing.T) {
 	dir := t.TempDir()
 
@@ -419,6 +475,76 @@ func TestProcessorTypePreservation(t *testing.T) {
 	}
 	if data["null_secret"] != nil {
 		t.Errorf("null_secret should be nil, got %T(%v)", data["null_secret"], data["null_secret"])
+	}
+}
+
+func TestHasUnencryptedValuesDetectsNonStringYAMLScalars(t *testing.T) {
+	dir := t.TempDir()
+
+	identity, _ := crypto.GenerateAgeKeypair()
+	cfg := createTestConfig(t, dir, []config.RecipientConfig{
+		{Name: "test", Age: identity.Recipient().String()},
+	})
+	cfg.KeysInclude = append(cfg.KeysInclude, "pin", "enabled")
+
+	proc, _ := NewProcessor(cfg, nil)
+	content := []byte("pin: 1234\nenabled: true\n")
+
+	if !proc.HasUnencryptedValues(content, filepath.Join(dir, "test.yml")) {
+		t.Fatal("Expected numeric/bool YAML scalars to be detected as needing encryption")
+	}
+
+	results, err := proc.CheckContent(content, FormatYAML)
+	if err != nil {
+		t.Fatalf("CheckContent failed: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("CheckContent returned %d results, want 2", len(results))
+	}
+}
+
+func TestProcessorLazyEncryptionEncryptsNonStringYAMLScalar(t *testing.T) {
+	dir := t.TempDir()
+
+	identity, _ := crypto.GenerateAgeKeypair()
+	cfg := createTestConfig(t, dir, []config.RecipientConfig{
+		{Name: "test", Age: identity.Recipient().String()},
+	})
+	cfg.KeysInclude = append(cfg.KeysInclude, "pin")
+
+	testFile := filepath.Join(dir, "test.yml")
+	os.WriteFile(testFile, []byte("pin: 1234\nname: service\n"), 0644)
+
+	proc, _ := NewProcessor(cfg, nil)
+	encrypted, modified, err := proc.ProcessFile(testFile, true)
+	if err != nil {
+		t.Fatalf("Lazy encryption failed: %v", err)
+	}
+	if !modified {
+		t.Fatal("Expected numeric YAML scalar to be encrypted")
+	}
+	if !strings.Contains(string(encrypted), "pin: ENC[AES256_GCM,") {
+		t.Fatalf("Expected pin to be encrypted, got:\n%s", string(encrypted))
+	}
+	if strings.Contains(string(encrypted), "pin: 1234") {
+		t.Fatalf("Numeric secret remained in plaintext:\n%s", string(encrypted))
+	}
+
+	os.WriteFile(testFile, encrypted, 0644)
+	if err := proc.SaveEncryptedSecrets(); err != nil {
+		t.Fatalf("Failed to save lazy-generated store: %v", err)
+	}
+
+	proc2, _ := NewProcessor(cfg, nil)
+	if _, err := proc2.SetupDecryption([]age.Identity{identity}); err != nil {
+		t.Fatalf("Failed to setup decryption: %v", err)
+	}
+	decrypted, _, err := proc2.ProcessFile(testFile, false)
+	if err != nil {
+		t.Fatalf("Failed to decrypt lazily encrypted value: %v", err)
+	}
+	if !strings.Contains(string(decrypted), "pin: 1234") {
+		t.Fatalf("Expected numeric value to round-trip, got:\n%s", string(decrypted))
 	}
 }
 

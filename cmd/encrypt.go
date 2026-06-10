@@ -68,6 +68,8 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
+	printConfigInUse(cfg, jsonOutput || toStdout)
+
 	// Create processor
 	proc, err := processor.NewProcessor(cfg, func() ([]age.Identity, error) {
 		return LoadDecryptionIdentity(cfg, "", "", false, false)
@@ -128,96 +130,42 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	// Check if any files have unencrypted values that need encryption
-	hasUnencrypted := false
-	for _, file := range files {
-		content, err := os.ReadFile(file)
-		if err != nil {
-			continue
-		}
-		if proc.HasUnencryptedValues(content, file, fileFormats[file]) {
-			hasUnencrypted = true
-			break
-		}
-	}
-
-	// Clean up stale MACs for files that no longer exist (even if nothing to encrypt)
-	if !toStdout && cfg.Confcrypt != nil && cfg.Confcrypt.MACs != nil {
-		allMatchingFiles, err := cfg.GetMatchingFiles()
-		if err == nil {
-			// Build set of valid relative paths
-			validPaths := make(map[string]bool)
-			for _, absPath := range allMatchingFiles {
-				relPath, _ := filepath.Rel(cfg.ConfigDir(), absPath)
-				if relPath != "" {
-					validPaths[relPath] = true
-				}
-			}
-
-			// Remove MACs for files that no longer exist
-			macsRemoved := false
-			for macPath := range cfg.Confcrypt.MACs {
-				if !validPaths[macPath] {
-					cfg.RemoveMAC(macPath)
-					macsRemoved = true
-				}
-			}
-
-			// Save config if MACs were removed
-			if macsRemoved {
-				if err := cfg.Save(); err != nil {
-					fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
-					os.Exit(1)
-				}
-			}
-		}
-	}
-
-	if !hasUnencrypted {
-		if jsonOutput {
-			fmt.Println(`{"files":{}}`)
-		} else {
-			fmt.Println("No values to encrypt")
-		}
-		os.Exit(0)
-	}
-
 	// Collect what will be encrypted (for JSON output)
 	var encryptedFields map[string][]string
 	if jsonOutput {
 		encryptedFields = make(map[string][]string)
-		for _, file := range files {
-			unencrypted, err := proc.CheckFile(file, fileFormats[file])
-			if err != nil {
-				continue
-			}
-		if len(unencrypted) > 0 {
-			var fields []string
-			for _, r := range unencrypted {
-				name := strings.Join(r.Path, ".")
-				if name == "" {
-					name = r.KeyName
-				}
-				fields = append(fields, name)
-			}
-			encryptedFields[file] = fields
-			}
-		}
 	}
 
 	// Check if secrets already exist (we'll reuse the key, no need to re-save secrets)
 	hadSecrets := cfg.HasSecrets()
 
-	if err := proc.SetupEncryption(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error setting up encryption: %v\n", err)
-		os.Exit(1)
-	}
-
+	// Stage all outputs in memory first; nothing is written to disk until
+	// every file processed successfully and the key store is persisted
+	var stages []stagedWrite
 	anyModified := false
 	for _, file := range files {
 		relPath, _ := filepath.Rel(cfg.ConfigDir(), file)
 		if relPath == "" {
 			relPath = file
+		}
+
+		if jsonOutput {
+			unencrypted, err := proc.CheckFile(file, fileFormats[file])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error checking %s: %v\n", relPath, err)
+				os.Exit(1)
+			}
+			if len(unencrypted) > 0 {
+				var fields []string
+				for _, r := range unencrypted {
+					name := strings.Join(r.Path, ".")
+					if name == "" {
+						name = r.KeyName
+					}
+					fields = append(fields, name)
+				}
+				encryptedFields[file] = fields
+			}
 		}
 
 		output, modified, err := proc.ProcessFile(file, true, fileFormats[file])
@@ -226,91 +174,75 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 			os.Exit(1)
 		}
 
-		if modified {
-			anyModified = true
-			if toStdout {
-				fmt.Printf("--- %s ---\n", relPath)
-				fmt.Print(string(output))
-				fmt.Println()
+		if !modified {
+			continue
+		}
+		anyModified = true
+
+		if toStdout {
+			fmt.Printf("--- %s ---\n", relPath)
+			fmt.Print(string(output))
+			fmt.Println()
+			continue
+		}
+
+		// Compute renamed path
+		renamedFile, err := cfg.GetEncryptRename(file)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error computing rename for %s: %v\n", relPath, err)
+			os.Exit(1)
+		}
+
+		stages = append(stages, stagedWrite{
+			originalPath: file,
+			outputPath:   renamedFile,
+			content:      output,
+			format:       fileFormats[file],
+		})
+	}
+
+	if !anyModified && !jsonOutput {
+		fmt.Println("No values to encrypt")
+	}
+
+	if !toStdout {
+		// Stage MACs for the new outputs and drop MACs of files that will no
+		// longer exist after the staged renames
+		if err := stageMACs(proc, stages); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		macsRemoved := cleanupStaleMACs(cfg, stages)
+
+		if len(stages) > 0 {
+			// Persist the key store (and MACs) BEFORE writing any file:
+			// a fresh AES key must never exist only in memory while files
+			// encrypted with it are already on disk
+			if hadSecrets {
+				err = cfg.Save()
 			} else {
-				// Compute renamed path
-				renamedFile, err := cfg.GetEncryptRename(file)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error computing rename for %s: %v\n", relPath, err)
-					os.Exit(1)
-				}
-
-				// Write to the renamed path directly
-				if err := proc.WriteFile(renamedFile, output); err != nil {
-					fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", renamedFile, err)
-					os.Exit(1)
-				}
-
-				// If renamed, delete the original file
-				if renamedFile != file {
-					if err := os.Remove(file); err != nil {
-						fmt.Fprintf(os.Stderr, "Error removing original file %s: %v\n", relPath, err)
-						os.Exit(1)
-					}
-				}
-
-				// Update MAC for the renamed file
-				renamedRelPath, _ := filepath.Rel(cfg.ConfigDir(), renamedFile)
-				if renamedRelPath == "" {
-					renamedRelPath = renamedFile
-				}
-				if err := proc.UpdateMAC(renamedFile, output, fileFormats[file]); err != nil {
-					fmt.Fprintf(os.Stderr, "Error updating MAC for %s: %v\n", renamedRelPath, err)
-					os.Exit(1)
-				}
-
-				if !jsonOutput {
-					baseDir := filepath.Base(cfg.ConfigDir())
-					if renamedFile != file {
-						fmt.Printf("Encrypted: %s -> %s\n", filepath.Join(baseDir, relPath), filepath.Join(baseDir, renamedRelPath))
-					} else {
-						fmt.Printf("Encrypted: %s\n", filepath.Join(baseDir, relPath))
-					}
-				}
+				err = proc.SaveEncryptedSecrets()
 			}
-		}
-	}
-
-	// Clean up stale MACs for files that no longer exist
-	if anyModified && !toStdout {
-		allMatchingFiles, err := cfg.GetMatchingFiles()
-		if err == nil {
-			// Build set of valid relative paths
-			validPaths := make(map[string]bool)
-			for _, absPath := range allMatchingFiles {
-				relPath, _ := filepath.Rel(cfg.ConfigDir(), absPath)
-				if relPath != "" {
-					validPaths[relPath] = true
-				}
-			}
-
-			// Remove MACs for files that no longer exist
-			if cfg.Confcrypt != nil && cfg.Confcrypt.MACs != nil {
-				for macPath := range cfg.Confcrypt.MACs {
-					if !validPaths[macPath] {
-						cfg.RemoveMAC(macPath)
-					}
-				}
-			}
-		}
-	}
-
-	// Save config if anything was modified
-	if anyModified && !toStdout {
-		if hadSecrets {
-			// Secrets already existed, just save config (for MACs)
-			if err := cfg.Save(); err != nil {
+			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
 				os.Exit(1)
 			}
-		} else {
-			// New encryption, save encrypted secrets for all recipients
-			if err := proc.SaveEncryptedSecrets(); err != nil {
+
+			if err := writeStagedFiles(proc, stages, func(s stagedWrite) {
+				if jsonOutput {
+					return
+				}
+				if s.outputPath != s.originalPath {
+					fmt.Printf("Encrypted: %s -> %s\n", displayPath(s.originalPath), displayPath(s.outputPath))
+				} else {
+					fmt.Printf("Encrypted: %s\n", displayPath(s.originalPath))
+				}
+			}); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+		} else if macsRemoved {
+			if err := cfg.Save(); err != nil {
 				fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
 				os.Exit(1)
 			}
@@ -390,13 +322,7 @@ func runEncryptDryRun(proc *processor.Processor, cfg *config.Config, files []str
 		}
 
 		fmt.Println("Would encrypt:")
-		baseDir := filepath.Base(cfg.ConfigDir())
 		for file, fields := range result {
-			relPath, _ := filepath.Rel(cfg.ConfigDir(), file)
-			if relPath == "" {
-				relPath = file
-			}
-
 			// Check if this is a renamed file
 			var originalFile string
 			for orig, renamed := range renames {
@@ -407,13 +333,9 @@ func runEncryptDryRun(proc *processor.Processor, cfg *config.Config, files []str
 			}
 
 			if originalFile != "" {
-				origRelPath, _ := filepath.Rel(cfg.ConfigDir(), originalFile)
-				if origRelPath == "" {
-					origRelPath = originalFile
-				}
-				fmt.Printf("  %s -> %s:\n", filepath.Join(baseDir, origRelPath), filepath.Join(baseDir, relPath))
+				fmt.Printf("  %s -> %s:\n", displayPath(originalFile), displayPath(file))
 			} else {
-				fmt.Printf("  %s:\n", filepath.Join(baseDir, relPath))
+				fmt.Printf("  %s:\n", displayPath(file))
 			}
 
 			for _, field := range fields {

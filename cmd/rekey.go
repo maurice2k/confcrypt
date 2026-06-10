@@ -3,13 +3,10 @@ package cmd
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 
-	"filippo.io/age"
 	"github.com/spf13/cobra"
 
 	"github.com/maurice2k/confcrypt/internal/config"
-	"github.com/maurice2k/confcrypt/internal/processor"
 )
 
 var (
@@ -57,112 +54,20 @@ func runRekey(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Create processor and setup decryption with old key
-	proc, err := processor.NewProcessor(cfg, func() ([]age.Identity, error) {
-		return LoadDecryptionIdentity(cfg, "", "", false, false)
-	})
+	rekeyedFiles, err := performRekey(cfg, identities)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
-	if _, err := proc.SetupDecryption(identities); err != nil {
-		fmt.Fprintf(os.Stderr, "Error setting up decryption: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Get all files (with format information)
-	filesWithFormat, err := cfg.GetMatchingFilesWithFormat()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Build file formats map
-	fileFormats := make(map[string]string)
-	for _, f := range filesWithFormat {
-		fileFormats[f.Path] = f.Format
-	}
-
-	// Decrypt all files first
-	decryptedFiles := make(map[string][]byte)
-	for _, f := range filesWithFormat {
-		content, err := os.ReadFile(f.Path)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading %s: %v\n", f.Path, err)
-			os.Exit(1)
-		}
-
-		if proc.HasEncryptedValues(content, f.Path, f.Format) {
-			output, _, err := proc.ProcessFile(f.Path, false, f.Format) // decrypt
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error decrypting %s: %v\n", f.Path, err)
-				os.Exit(1)
-			}
-			decryptedFiles[f.Path] = output
-		}
-	}
-
-	if len(decryptedFiles) == 0 {
-		fmt.Println("No encrypted files found - nothing to rekey")
+	if len(rekeyedFiles) == 0 {
+		fmt.Println("No encrypted files found - rotated AES key only")
 		return
 	}
 
-	// Clear existing secrets to force new key generation
-	cfg.Confcrypt.Store = nil
-
-	// Create new processor with fresh key
-	proc2, err := processor.NewProcessor(cfg, func() ([]age.Identity, error) {
-		return LoadDecryptionIdentity(cfg, "", "", false, false)
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-
-	if err := proc2.SetupEncryption(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error setting up encryption with new key: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Write decrypted content temporarily, then re-encrypt with new key
-	for file, content := range decryptedFiles {
-		// Write decrypted content
-		if err := os.WriteFile(file, content, 0644); err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", file, err)
-			os.Exit(1)
-		}
-
-		// Re-encrypt with new key
-		output, _, err := proc2.ProcessFile(file, true, fileFormats[file]) // encrypt
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error re-encrypting %s: %v\n", file, err)
-			os.Exit(1)
-		}
-
-		if err := os.WriteFile(file, output, 0644); err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", file, err)
-			os.Exit(1)
-		}
-
-		// Update MAC
-		if err := proc2.UpdateMAC(file, output, fileFormats[file]); err != nil {
-			fmt.Fprintf(os.Stderr, "Error updating MAC for %s: %v\n", file, err)
-			os.Exit(1)
-		}
-
-		relPath, _ := filepath.Rel(cfg.ConfigDir(), file)
-		if relPath == "" {
-			relPath = file
-		}
+	for _, relPath := range rekeyedFiles {
 		fmt.Printf("Rekeyed: %s\n", relPath)
 	}
 
-	// Save new encrypted secrets
-	if err := proc2.SaveEncryptedSecrets(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("\nSuccessfully rekeyed %d file(s) with new AES key\n", len(decryptedFiles))
+	fmt.Printf("\nSuccessfully rekeyed %d file(s) with new AES key\n", len(rekeyedFiles))
 }

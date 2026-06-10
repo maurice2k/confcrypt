@@ -1076,3 +1076,71 @@ keys_include:
 		t.Errorf("GetEncryptRename = %q, want %q (files_rename should take precedence)", got, "/path/to/config.enc.yml")
 	}
 }
+
+func TestSaveWithNullConfcryptSection(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, ".confcrypt.yml")
+
+	// A bare ".confcrypt:" key parses as a null scalar node
+	content := `recipients:
+  - name: test
+    age: age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
+files:
+  - "*.yml"
+keys_include:
+  - /password$/
+.confcrypt:
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Failed to load config: %v", err)
+	}
+
+	// Simulate the first encryption populating the store
+	cfg.SetSecrets(map[string]string{
+		"age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p": "encrypted-secret",
+	})
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Failed to save config: %v", err)
+	}
+
+	saved, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("Failed to read saved config: %v", err)
+	}
+	if strings.Contains(string(saved), "!!null") {
+		t.Errorf("Saved config contains !!null tag:\n%s", saved)
+	}
+
+	// The saved config must be loadable again
+	reloaded, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Failed to reload config after save: %v\nSaved content:\n%s", err, saved)
+	}
+	if !reloaded.HasSecrets() {
+		t.Error("Expected secrets to survive the save/load round-trip")
+	}
+}
+
+func TestAddSecretsKeepsExistingEntries(t *testing.T) {
+	cfg := &Config{}
+	cfg.SetSecrets(map[string]string{"age1aaa": "secret-old"})
+	cfg.AddSecrets(map[string]string{"age1aaa": "secret-new"})
+
+	if len(cfg.Confcrypt.Store) != 2 {
+		t.Fatalf("Expected 2 store entries (transitional), got %d", len(cfg.Confcrypt.Store))
+	}
+	if cfg.Confcrypt.Store[0].Secret != "secret-old" || cfg.Confcrypt.Store[1].Secret != "secret-new" {
+		t.Errorf("Expected old entry first and new entry appended, got %+v", cfg.Confcrypt.Store)
+	}
+
+	// SetSecrets replaces the transitional store entirely
+	cfg.SetSecrets(map[string]string{"age1aaa": "secret-new"})
+	if len(cfg.Confcrypt.Store) != 1 || cfg.Confcrypt.Store[0].Secret != "secret-new" {
+		t.Errorf("Expected SetSecrets to replace the store, got %+v", cfg.Confcrypt.Store)
+	}
+}

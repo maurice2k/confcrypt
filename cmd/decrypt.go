@@ -91,6 +91,8 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
+	printConfigInUse(cfg, toStdout || decryptOutputTar == "-")
+
 	// Create processor
 	proc, err := processor.NewProcessor(cfg, func() ([]age.Identity, error) {
 		return LoadDecryptionIdentity(cfg, "", "", false, false)
@@ -344,18 +346,11 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 				anyMACsRemoved = true
 			}
 
-			// Display output (include base directory for consistency)
-			outputRelPath, _ := filepath.Rel(cfg.ConfigDir(), outputFile)
-			if outputRelPath == "" {
-				outputRelPath = outputFile
-			}
-			baseDir := filepath.Base(cfg.ConfigDir())
-			displayPath := filepath.Join(baseDir, outputRelPath)
+			// Display output relative to the current working directory
 			if outputFile != originalFile && decryptOutputPath == "" {
-				displayFrom := filepath.Join(baseDir, relPath)
-				fmt.Printf("Decrypted: %s -> %s\n", displayFrom, displayPath)
+				fmt.Printf("Decrypted: %s -> %s\n", displayPath(originalFile), displayPath(outputFile))
 			} else {
-				fmt.Printf("Decrypted: %s\n", displayPath)
+				fmt.Printf("Decrypted: %s\n", displayPath(outputFile))
 			}
 		}
 	}
