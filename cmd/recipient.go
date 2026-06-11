@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"filippo.io/age"
@@ -176,6 +177,86 @@ func runRecipientAdd(cmd *cobra.Command, args []string) {
 	} else {
 		fmt.Printf("Added recipient: %s\n", truncateKey(pubKey))
 	}
+}
+
+// storeRecipientKeys returns the set of recipient public keys present in the store.
+func storeRecipientKeys(cfg *config.Config) map[string]bool {
+	set := make(map[string]bool)
+	if cfg.Confcrypt != nil {
+		for _, entry := range cfg.Confcrypt.Store {
+			set[entry.Recipient] = true
+		}
+	}
+	return set
+}
+
+// missingStoreRecipients returns the public keys of configured recipients that
+// have no entry in the store yet (e.g. added by hand-editing .confcrypt.yml),
+// sorted for stable output.
+func missingStoreRecipients(cfg *config.Config) []string {
+	inStore := storeRecipientKeys(cfg)
+	var missing []string
+	for _, r := range cfg.Recipients {
+		pubKey := r.GetPublicKey()
+		if pubKey != "" && !inStore[pubKey] {
+			missing = append(missing, pubKey)
+		}
+	}
+	sort.Strings(missing)
+	return missing
+}
+
+// staleStoreRecipients returns store entries whose recipient is no longer in
+// the configured recipient list, sorted for stable output.
+func staleStoreRecipients(cfg *config.Config) []string {
+	configured := make(map[string]bool)
+	for _, r := range cfg.Recipients {
+		if pubKey := r.GetPublicKey(); pubKey != "" {
+			configured[pubKey] = true
+		}
+	}
+	var stale []string
+	if cfg.Confcrypt != nil {
+		for _, entry := range cfg.Confcrypt.Store {
+			if !configured[entry.Recipient] {
+				stale = append(stale, entry.Recipient)
+			}
+		}
+	}
+	sort.Strings(stale)
+	return stale
+}
+
+// recipientLabel renders a recipient public key with its configured name, if any.
+func recipientLabel(cfg *config.Config, pubKey string) string {
+	for _, r := range cfg.Recipients {
+		if r.GetPublicKey() == pubKey && r.Name != "" {
+			return fmt.Sprintf("%s (%s)", r.Name, truncateKey(pubKey))
+		}
+	}
+	return truncateKey(pubKey)
+}
+
+// warnStaleStoreEntries prints a warning (to stderr) about store entries that
+// no longer correspond to a configured recipient. These still grant access to
+// the current AES key, so true revocation requires a rekey.
+func warnStaleStoreEntries(cfg *config.Config) {
+	stale := staleStoreRecipients(cfg)
+	if len(stale) == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "Warning: %d store entr%s no longer matched by any recipient:\n", len(stale), pluralY(len(stale)))
+	for _, k := range stale {
+		fmt.Fprintf(os.Stderr, "  - %s\n", truncateKey(k))
+	}
+	fmt.Fprintf(os.Stderr, "These still grant access to the current AES key. Run 'confcrypt rekey' to rotate the key and drop them.\n")
+}
+
+func pluralY(n int) string {
+	if n == 1 {
+		return "y"
+	}
+	return "ies"
 }
 
 // truncateKey truncates long keys for display

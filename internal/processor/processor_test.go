@@ -139,6 +139,66 @@ api_key: myapikey
 	}
 }
 
+func TestAddMissingStoreRecipients(t *testing.T) {
+	dir := t.TempDir()
+
+	alice, _ := crypto.GenerateAgeKeypair()
+	bob, _ := crypto.GenerateAgeKeypair()
+
+	// Initial store has only Alice
+	cfg := createTestConfig(t, dir, []config.RecipientConfig{
+		{Name: "Alice", Age: alice.Recipient().String()},
+	})
+	proc, _ := NewProcessor(cfg, nil)
+	if err := proc.SetupEncryption(); err != nil {
+		t.Fatalf("setup encryption: %v", err)
+	}
+	if err := proc.SaveEncryptedSecrets(); err != nil {
+		t.Fatalf("save secrets: %v", err)
+	}
+
+	// Reload and simulate a hand-edit that adds Bob to the recipients list
+	cfg, _ = config.Load(cfg.ConfigPath())
+	cfg.Recipients = append(cfg.Recipients, config.RecipientConfig{Name: "Bob", Age: bob.Recipient().String()})
+
+	identityLoader := func() ([]age.Identity, error) {
+		return []age.Identity{alice}, nil
+	}
+	proc2, _ := NewProcessor(cfg, identityLoader)
+
+	added, err := proc2.AddMissingStoreRecipients()
+	if err != nil {
+		t.Fatalf("AddMissingStoreRecipients: %v", err)
+	}
+	if len(added) != 1 || added[0] != bob.Recipient().String() {
+		t.Fatalf("expected Bob added, got %v", added)
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	// Bob (the new recipient) must now be able to decrypt the AES key,
+	// proving the same key was reused.
+	cfg, _ = config.Load(cfg.ConfigPath())
+	if len(cfg.Confcrypt.Store) != 2 {
+		t.Fatalf("expected 2 store entries, got %d", len(cfg.Confcrypt.Store))
+	}
+	procBob, _ := NewProcessor(cfg, nil)
+	if _, err := procBob.SetupDecryption([]age.Identity{bob}); err != nil {
+		t.Fatalf("Bob could not decrypt key after being added: %v", err)
+	}
+
+	// Calling again with no new recipients is a no-op.
+	proc3, _ := NewProcessor(cfg, identityLoader)
+	added2, err := proc3.AddMissingStoreRecipients()
+	if err != nil {
+		t.Fatalf("AddMissingStoreRecipients (2nd): %v", err)
+	}
+	if len(added2) != 0 {
+		t.Fatalf("expected no additions on second run, got %v", added2)
+	}
+}
+
 func TestProcessorIdempotentEncryption(t *testing.T) {
 	dir := t.TempDir()
 

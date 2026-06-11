@@ -237,6 +237,55 @@ func (p *Processor) EncryptStoreEntries() (map[string]string, error) {
 	return secrets, nil
 }
 
+// AddMissingStoreRecipients wraps the current AES key for every configured
+// recipient that is not yet present in the store and appends those entries,
+// leaving existing entries untouched (stale entries are preserved, never
+// pruned, since dropping them does not actually revoke access without a
+// rekey). ensureEncryptionSetup loads identities to decrypt the existing key,
+// which may prompt a hardware key, but only if setup has not already happened.
+// The config is mutated in memory; the caller is responsible for saving.
+// Returns the public keys that were added.
+func (p *Processor) AddMissingStoreRecipients() ([]string, error) {
+	if err := p.ensureEncryptionSetup(); err != nil {
+		return nil, err
+	}
+
+	inStore := make(map[string]bool)
+	if p.config.Confcrypt != nil {
+		for _, entry := range p.config.Confcrypt.Store {
+			inStore[entry.Recipient] = true
+		}
+	}
+
+	secrets := make(map[string]string)
+	var added []string
+	for _, r := range p.config.Recipients {
+		pubKey := r.GetPublicKey()
+		if pubKey == "" || inStore[pubKey] {
+			continue
+		}
+
+		recipient, err := crypto.ParseRecipient(pubKey)
+		if err != nil {
+			return nil, err
+		}
+
+		encrypted, err := crypto.EncryptForRecipients(p.aesKey, []age.Recipient{recipient})
+		if err != nil {
+			return nil, fmt.Errorf("failed to encrypt secret for %s: %w", pubKey, err)
+		}
+
+		secrets[pubKey] = string(encrypted)
+		added = append(added, pubKey)
+	}
+
+	if len(secrets) > 0 {
+		p.config.AddSecrets(secrets)
+	}
+
+	return added, nil
+}
+
 // SaveEncryptedSecrets encrypts the AES key for all recipients and saves to config
 func (p *Processor) SaveEncryptedSecrets() error {
 	secrets, err := p.EncryptStoreEntries()

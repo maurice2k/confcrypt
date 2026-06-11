@@ -143,6 +143,11 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 	// Check if secrets already exist (we'll reuse the key, no need to re-save secrets)
 	hadSecrets := cfg.HasSecrets()
 
+	// Recipients added by hand-editing .confcrypt.yml are wrapped with the
+	// existing AES key and appended to the store (see store sync below).
+	missingRecipients := missingStoreRecipients(cfg)
+	willSyncStore := hadSecrets && len(missingRecipients) > 0 && !toStdout
+
 	// Stage all outputs in memory first; nothing is written to disk until
 	// every file processed successfully and the key store is persisted
 	var stages []stagedWrite
@@ -197,11 +202,24 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 		})
 	}
 
-	if !anyModified && !jsonOutput {
+	if !anyModified && !jsonOutput && !willSyncStore {
 		fmt.Println("No values to encrypt")
 	}
 
 	if !toStdout {
+		// Sync the store: wrap the existing AES key for recipients that were
+		// added to the config by hand. ensureEncryptionSetup (inside) reuses
+		// the setup already done by the encrypt loop, so this never triggers a
+		// second hardware-key prompt.
+		var addedRecipients []string
+		if willSyncStore {
+			addedRecipients, err = proc.AddMissingStoreRecipients()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error updating recipient store: %v\n", err)
+				os.Exit(1)
+			}
+		}
+
 		// Stage MACs for the new outputs and drop MACs of files that will no
 		// longer exist after the staged renames
 		if err := stageMACs(proc, stages); err != nil {
@@ -237,12 +255,22 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
-		} else if macsRemoved {
+		} else if macsRemoved || len(addedRecipients) > 0 {
 			if err := cfg.Save(); err != nil {
 				fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
 				os.Exit(1)
 			}
 		}
+
+		// Report newly granted recipients (stderr in --json mode to keep stdout clean)
+		recipientOut := os.Stdout
+		if jsonOutput {
+			recipientOut = os.Stderr
+		}
+		for _, pub := range addedRecipients {
+			fmt.Fprintf(recipientOut, "Granted access to new recipient: %s\n", recipientLabel(cfg, pub))
+		}
+		warnStaleStoreEntries(cfg)
 	}
 
 	// Output JSON if requested

@@ -295,11 +295,12 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 				os.Exit(1)
 			}
 
-			// Display progress (to stderr if tar goes to stdout)
+			// Display progress (to stderr if tar goes to stdout).
+			// tarPath is the path inside the archive, not on disk.
 			if decryptOutputTar == "-" {
-				fmt.Fprintf(os.Stderr, "Decrypted: %s\n", tarPath)
+				fmt.Fprintf(os.Stderr, "Decrypted and archived: %s\n", tarPath)
 			} else {
-				fmt.Printf("Decrypted: %s\n", tarPath)
+				fmt.Printf("Decrypted and archived: %s\n", tarPath)
 			}
 		} else if modified {
 			// Determine output file path
