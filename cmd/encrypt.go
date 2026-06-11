@@ -130,10 +130,14 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	// Collect what will be encrypted (for JSON output)
+	// Collect what will be encrypted (for JSON output). Keyed by path relative to
+	// the config dir (same key space as --dry-run --json); renames hold the
+	// would-be output path for files that get renamed on encrypt.
 	var encryptedFields map[string][]string
+	var renames map[string]string
 	if jsonOutput {
 		encryptedFields = make(map[string][]string)
+		renames = make(map[string]string)
 	}
 
 	// Check if secrets already exist (we'll reuse the key, no need to re-save secrets)
@@ -144,10 +148,7 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 	var stages []stagedWrite
 	anyModified := false
 	for _, file := range files {
-		relPath, _ := filepath.Rel(cfg.ConfigDir(), file)
-		if relPath == "" {
-			relPath = file
-		}
+		relPath := configRelPath(cfg, file)
 
 		if jsonOutput {
 			unencrypted, err := proc.CheckFile(file, fileFormats[file])
@@ -156,15 +157,10 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 				os.Exit(1)
 			}
 			if len(unencrypted) > 0 {
-				var fields []string
-				for _, r := range unencrypted {
-					name := strings.Join(r.Path, ".")
-					if name == "" {
-						name = r.KeyName
-					}
-					fields = append(fields, name)
+				encryptedFields[relPath] = fieldNames(unencrypted)
+				if renamed, rerr := cfg.GetEncryptRename(file); rerr == nil && renamed != file {
+					renames[relPath] = configRelPath(cfg, renamed)
 				}
-				encryptedFields[file] = fields
 			}
 		}
 
@@ -251,96 +247,103 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 
 	// Output JSON if requested
 	if jsonOutput {
-		output := struct {
-			Files map[string][]string `json:"files"`
-		}{
-			Files: encryptedFields,
-		}
-		jsonBytes, err := json.MarshalIndent(output, "", "  ")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding JSON: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Println(string(jsonBytes))
+		printEncryptJSON(encryptedFields, renames)
 	}
 }
 
-// runEncryptDryRun handles --dry-run and --json output modes
+// runEncryptDryRun handles --dry-run and --json output modes.
+// JSON output uses the same key space as the live --json run: keys are paths
+// relative to the config dir (original, not renamed), with renames reported
+// separately.
 func runEncryptDryRun(proc *processor.Processor, cfg *config.Config, files []string, fileFormats map[string]string) {
-	// Collect unencrypted keys per file (with renamed paths)
-	result := make(map[string][]string)
-	renames := make(map[string]string) // original -> renamed
+	result := make(map[string][]string)  // relOriginal -> fields
+	renames := make(map[string]string)   // relOriginal -> relRenamed
+	origPaths := make(map[string]string) // relOriginal -> absolute original (for display)
 
 	for _, file := range files {
 		unencrypted, err := proc.CheckFile(file, fileFormats[file])
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error checking %s: %v\n", file, err)
+			fmt.Fprintf(os.Stderr, "Error checking %s: %v\n", configRelPath(cfg, file), err)
 			os.Exit(1)
 		}
 
 		if len(unencrypted) > 0 {
-			var fields []string
-			for _, r := range unencrypted {
-				name := strings.Join(r.Path, ".")
-				if name == "" {
-					name = r.KeyName
-				}
-				fields = append(fields, name)
-			}
+			rel := configRelPath(cfg, file)
+			result[rel] = fieldNames(unencrypted)
+			origPaths[rel] = file
 
-			// Compute renamed path for output
 			renamedFile, err := cfg.GetEncryptRename(file)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error computing rename for %s: %v\n", file, err)
+				fmt.Fprintf(os.Stderr, "Error computing rename for %s: %v\n", rel, err)
 				os.Exit(1)
 			}
-
-			result[renamedFile] = fields
 			if renamedFile != file {
-				renames[file] = renamedFile
+				renames[rel] = configRelPath(cfg, renamedFile)
 			}
 		}
 	}
 
 	if jsonOutput {
-		output := struct {
-			Files map[string][]string `json:"files"`
-		}{
-			Files: result,
-		}
-		jsonBytes, err := json.MarshalIndent(output, "", "  ")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding JSON: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Println(string(jsonBytes))
-	} else {
-		// Human-readable dry-run output
-		if len(result) == 0 {
-			fmt.Println("No values to encrypt")
-			return
+		printEncryptJSON(result, renames)
+		return
+	}
+
+	// Human-readable dry-run output
+	if len(result) == 0 {
+		fmt.Println("No values to encrypt")
+		return
+	}
+
+	fmt.Println("Would encrypt:")
+	for rel, fields := range result {
+		if renamed, ok := renames[rel]; ok {
+			fmt.Printf("  %s -> %s:\n", displayPath(origPaths[rel]), displayPath(filepath.Join(cfg.ConfigDir(), renamed)))
+		} else {
+			fmt.Printf("  %s:\n", displayPath(origPaths[rel]))
 		}
 
-		fmt.Println("Would encrypt:")
-		for file, fields := range result {
-			// Check if this is a renamed file
-			var originalFile string
-			for orig, renamed := range renames {
-				if renamed == file {
-					originalFile = orig
-					break
-				}
-			}
-
-			if originalFile != "" {
-				fmt.Printf("  %s -> %s:\n", displayPath(originalFile), displayPath(file))
-			} else {
-				fmt.Printf("  %s:\n", displayPath(file))
-			}
-
-			for _, field := range fields {
-				fmt.Printf("    - %s\n", field)
-			}
+		for _, field := range fields {
+			fmt.Printf("    - %s\n", field)
 		}
 	}
+}
+
+// configRelPath returns path relative to the config directory (a stable JSON
+// key independent of the caller's cwd), falling back to the input path.
+func configRelPath(cfg *config.Config, path string) string {
+	rel, err := filepath.Rel(cfg.ConfigDir(), path)
+	if err != nil || rel == "" {
+		return path
+	}
+	return rel
+}
+
+// fieldNames flattens matcher results into dotted field names.
+func fieldNames(results []processor.MatchResult) []string {
+	fields := make([]string, 0, len(results))
+	for _, r := range results {
+		name := strings.Join(r.Path, ".")
+		if name == "" {
+			name = r.KeyName
+		}
+		fields = append(fields, name)
+	}
+	return fields
+}
+
+// printEncryptJSON writes the shared encrypt/dry-run JSON shape to stdout.
+func printEncryptJSON(files map[string][]string, renames map[string]string) {
+	output := struct {
+		Files   map[string][]string `json:"files"`
+		Renames map[string]string   `json:"renames,omitempty"`
+	}{
+		Files:   files,
+		Renames: renames,
+	}
+	jsonBytes, err := json.MarshalIndent(output, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error encoding JSON: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(string(jsonBytes))
 }
