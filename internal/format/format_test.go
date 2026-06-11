@@ -216,6 +216,26 @@ func TestFormatParseFullFileRoundTrip(t *testing.T) {
 	}
 }
 
+func TestParseFullFileEncryptedToleratesTrailingWhitespace(t *testing.T) {
+	ev := &EncryptedValue{
+		Data: []byte("hello world this is some test data that will be encrypted"),
+		IV:   []byte("123456789012"),
+		Tag:  []byte("1234567890123456"),
+		Type: TypeBytes,
+	}
+	formatted := FormatFullFileEncrypted(ev)
+
+	for _, suffix := range []string{"\n", "\r\n", "\n\n", "  \n", "\t"} {
+		parsed, err := ParseFullFileEncrypted(formatted + suffix)
+		if err != nil {
+			t.Fatalf("trailing %q: ParseFullFileEncrypted() error = %v", suffix, err)
+		}
+		if string(parsed.Data) != string(ev.Data) {
+			t.Errorf("trailing %q: data mismatch: got %q", suffix, parsed.Data)
+		}
+	}
+}
+
 func TestFormatFullFileEncryptedChunking(t *testing.T) {
 	// Create a large encrypted value that will need chunking
 	largeData := make([]byte, 1000)

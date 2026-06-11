@@ -503,6 +503,47 @@ func TestHasUnencryptedValuesDetectsNonStringYAMLScalars(t *testing.T) {
 	}
 }
 
+// TestCheckContentSiblingPathsNotAliased guards against the path append-aliasing
+// regression where sibling MatchResults all reported the same key name/path
+// because they shared a backing array.
+func TestCheckContentSiblingPathsNotAliased(t *testing.T) {
+	identity, _ := crypto.GenerateAgeKeypair()
+	cfg := createTestConfig(t, t.TempDir(), []config.RecipientConfig{
+		{Name: "test", Age: identity.Recipient().String()},
+	})
+	cfg.KeysInclude = append(cfg.KeysInclude, "alpha", "beta", "gamma")
+
+	proc, _ := NewProcessor(cfg, nil)
+
+	check := func(t *testing.T, content []byte, ff FileFormat) {
+		results, err := proc.CheckContent(content, ff)
+		if err != nil {
+			t.Fatalf("CheckContent failed: %v", err)
+		}
+		if len(results) != 3 {
+			t.Fatalf("got %d results, want 3", len(results))
+		}
+		seen := map[string]bool{}
+		for _, r := range results {
+			joined := strings.Join(r.Path, ".")
+			if seen[joined] {
+				t.Fatalf("duplicate (aliased) path %q across siblings: %+v", joined, results)
+			}
+			seen[joined] = true
+			if last := r.Path[len(r.Path)-1]; last != r.KeyName {
+				t.Fatalf("path tail %q != KeyName %q (aliasing): %+v", last, r.KeyName, results)
+			}
+		}
+	}
+
+	t.Run("yaml", func(t *testing.T) {
+		check(t, []byte("alpha: one\nbeta: two\ngamma: three\n"), FormatYAML)
+	})
+	t.Run("json", func(t *testing.T) {
+		check(t, []byte(`{"alpha":"one","beta":"two","gamma":"three"}`), FormatJSON)
+	})
+}
+
 func TestProcessorLazyEncryptionEncryptsNonStringYAMLScalar(t *testing.T) {
 	dir := t.TempDir()
 

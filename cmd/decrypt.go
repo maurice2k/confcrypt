@@ -405,6 +405,9 @@ func validateDecryptOptions(stdout bool, outputPath, outputTar string, clearSecr
 	if outputTar != "" && stdout {
 		return fmt.Errorf("cannot use both --output-tar and --stdout")
 	}
+	if stdout && outputPath != "" {
+		return fmt.Errorf("cannot use both --stdout and --output-path")
+	}
 	if clearSecrets && stdout {
 		return fmt.Errorf("cannot use --clear-secrets with --stdout")
 	}

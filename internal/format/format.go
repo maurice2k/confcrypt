@@ -200,7 +200,8 @@ func FormatFullFileEncrypted(ev *EncryptedValue) string {
 
 // ParseFullFileEncrypted parses a fully encrypted file content
 func ParseFullFileEncrypted(content string) (*EncryptedValue, error) {
-	matches := fullFileRegex.FindStringSubmatch(content)
+	// Tolerate trailing whitespace/newlines that editors commonly append.
+	matches := fullFileRegex.FindStringSubmatch(strings.TrimRight(content, " \t\r\n"))
 	if matches == nil {
 		return nil, fmt.Errorf("invalid full file encrypted format")
 	}
