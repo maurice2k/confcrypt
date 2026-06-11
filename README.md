@@ -509,6 +509,24 @@ confcrypt recipient add age1lggyhqrw2nlhcxprm67z43rta597azn8gknawjehu9d9dl0jq3yq
 
 **Note:** No rekeying occurs - the same AES-256 key is used, just encrypted for an additional recipient.
 
+### Add a recipient by hand-editing `.confcrypt.yml`
+
+You can also add recipients directly to the `recipients` list in `.confcrypt.yml`:
+
+```yaml
+recipients:
+  - name: Moritz Fain
+    fido2: age1fido21qpqgzyfh3lf67ksge6gu9j37grr3ru8prs9h8su6rwcya0w8ncz54ajwvz0kzm3gd2p8ng7...
+```
+
+The next `confcrypt encrypt` detects recipients that are missing from the encrypted key store and wraps the existing AES-256 key for them automatically (no rekey, same key), printing:
+
+```text
+Granted access to new recipient: Moritz Fain (age1fido21qpqgzyfh3lf67ksge6gu9j37grr3ru8prs9h8su6...)
+```
+
+This runs even when there is nothing new to encrypt. Removing a recipient line is **not** auto-handled: a leftover store entry still grants access to the current key, so `encrypt` only warns about stale entries and leaves real revocation to `confcrypt rekey` (which rotates the key and drops them).
+
 ### Remove a recipient (`recipient rm`)
 
 ```bash

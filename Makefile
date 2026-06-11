@@ -36,6 +36,12 @@ ifeq ($(GOOS),darwin)
     endif
 endif
 
+# Install location (override with e.g. `make install PREFIX=$HOME/.local`)
+# DESTDIR is supported for staged/packaged installs.
+PREFIX ?= /usr/local
+BINDIR ?= $(PREFIX)/bin
+INSTALL_PATH := $(DESTDIR)$(BINDIR)/$(BINARY_NAME)
+
 # Output directory
 BUILD_DIR := build
 
@@ -51,8 +57,9 @@ help:
 	@echo "Usage:"
 	@echo "  make build          Build with CGO enabled (FIDO2 support)"
 	@echo "  make build-nocgo    Build without CGO (no FIDO2 support)"
-	@echo "  make install        Install to GOPATH/bin (with CGO)"
-	@echo "  make install-nocgo  Install to GOPATH/bin (without CGO)"
+	@echo "  make install        Install to $(BINDIR) (with CGO; override with PREFIX/BINDIR)"
+	@echo "  make install-nocgo  Install to $(BINDIR) (without CGO)"
+	@echo "  make uninstall      Remove $(BINDIR)/$(BINARY_NAME)"
 	@echo "  make test           Run tests"
 	@echo "  make test-verbose   Run tests with verbose output"
 	@echo "  make test-coverage  Run tests with coverage report"
@@ -93,16 +100,24 @@ build-nocgo:
 # Install with CGO
 .PHONY: install
 install:
-	@echo "Installing $(BINARY_NAME) with CGO (FIDO2 support)..."
-	CGO_ENABLED=1 $(GOBUILD) $(LDFLAGS) -o $(GOPATH)/bin/$(BINARY_NAME) .
-	@echo "Installed to $(GOPATH)/bin/$(BINARY_NAME)"
+	@echo "Installing $(BINARY_NAME) with CGO (FIDO2 support) to $(INSTALL_PATH)..."
+	install -d $(DESTDIR)$(BINDIR)
+	CGO_ENABLED=1 $(GOBUILD) $(LDFLAGS) -o $(INSTALL_PATH) .
+	@echo "Installed to $(INSTALL_PATH)"
 
 # Install without CGO
 .PHONY: install-nocgo
 install-nocgo:
-	@echo "Installing $(BINARY_NAME) without CGO (no FIDO2 support)..."
-	CGO_ENABLED=0 $(GOBUILD) $(LDFLAGS) -o $(GOPATH)/bin/$(BINARY_NAME) .
-	@echo "Installed to $(GOPATH)/bin/$(BINARY_NAME)"
+	@echo "Installing $(BINARY_NAME) without CGO (no FIDO2 support) to $(INSTALL_PATH)..."
+	install -d $(DESTDIR)$(BINDIR)
+	CGO_ENABLED=0 $(GOBUILD) $(LDFLAGS) -o $(INSTALL_PATH) .
+	@echo "Installed to $(INSTALL_PATH)"
+
+# Uninstall
+.PHONY: uninstall
+uninstall:
+	@echo "Removing $(INSTALL_PATH)..."
+	rm -f $(INSTALL_PATH)
 
 # Run tests
 .PHONY: test
