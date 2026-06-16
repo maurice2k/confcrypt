@@ -202,7 +202,7 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 		})
 	}
 
-	if !anyModified && !jsonOutput && !willSyncStore {
+	if !anyModified && !jsonOutput && !willSyncStore && quiet < 3 {
 		fmt.Println("No values to encrypt")
 	}
 
@@ -243,7 +243,7 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 			}
 
 			if err := writeStagedFiles(proc, stages, func(s stagedWrite) {
-				if jsonOutput {
+				if jsonOutput || quiet >= 1 {
 					return
 				}
 				if s.outputPath != s.originalPath {
@@ -267,8 +267,10 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 		if jsonOutput {
 			recipientOut = os.Stderr
 		}
-		for _, pub := range addedRecipients {
-			fmt.Fprintf(recipientOut, "Granted access to new recipient: %s\n", recipientLabel(cfg, pub))
+		if quiet < 3 {
+			for _, pub := range addedRecipients {
+				fmt.Fprintf(recipientOut, "Granted access to new recipient: %s\n", recipientLabel(cfg, pub))
+			}
 		}
 		warnStaleStoreEntries(cfg)
 	}

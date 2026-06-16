@@ -35,6 +35,9 @@ func displayPath(p string) string {
 // printConfigInUse reports which .confcrypt config file is being used.
 // Writes to stderr when stdout must stay clean (e.g. --stdout/--json output).
 func printConfigInUse(cfg *config.Config, toStderr bool) {
+	if quiet >= 2 {
+		return
+	}
 	w := os.Stdout
 	if toStderr {
 		w = os.Stderr

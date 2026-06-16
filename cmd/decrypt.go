@@ -126,7 +126,9 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 	}
 
 	if len(files) == 0 {
-		fmt.Fprintf(os.Stderr, "No files to process\n")
+		if quiet < 3 {
+			fmt.Fprintf(os.Stderr, "No files to process\n")
+		}
 		os.Exit(0)
 	}
 
@@ -160,10 +162,14 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 			}
 			tw := tar.NewWriter(out)
 			tw.Close() // Creates valid empty tar with EOF blocks
-			fmt.Fprintf(os.Stderr, "No encrypted values found (empty tar created)\n")
+			if quiet < 3 {
+				fmt.Fprintf(os.Stderr, "No encrypted values found (empty tar created)\n")
+			}
 			os.Exit(0)
 		}
-		fmt.Println("No encrypted values found")
+		if quiet < 3 {
+			fmt.Println("No encrypted values found")
+		}
 		os.Exit(0)
 	}
 
@@ -188,14 +194,16 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 			fmt.Printf(format, args...)
 		}
 	}
-	if recipient := cfg.FindRecipientByKey(usedKey); recipient != nil {
-		if recipient.Name != "" {
-			printInfo("Using key: %s (%s)\n", recipient.Name, truncateKey(usedKey))
+	if quiet < 3 {
+		if recipient := cfg.FindRecipientByKey(usedKey); recipient != nil {
+			if recipient.Name != "" {
+				printInfo("Using key: %s (%s)\n", recipient.Name, truncateKey(usedKey))
+			} else {
+				printInfo("Using key: %s\n", truncateKey(usedKey))
+			}
 		} else {
 			printInfo("Using key: %s\n", truncateKey(usedKey))
 		}
-	} else {
-		printInfo("Using key: %s\n", truncateKey(usedKey))
 	}
 
 	// Set up tar writer if --output-tar is specified
@@ -297,10 +305,12 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 
 			// Display progress (to stderr if tar goes to stdout).
 			// tarPath is the path inside the archive, not on disk.
-			if decryptOutputTar == "-" {
-				fmt.Fprintf(os.Stderr, "Decrypted and archived: %s\n", tarPath)
-			} else {
-				fmt.Printf("Decrypted and archived: %s\n", tarPath)
+			if quiet < 1 {
+				if decryptOutputTar == "-" {
+					fmt.Fprintf(os.Stderr, "Decrypted and archived: %s\n", tarPath)
+				} else {
+					fmt.Printf("Decrypted and archived: %s\n", tarPath)
+				}
 			}
 		} else if modified {
 			// Determine output file path
@@ -368,10 +378,12 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 			}
 
 			// Display output relative to the current working directory
-			if outputFile != originalFile && decryptOutputPath == "" {
-				fmt.Printf("Decrypted: %s -> %s\n", displayPath(originalFile), displayPath(outputFile))
-			} else {
-				fmt.Printf("Decrypted: %s\n", displayPath(outputFile))
+			if quiet < 1 {
+				if outputFile != originalFile && decryptOutputPath == "" {
+					fmt.Printf("Decrypted: %s -> %s\n", displayPath(originalFile), displayPath(outputFile))
+				} else {
+					fmt.Printf("Decrypted: %s\n", displayPath(outputFile))
+				}
 			}
 		}
 	}
@@ -393,7 +405,7 @@ func runDecrypt(cmd *cobra.Command, args []string) {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		if message != "" {
+		if message != "" && quiet < 3 {
 			fmt.Println(message)
 		}
 	}

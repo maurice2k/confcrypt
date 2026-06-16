@@ -28,6 +28,7 @@ var (
 	configPath string
 	filePath   string
 	toStdout   bool
+	quiet      int
 
 	// Resolved config path (computed from flags)
 	resolvedConfigPath string
@@ -61,6 +62,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&configPath, "config", "", "Path to .confcrypt.yml config file (overrides --path)")
 	rootCmd.PersistentFlags().StringVar(&filePath, "file", "", "Process a specific file only (deprecated: use positional argument instead)")
 	rootCmd.PersistentFlags().BoolVar(&toStdout, "stdout", false, "Output to stdout instead of modifying files in-place")
+	rootCmd.PersistentFlags().CountVarP(&quiet, "quiet", "q", "Reduce output: -q hides per-file progress, -qq also hides 'Using config', -qqq silences all but prompts/errors")
 }
 
 func Execute() {

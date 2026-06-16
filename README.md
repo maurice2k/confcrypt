@@ -247,6 +247,7 @@ Global Options:
   --config string      Path to .confcrypt.yml config file (overrides --path)
   --file string        Process a specific file only
   --stdout             Output to stdout instead of modifying files in-place
+  -q, --quiet          Reduce output (repeatable: -q, -qq, -qqq)
   --version            Show version
   --help               Show help
 
@@ -260,6 +261,16 @@ Decrypt Options:
   --force              Continue decryption even if MAC verification fails
   --clear-secrets      Clear encrypted AES key store after all in-place encrypted values are removed
 ```
+
+### Quiet output (`-q`)
+
+The `-q`/`--quiet` flag is repeatable and progressively suppresses *confcrypt*'s human-readable status output (for both `encrypt` and `decrypt`):
+
+- `-q`: hide per-file progress lines (`Encrypted:`, `Decrypted:`, `Decrypted and archived:`)
+- `-qq`: also hide `Using config: ...`
+- `-qqq`: also hide `Using key: ...`, summaries, and `Granted access: ...` (silent except prompts and errors)
+
+Interactive prompts (PIN/touch/passphrase), warnings, errors, and data output (`--stdout`, `--json`, tar contents, `--dry-run`) are never suppressed.
 
 ## Examples
 
