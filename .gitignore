@@ -1,5 +1,4 @@
 confcrypt
-confcrypt-*
 build/
 test*/
 .confcrypt.yml

@@ -127,8 +127,24 @@ func loadIdentitiesFromFileWithPassphrase(path string, passphraseFunc crypto.Pas
 }
 
 // promptPassphrase prompts the user for a passphrase to decrypt an SSH key.
+// In non-interactive mode (no TTY on stdin) it uses CONFCRYPT_ASKPASS
+// (falling back to SSH_ASKPASS) to obtain the passphrase, or fails with an
+// error if neither is set.
 func promptPassphrase(keyPath string) ([]byte, error) {
-	fmt.Fprintf(os.Stderr, "Enter passphrase for %s: ", filepath.Base(keyPath))
+	prompt := fmt.Sprintf("Enter passphrase for %s: ", filepath.Base(keyPath))
+
+	if value, handled, err := askSecret(prompt); handled {
+		if err != nil {
+			return nil, err
+		}
+		return []byte(value), nil
+	}
+
+	if isNonInteractive() {
+		return nil, fmt.Errorf("cannot read SSH key passphrase: no TTY available; set CONFCRYPT_ASKPASS (or SSH_ASKPASS) to a helper program")
+	}
+
+	fmt.Fprint(os.Stderr, prompt)
 	passphrase, err := term.ReadPassword(int(os.Stdin.Fd()))
 	fmt.Fprintln(os.Stderr) // newline after password input
 	if err != nil {

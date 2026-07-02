@@ -88,6 +88,7 @@ This installs to `/usr/local/bin` by default. To install elsewhere:
 INSTALL_DIR=~/.local/bin curl -fsSL https://raw.githubusercontent.com/maurice2k/confcrypt/main/install.sh | sh
 ```
 
+
 ### From source (go install)
 
 ```bash
@@ -241,6 +242,7 @@ Commands:
   rekey           Rotate the AES-256 key and re-encrypt all values
   recipient add   Add a recipient (public key required, --name optional)
   recipient rm    Remove a recipient by public key (rekeys by default)
+  install-askpass-helper  Extract the bundled confcrypt-askpass helper (see CONFCRYPT_ASKPASS)
 
 Global Options:
   --path string        Base path where .confcrypt.yml is located (default: current directory)
@@ -642,6 +644,48 @@ confcrypt recipient add --name "Your Name" age1fido21qpzry9x8...
 5. **Decryption**: Touch the device (and enter PIN if configured) to re-derive the private key
 
 For the full credential/key-derivation flow, recipient encoding, and how the exact device is selected at decryption time, see [FIDO2.md](FIDO2.md).
+
+### Non-interactive PIN/passphrase entry (`CONFCRYPT_ASKPASS`)
+
+When stdin isn't a terminal (e.g. *confcrypt* is invoked by another program, a CI job, or an LLM agent), it can't interactively prompt for a FIDO2 PIN or SSH key passphrase. Point it at an external askpass helper instead, the same way `ssh` uses `SSH_ASKPASS`:
+
+- `CONFCRYPT_ASKPASS=/path/to/program` - program to call for the secret. It is invoked as `program "<prompt text>"` and must print the PIN/passphrase to stdout.
+- `CONFCRYPT_ASKPASS_REQUIRE=force` - always use an askpass helper, even when stdin is a terminal: `CONFCRYPT_ASKPASS` if set, otherwise the installed `confcrypt-askpass` helper (see below) if found.
+
+When stdin isn't a terminal, *confcrypt* resolves a helper in this order:
+
+1. `CONFCRYPT_ASKPASS`, if set.
+2. The bundled `confcrypt-askpass` helper (see below), if installed - found on `PATH`, or next to the running `confcrypt` binary.
+3. `SSH_ASKPASS`/`SSH_ASKPASS_REQUIRE` (standard `ssh(1)` variables), so an existing SSH askpass setup works automatically.
+
+If none of the above apply, *confcrypt* fails with an error instead of hanging or silently reading garbage from stdin.
+
+```bash
+CONFCRYPT_ASKPASS=/usr/local/bin/my-askpass.sh confcrypt decrypt --fido2-key
+```
+
+#### Setting up an askpass helper
+
+*confcrypt* ships an optional auto-detecting helper script, embedded directly in the binary (so it always matches your confcrypt version), that picks the best available backend for your OS:
+
+- **macOS**: `osascript` (native dialog) -> `ssh-askpass` -> `pinentry-mac`
+- **Linux**: `pinentry-gnome3` -> `pinentry-gtk-2` -> `ssh-askpass` -> `zenity`
+
+Install it with `confcrypt install-askpass-helper` (opt-in only, not run automatically, since it depends on a GUI/agent being available):
+
+```bash
+confcrypt install-askpass-helper   # writes confcrypt-askpass next to the confcrypt binary
+export CONFCRYPT_ASKPASS=/usr/local/bin/confcrypt-askpass
+confcrypt decrypt --fido2-key
+```
+
+Other options:
+```bash
+confcrypt install-askpass-helper /usr/local/bin/confcrypt-askpass  # explicit path
+confcrypt install-askpass-helper --print > ~/bin/confcrypt-askpass && chmod +x ~/bin/confcrypt-askpass
+```
+
+An askpass helper is just an executable that receives the prompt as `$1` and prints the secret to stdout, so you can also write your own instead. Use the bundled `confcrypt-askpass` as a reference.
 
 ### FIDO2 vs YubiKey OTP
 

@@ -80,6 +80,9 @@ fi
 echo ""
 echo "confcrypt ${LATEST_RELEASE} installed to ${INSTALL_DIR}/${BINARY_NAME}"
 echo ""
+echo "Tip: for non-interactive FIDO2 PIN / SSH passphrase entry, run:"
+echo "  confcrypt install-askpass-helper"
+echo ""
 
 # Check for FIDO2 dependency
 if [ "$OS" = "darwin" ]; then

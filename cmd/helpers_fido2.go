@@ -3,7 +3,6 @@
 package cmd
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"os"
@@ -53,7 +52,11 @@ func loadFIDO2Identities(cfg *config.Config) ([]age.Identity, error) {
 
 		var pin string
 		if fido2.DeviceRequiresPIN(device.Path) {
-			pin = readFIDO2PIN()
+			var err error
+			pin, err = readFIDO2PIN()
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		fmt.Fprintln(os.Stderr, "Decrypting (touch your security key when it blinks)...")
@@ -98,7 +101,11 @@ func findFIDO2IdentityImpl(storeRecipients []string) ([]age.Identity, error) {
 
 		var pin string
 		if fido2.DeviceRequiresPIN(device.Path) {
-			pin = readFIDO2PIN()
+			var err error
+			pin, err = readFIDO2PIN()
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		fmt.Fprintln(os.Stderr, "Decrypting (touch your security key when it blinks)...")
@@ -164,7 +171,11 @@ func generateFIDO2Recipient() (string, crypto.KeyType, error) {
 	// Get PIN if device requires it
 	var pin string
 	if devInfo.RequiresPIN {
-		pin = readFIDO2PIN()
+		var err error
+		pin, err = readFIDO2PIN()
+		if err != nil {
+			return "", crypto.KeyTypeUnknown, err
+		}
 	}
 
 	// Step 1: Create credential (PIN verified first, then touch required)
@@ -194,29 +205,35 @@ func generateFIDO2Recipient() (string, crypto.KeyType, error) {
 	return recipient, crypto.KeyTypeFIDO2, nil
 }
 
-// readFIDO2PIN prompts for and reads a FIDO2 PIN securely
-func readFIDO2PIN() string {
-	fmt.Fprint(os.Stderr, "Enter PIN: ")
-	if term.IsTerminal(int(os.Stdin.Fd())) {
-		pinBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
-		fmt.Fprintln(os.Stderr)
+// readFIDO2PIN prompts for and reads a FIDO2 PIN securely. In non-interactive
+// mode (no TTY on stdin) it uses CONFCRYPT_ASKPASS (falling back to
+// SSH_ASKPASS) to obtain the PIN, or fails with an error if neither is set.
+func readFIDO2PIN() (string, error) {
+	prompt := "Enter PIN for FIDO2 device: "
+
+	if value, handled, err := askSecret(prompt); handled {
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading PIN: %v\n", err)
-			os.Exit(1)
+			return "", err
 		}
-		pin := strings.TrimSpace(string(pinBytes))
-		if pin == "" {
-			fmt.Fprintln(os.Stderr, "Error: PIN cannot be empty")
-			os.Exit(1)
+		if value == "" {
+			return "", fmt.Errorf("PIN cannot be empty (askpass returned empty value)")
 		}
-		return pin
+		return value, nil
 	}
-	reader := bufio.NewReader(os.Stdin)
-	pin, _ := reader.ReadString('\n')
-	pin = strings.TrimSpace(pin)
+
+	if isNonInteractive() {
+		return "", fmt.Errorf("cannot read FIDO2 PIN: no TTY available; set CONFCRYPT_ASKPASS (or SSH_ASKPASS) to a helper program")
+	}
+
+	fmt.Fprint(os.Stderr, prompt)
+	pinBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Fprintln(os.Stderr)
+	if err != nil {
+		return "", fmt.Errorf("error reading PIN: %w", err)
+	}
+	pin := strings.TrimSpace(string(pinBytes))
 	if pin == "" {
-		fmt.Fprintln(os.Stderr, "Error: PIN cannot be empty")
-		os.Exit(1)
+		return "", fmt.Errorf("PIN cannot be empty")
 	}
-	return pin
+	return pin, nil
 }

@@ -1,0 +1,163 @@
+#!/bin/sh
+# confcrypt-askpass - auto-detecting askpass helper for CONFCRYPT_ASKPASS
+# (also works as an SSH_ASKPASS helper).
+#
+# Usage: confcrypt-askpass "<prompt text>"
+#
+# Picks the best available GUI/agent backend for the current OS and prints
+# the entered secret to stdout:
+#
+#   macOS: osascript -> ssh-askpass -> pinentry-mac
+#   Linux: pinentry-gnome3 -> pinentry-gtk-2 -> ssh-askpass -> zenity
+#
+# See: https://github.com/maurice2k/confcrypt#non-interactive-pinpassphrase-entry-confcrypt_askpass
+
+set -eu
+
+title="confcrypt"
+prompt="${1:-Enter PIN/passphrase:}"
+
+# escape_assuan escapes '%' for the pinentry/Assuan line protocol, where '%'
+# starts an escape sequence (e.g. %0A for newline).
+escape_assuan() {
+	printf '%s' "$1" | sed 's/%/%25/g'
+}
+
+# escape_osascript escapes backslashes and double quotes for embedding into
+# an AppleScript string literal.
+escape_osascript() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+# ask_pinentry speaks the minimal pinentry/Assuan line protocol over a pair
+# of named pipes to obtain the secret via GETPIN.
+ask_pinentry() {
+	pinentry_bin="$1"
+	tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/confcrypt-askpass.XXXXXX") || return 1
+	fifo_in="$tmpdir/in"
+	fifo_out="$tmpdir/out"
+	mkfifo "$fifo_in" "$fifo_out" || {
+		rm -rf "$tmpdir"
+		return 1
+	}
+
+	"$pinentry_bin" <"$fifo_in" >"$fifo_out" &
+	pinentry_pid=$!
+	exec 3>"$fifo_in" 4<"$fifo_out"
+
+	cleanup_pinentry() {
+		printf 'BYE\n' >&3 2>/dev/null || true
+		exec 3>&- 4<&- 2>/dev/null || true
+		kill "$pinentry_pid" 2>/dev/null || true
+		wait "$pinentry_pid" 2>/dev/null || true
+		rm -rf "$tmpdir"
+	}
+
+	# Greeting + one "OK" per SET* command.
+	read -r _ <&4 || {
+		cleanup_pinentry
+		return 1
+	}
+	printf 'SETTITLE %s\n' "$(escape_assuan "$title")" >&3
+	read -r _ <&4 || {
+		cleanup_pinentry
+		return 1
+	}
+	printf 'SETDESC %s\n' "$(escape_assuan "$prompt")" >&3
+	read -r _ <&4 || {
+		cleanup_pinentry
+		return 1
+	}
+	printf 'SETPROMPT %s\n' "$(escape_assuan "PIN/Passphrase:")" >&3
+	read -r _ <&4 || {
+		cleanup_pinentry
+		return 1
+	}
+	printf 'GETPIN\n' >&3
+
+	result=""
+	ok=0
+	while IFS= read -r line <&4; do
+		case "$line" in
+		D\ *)
+			result="${line#D }"
+			;;
+		OK*)
+			ok=1
+			break
+			;;
+		ERR*)
+			ok=0
+			break
+			;;
+		esac
+	done
+
+	cleanup_pinentry
+
+	[ "$ok" = "1" ] || return 1
+	printf '%s' "$result"
+}
+
+# ask_osascript shows a native macOS password dialog with OK/Cancel buttons.
+ask_osascript() {
+	osascript -e "text returned of (display dialog \"$(escape_osascript "$prompt")\" with title \"$title\" with icon caution default answer \"\" with hidden answer buttons {\"Cancel\", \"OK\"} default button \"OK\" cancel button \"Cancel\")"
+}
+
+# ask_zenity shows a GTK password dialog via zenity (OK/Cancel buttons are
+# shown by default).
+ask_zenity() {
+	zenity --password --title="$title" --text="$prompt"
+}
+
+# ask_ssh_askpass delegates to an ssh-askpass-compatible program, which
+# already receives the prompt as argv[1].
+ask_ssh_askpass() {
+	"$1" "$prompt"
+}
+
+# Once a backend is available, commit to its result (including a user
+# cancellation) instead of silently falling through and popping up another
+# dialog from the next backend - only backend *absence* should skip ahead.
+os_name=$(uname -s)
+
+case "$os_name" in
+Darwin)
+	if command -v osascript >/dev/null 2>&1; then
+		ask_osascript
+		exit $?
+	fi
+	if ssh_askpass_bin=$(command -v ssh-askpass 2>/dev/null); then
+		ask_ssh_askpass "$ssh_askpass_bin"
+		exit $?
+	fi
+	if pinentry_bin=$(command -v pinentry-mac 2>/dev/null); then
+		ask_pinentry "$pinentry_bin"
+		exit $?
+	fi
+	;;
+Linux)
+	if pinentry_bin=$(command -v pinentry-gnome3 2>/dev/null); then
+		ask_pinentry "$pinentry_bin"
+		exit $?
+	fi
+	if pinentry_bin=$(command -v pinentry-gtk-2 2>/dev/null); then
+		ask_pinentry "$pinentry_bin"
+		exit $?
+	fi
+	if ssh_askpass_bin=$(command -v ssh-askpass 2>/dev/null); then
+		ask_ssh_askpass "$ssh_askpass_bin"
+		exit $?
+	fi
+	if command -v zenity >/dev/null 2>&1; then
+		ask_zenity
+		exit $?
+	fi
+	;;
+esac
+
+echo "confcrypt-askpass: no supported askpass backend found" >&2
+echo "  macOS tried: osascript, ssh-askpass, pinentry-mac" >&2
+echo "  Linux tried: pinentry-gnome3, pinentry-gtk-2, ssh-askpass, zenity" >&2
+echo "Install one of the above, or set CONFCRYPT_ASKPASS to your own helper." >&2
+exit 1
