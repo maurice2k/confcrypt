@@ -1,6 +1,7 @@
 package processor
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -535,6 +536,157 @@ func TestProcessorTypePreservation(t *testing.T) {
 	}
 	if data["null_secret"] != nil {
 		t.Errorf("null_secret should be nil, got %T(%v)", data["null_secret"], data["null_secret"])
+	}
+}
+
+func TestProcessorJSONNullRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	identity, err := crypto.GenerateAgeKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := createTestConfig(t, dir, []config.RecipientConfig{
+		{Name: "test", Age: identity.Recipient().String()},
+	})
+	cfg.KeysInclude = append(cfg.KeysInclude, "null_secret")
+
+	proc, err := NewProcessor(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := proc.SetupEncryption(); err != nil {
+		t.Fatal(err)
+	}
+	encrypted, modified, err := proc.ProcessContent(
+		[]byte(`{"null_secret":null}`), "test.json", true, FormatJSON)
+	if err != nil {
+		t.Fatalf("encrypting JSON null: %v", err)
+	}
+	if !modified {
+		t.Fatal("expected JSON null to be encrypted")
+	}
+	if !strings.Contains(string(encrypted), "type:null") {
+		t.Fatalf("encrypted JSON null did not retain its type: %s", encrypted)
+	}
+	if strings.Contains(string(encrypted), "yaml_tag:") {
+		t.Fatalf("JSON value unexpectedly contains YAML metadata: %s", encrypted)
+	}
+	if err := proc.SaveEncryptedSecrets(); err != nil {
+		t.Fatal(err)
+	}
+
+	decryptor, err := NewProcessor(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decryptor.SetupDecryption([]age.Identity{identity}); err != nil {
+		t.Fatal(err)
+	}
+	decrypted, modified, err := decryptor.ProcessContent(encrypted, "test.json", false, FormatJSON)
+	if err != nil {
+		t.Fatalf("decrypting JSON null: %v", err)
+	}
+	if !modified {
+		t.Fatal("expected JSON null to be decrypted")
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(decrypted, &result); err != nil {
+		t.Fatalf("parsing decrypted JSON: %v", err)
+	}
+	value, ok := result["null_secret"]
+	if !ok {
+		t.Fatal("decrypted JSON is missing null_secret")
+	}
+	if value != nil {
+		t.Fatalf("null_secret = %T(%v), want nil", value, value)
+	}
+}
+
+func TestProcessorYAMLScalarTagPreservation(t *testing.T) {
+	dir := t.TempDir()
+	identity, err := crypto.GenerateAgeKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := createTestConfig(t, dir, []config.RecipientConfig{
+		{Name: "test", Age: identity.Recipient().String()},
+	})
+	cfg.KeysInclude = append(cfg.KeysInclude,
+		"null_secret", "timestamp_secret", "binary_secret", "custom_secret")
+
+	content := []byte(`null_secret: null
+timestamp_secret: 2026-07-10T12:34:56Z
+binary_secret: !!binary SGVsbG8=
+custom_secret: !duration 5m
+`)
+
+	proc, err := NewProcessor(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := proc.SetupEncryption(); err != nil {
+		t.Fatal(err)
+	}
+	encrypted, modified, err := proc.ProcessContent(content, "test.yml", true, FormatYAML)
+	if err != nil {
+		t.Fatalf("encrypting YAML: %v", err)
+	}
+	if !modified {
+		t.Fatal("expected YAML to be encrypted")
+	}
+	if !strings.Contains(string(encrypted), "type:null") {
+		t.Fatalf("encrypted null did not retain its portable type: %s", encrypted)
+	}
+	if strings.Count(string(encrypted), "yaml_tag:") != 3 {
+		t.Fatalf("encrypted YAML tag count = %d, want 3", strings.Count(string(encrypted), "yaml_tag:"))
+	}
+	if err := proc.SaveEncryptedSecrets(); err != nil {
+		t.Fatal(err)
+	}
+
+	decryptor, err := NewProcessor(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decryptor.SetupDecryption([]age.Identity{identity}); err != nil {
+		t.Fatal(err)
+	}
+	decrypted, modified, err := decryptor.ProcessContent(encrypted, "test.yml", false, FormatYAML)
+	if err != nil {
+		t.Fatalf("decrypting YAML: %v", err)
+	}
+	if !modified {
+		t.Fatal("expected YAML to be decrypted")
+	}
+
+	var document yaml.Node
+	if err := yaml.Unmarshal(decrypted, &document); err != nil {
+		t.Fatalf("parsing decrypted YAML: %v", err)
+	}
+	root := document.Content[0]
+	want := map[string]struct {
+		tag   string
+		value string
+	}{
+		"null_secret":      {tag: "!!null", value: "null"},
+		"timestamp_secret": {tag: "!!timestamp", value: "2026-07-10T12:34:56Z"},
+		"binary_secret":    {tag: "!!binary", value: "SGVsbG8="},
+		"custom_secret":    {tag: "!duration", value: "5m"},
+	}
+	for i := 0; i < len(root.Content); i += 2 {
+		key, value := root.Content[i].Value, root.Content[i+1]
+		expected, ok := want[key]
+		if !ok {
+			continue
+		}
+		if value.Tag != expected.tag || value.Value != expected.value {
+			t.Errorf("%s = (%q, %q), want (%q, %q)", key, value.Tag, value.Value, expected.tag, expected.value)
+		}
+		delete(want, key)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing decrypted keys: %v", want)
 	}
 }
 

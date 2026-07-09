@@ -38,6 +38,7 @@ confcrypt init
 This creates a `.confcrypt.yml` with:
 - Your public key as the first recipient (auto-detected from age key or SSH key)
 - Default file patterns: `*.yml`, `*.yaml`, `*.json`
+- Default exclusions for common repository metadata, dependency, and build directories
 - Default sensitive key patterns: `/password$/`, `/api_key$/`, `/secret$/`, `/token$/`
 
 You can also specify a particular key file or hardware key:
@@ -85,7 +86,7 @@ curl -fsSL https://raw.githubusercontent.com/maurice2k/confcrypt/main/install.sh
 This installs to `/usr/local/bin` by default. To install elsewhere:
 
 ```bash
-INSTALL_DIR=~/.local/bin curl -fsSL https://raw.githubusercontent.com/maurice2k/confcrypt/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/maurice2k/confcrypt/main/install.sh | INSTALL_DIR="$HOME/.local/bin" sh
 ```
 
 
@@ -108,13 +109,13 @@ cd confcrypt
 # Build with CGO (FIDO2 support, requires libfido2)
 make build
 
-# Install to $GOPATH/bin (with CGO)
+# Install to /usr/local/bin (with CGO; override with PREFIX or BINDIR)
 make install
 
 # Build without CGO (no FIDO2 support, but portable)
 make build-nocgo
 
-# Install to $GOPATH/bin (without CGO)
+# Install to /usr/local/bin (without CGO; override with PREFIX or BINDIR)
 make install-nocgo
 
 # Cross-compile for all platforms (without CGO)
@@ -752,13 +753,16 @@ The private key is **never stored** - it's derived each time using the YubiKey.
 Values are encrypted using AES-256-GCM and stored in this format:
 
 ```
-ENC[AES256_GCM,data:<base64>,iv:<base64>,tag:<base64>,type:<type>]
+ENC[AES256_GCM,data:<base64>,iv:<base64>,tag:<base64>,type:<type>[,yaml_tag:<base64>]]
 ```
 
 - `data`: AES-GCM ciphertext (base64)
 - `iv`: 12-byte initialization vector (base64)
 - `tag`: 16-byte authentication tag (base64)
-- `type`: Original value type (`str`, `int`, `float`, `bool`, `null`)
+- `type`: Original value type (`str`, `int`, `float`, `bool`, `null`, `bytes`)
+- `yaml_tag`: Optional exact YAML scalar tag, emitted for timestamps, binary values,
+  and custom tags so they survive an encrypt/decrypt round trip. Older encrypted
+  values without this field remain fully supported.
 
 The AES-256 key is randomly generated per config and encrypted for each recipient using their public key (age or SSH).
 

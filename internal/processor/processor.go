@@ -626,11 +626,22 @@ func (p *Processor) encryptScalarValue(value string, tag string) (string, error)
 		valueType = format.TypeFloat
 	case "!!bool":
 		valueType = format.TypeBool
+	case "!!null":
+		valueType = format.TypeNull
 	}
 
 	ev, err := p.encryptPlaintext([]byte(value), valueType)
 	if err != nil {
 		return "", err
+	}
+
+	// Preserve tags that cannot be reconstructed from the portable value type.
+	// This keeps timestamps, binary scalars, and application-specific tags exact
+	// while retaining the old ENC format for common scalar types.
+	switch tag {
+	case "", "!!str", "!!int", "!!float", "!!bool", "!!null":
+	default:
+		ev.YAMLTag = tag
 	}
 
 	return format.FormatEncryptedValue(ev), nil
@@ -648,6 +659,12 @@ func (p *Processor) decryptScalarValue(encStr string) (string, string, error) {
 		return "", "", err
 	}
 
+	// Prefer the exact YAML tag stored by newer ciphertexts. Older ciphertexts
+	// reconstruct the tag from their portable value type as before.
+	if ev.YAMLTag != "" {
+		return string(plaintext), ev.YAMLTag, nil
+	}
+
 	// Determine YAML tag from stored type
 	tag := "!!str"
 	switch ev.Type {
@@ -657,6 +674,8 @@ func (p *Processor) decryptScalarValue(encStr string) (string, string, error) {
 		tag = "!!float"
 	case format.TypeBool:
 		tag = "!!bool"
+	case format.TypeNull:
+		tag = "!!null"
 	}
 
 	return string(plaintext), tag, nil
@@ -1097,7 +1116,6 @@ func (p *Processor) collectUnencryptedMatchedYAMLSequence(node *yaml.Node, paren
 		}
 	}
 }
-
 
 func (p *Processor) collectUnencryptedData(data interface{}, path []string, results *[]MatchResult) {
 	switch v := data.(type) {

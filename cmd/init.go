@@ -122,6 +122,9 @@ files:
   - "*.yaml"
   - "*.json"
 
+# Common repository, dependency, build, and test directories to ignore
+%s
+
 # Keys to encrypt (exact match, /regex/, or $path)
 # Regex patterns are case-insensitive by default
 keys_include:
@@ -139,7 +142,7 @@ keys_exclude:
 # confcrypt metadata (do not edit manually)
 .confcrypt:
   version: "%s"
-`, escapedUserName, recipientField, version)
+`, escapedUserName, recipientField, defaultFilesExcludeYAML(), version)
 
 	if err := fileutil.WriteFileAtomic(cfgPath, []byte(configContent), 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "Error writing config file: %v\n", err)
@@ -155,6 +158,26 @@ keys_exclude:
 	fmt.Printf("  Recipient: %s (%s)\n", userName, displayKey)
 	fmt.Println("\nEdit the file to customize recipients, files, and key patterns.")
 	fmt.Println("Then run 'confcrypt' to encrypt matching keys in your config files.")
+}
+
+var defaultFilesExclude = []string{
+	".git/",
+	".github/",
+	".idea/",
+	".vscode/",
+	"node_modules/",
+	"vendor/",
+	"build/",
+	"dist/",
+}
+
+func defaultFilesExcludeYAML() string {
+	var output strings.Builder
+	output.WriteString("files_exclude:\n")
+	for _, pattern := range defaultFilesExclude {
+		fmt.Fprintf(&output, "  - %q\n", pattern)
+	}
+	return strings.TrimSuffix(output.String(), "\n")
 }
 
 // getPublicKeyForInit tries to find a public key for initializing confcrypt.

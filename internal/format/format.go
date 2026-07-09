@@ -24,10 +24,11 @@ const (
 
 // EncryptedValue represents a parsed ENC[...] value
 type EncryptedValue struct {
-	Data []byte    // Ciphertext
-	IV   []byte    // Initialization vector (12 bytes)
-	Tag  []byte    // Authentication tag (16 bytes)
-	Type ValueType // Original value type
+	Data    []byte    // Ciphertext
+	IV      []byte    // Initialization vector (12 bytes)
+	Tag     []byte    // Authentication tag (16 bytes)
+	Type    ValueType // Original value type
+	YAMLTag string    // Optional exact YAML scalar tag for types not represented by Type
 }
 
 const encPrefix = "ENC[AES256_GCM,"
@@ -40,7 +41,7 @@ const FullFileHeader = "$CONFCRYPT_ENCRYPTED;"
 const ChunkLineLength = 80
 
 // encRegex matches the ENC[...] format
-var encRegex = regexp.MustCompile(`^ENC\[AES256_GCM,data:([A-Za-z0-9+/=]*),iv:([A-Za-z0-9+/=]+),tag:([A-Za-z0-9+/=]+),type:(str|int|float|bool|null|bytes)\]$`)
+var encRegex = regexp.MustCompile(`^ENC\[AES256_GCM,data:([A-Za-z0-9+/=]*),iv:([A-Za-z0-9+/=]+),tag:([A-Za-z0-9+/=]+),type:(str|int|float|bool|null|bytes)(,yaml_tag:([A-Za-z0-9+/=]+))?\]$`)
 
 // fullFileRegex matches the full file encrypted format (with optional newlines in data and before ,iv:)
 var fullFileRegex = regexp.MustCompile(`^\$CONFCRYPT_ENCRYPTED;ENC\[AES256_GCM,data:\n?([\s\S]*?)\n?,iv:([A-Za-z0-9+/=]+),tag:([A-Za-z0-9+/=]+),type:(str|int|float|bool|null|bytes)\]$`)
@@ -52,12 +53,17 @@ func IsEncrypted(s string) bool {
 
 // FormatEncryptedValue formats an encrypted value into the ENC[...] string format
 func FormatEncryptedValue(ev *EncryptedValue) string {
-	return fmt.Sprintf("%sdata:%s,iv:%s,tag:%s,type:%s%s",
+	yamlTag := ""
+	if ev.YAMLTag != "" {
+		yamlTag = ",yaml_tag:" + base64.StdEncoding.EncodeToString([]byte(ev.YAMLTag))
+	}
+	return fmt.Sprintf("%sdata:%s,iv:%s,tag:%s,type:%s%s%s",
 		encPrefix,
 		base64.StdEncoding.EncodeToString(ev.Data),
 		base64.StdEncoding.EncodeToString(ev.IV),
 		base64.StdEncoding.EncodeToString(ev.Tag),
 		ev.Type,
+		yamlTag,
 		encSuffix,
 	)
 }
@@ -92,11 +98,24 @@ func ParseEncryptedValue(s string) (*EncryptedValue, error) {
 		return nil, fmt.Errorf("invalid tag length: expected 16, got %d", len(tag))
 	}
 
+	var yamlTag string
+	if matches[6] != "" {
+		decodedTag, err := base64.StdEncoding.DecodeString(matches[6])
+		if err != nil {
+			return nil, fmt.Errorf("invalid base64 in yaml_tag field: %w", err)
+		}
+		if len(decodedTag) == 0 {
+			return nil, fmt.Errorf("yaml_tag field must not be empty")
+		}
+		yamlTag = string(decodedTag)
+	}
+
 	return &EncryptedValue{
-		Data: data,
-		IV:   iv,
-		Tag:  tag,
-		Type: ValueType(matches[4]),
+		Data:    data,
+		IV:      iv,
+		Tag:     tag,
+		Type:    ValueType(matches[4]),
+		YAMLTag: yamlTag,
 	}, nil
 }
 

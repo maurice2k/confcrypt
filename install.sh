@@ -69,6 +69,14 @@ fi
 # Make executable
 chmod +x "$TMP_FILE"
 
+# Create the install directory when a custom path does not exist yet.
+if [ ! -d "$INSTALL_DIR" ]; then
+    if ! mkdir -p "$INSTALL_DIR" 2>/dev/null; then
+        echo "Creating ${INSTALL_DIR} (requires sudo)..."
+        sudo mkdir -p "$INSTALL_DIR"
+    fi
+fi
+
 # Install (may need sudo)
 if [ -w "$INSTALL_DIR" ]; then
     mv "$TMP_FILE" "${INSTALL_DIR}/${BINARY_NAME}"

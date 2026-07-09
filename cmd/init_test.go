@@ -3,10 +3,25 @@ package cmd
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 
 	"github.com/maurice2k/confcrypt/internal/crypto"
 )
+
+func TestDefaultFilesExcludeYAML(t *testing.T) {
+	var parsed struct {
+		FilesExclude []string `yaml:"files_exclude"`
+	}
+	if err := yaml.Unmarshal([]byte(defaultFilesExcludeYAML()), &parsed); err != nil {
+		t.Fatalf("default exclusions are not valid YAML: %v", err)
+	}
+	if !reflect.DeepEqual(parsed.FilesExclude, defaultFilesExclude) {
+		t.Fatalf("default exclusions = %v, want %v", parsed.FilesExclude, defaultFilesExclude)
+	}
+}
 
 func TestGetPublicKeyFromAgeFile(t *testing.T) {
 	tmpDir := t.TempDir()

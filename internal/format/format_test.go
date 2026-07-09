@@ -385,6 +385,29 @@ func TestParseEncryptedValue(t *testing.T) {
 	}
 }
 
+func TestFormatParseEncryptedValuePreservesYAMLTag(t *testing.T) {
+	ev := &EncryptedValue{
+		Data:    []byte("2026-07-10T12:34:56Z"),
+		IV:      []byte("123456789012"),
+		Tag:     []byte("1234567890123456"),
+		Type:    TypeString,
+		YAMLTag: "!!timestamp",
+	}
+
+	formatted := FormatEncryptedValue(ev)
+	if !IsEncrypted(formatted) {
+		t.Fatalf("value with YAML tag is not recognized as encrypted: %s", formatted)
+	}
+
+	parsed, err := ParseEncryptedValue(formatted)
+	if err != nil {
+		t.Fatalf("ParseEncryptedValue failed: %v", err)
+	}
+	if parsed.YAMLTag != ev.YAMLTag {
+		t.Fatalf("YAML tag = %q, want %q", parsed.YAMLTag, ev.YAMLTag)
+	}
+}
+
 func TestParseEncryptedValueAllTypes(t *testing.T) {
 	types := []ValueType{TypeString, TypeInt, TypeFloat, TypeBool, TypeNull}
 
