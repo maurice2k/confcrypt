@@ -185,18 +185,32 @@ func FindDeviceByCredential(credentialID []byte, rpID string, aaguid []byte) (*D
 		return nil, fmt.Errorf("failed to generate client data hash: %w", err)
 	}
 
-	for _, dev := range candidates {
+	return selectCredentialOwner(candidates, func(dev Device) error {
 		device, err := libfido2.NewDevice(dev.Path)
 		if err != nil {
-			continue
+			return err
 		}
 
 		// Silent probe: up=false means the device reports credential ownership
 		// without requiring a touch. The credential is bound to this device, so a
-		// non-owning device returns a no-credentials/not-allowed error instead.
+		// non-owning device returns a credential rejection instead.
 		_, err = device.Assertion(rpID, cdh, [][]byte{credentialID}, "", &libfido2.AssertionOpts{
 			UP: libfido2.False,
 		})
+		return err
+	})
+}
+
+// selectCredentialOwner returns the candidate that owns a credential based on
+// touch-free assertion results. A sole remaining candidate is only used as a
+// fallback when its probe is inconclusive, never after it explicitly rejects
+// the credential.
+func selectCredentialOwner(candidates []Device, probe func(Device) error) (*Device, error) {
+	var inconclusiveCandidate *Device
+	inconclusiveCount := 0
+
+	for _, dev := range candidates {
+		err := probe(dev)
 
 		// Success or "user presence required" both mean the device owns the
 		// credential (some authenticators always enforce UP and answer this way).
@@ -206,15 +220,23 @@ func FindDeviceByCredential(credentialID []byte, rpID string, aaguid []byte) (*D
 			d := dev
 			return &d, nil
 		}
-		// ErrNoCredentials / ErrNotAllowed / ErrInvalidCredential -> not this device.
+
+		// These errors conclusively mean the credential does not belong to this
+		// device. Other errors leave ownership unknown and preserve the legacy
+		// fallback for authenticators that cannot perform a silent assertion.
+		if !errors.Is(err, libfido2.ErrNoCredentials) &&
+			!errors.Is(err, libfido2.ErrInvalidCredential) {
+			d := dev
+			inconclusiveCandidate = &d
+			inconclusiveCount++
+		}
 	}
 
 	// Probe inconclusive (e.g. an authenticator that refuses silent assertions).
-	// With a single same-model candidate it's safe to use it; with several we
-	// can't disambiguate without a touch, so refuse rather than guess.
-	if len(candidates) == 1 {
-		d := candidates[0]
-		return &d, nil
+	// With one remaining candidate it's safe to use it; with several we can't
+	// disambiguate without a touch, so refuse rather than guess.
+	if inconclusiveCount == 1 {
+		return inconclusiveCandidate, nil
 	}
 
 	return nil, ErrDeviceNotFound

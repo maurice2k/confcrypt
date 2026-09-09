@@ -119,8 +119,11 @@ flowchart TD
     filter -->|no match| notfound[ErrDeviceNotFound -> next recipient]
     filter -->|candidates| probe[silent credential probe up=false]
     probe -->|owns credential| use[use this device]
-    probe -->|none, single candidate| use
-    probe -->|none, multiple| ambig[ErrDeviceNotFound]
+    probe -->|candidate rejects credential| next[next candidate]
+    next --> probe
+    probe -->|all candidates reject| notfound
+    probe -->|one inconclusive candidate remains| use
+    probe -->|multiple inconclusive candidates| ambig[ErrDeviceNotFound]
     use --> pin[prompt PIN if required]
     pin --> derive[ToAgeIdentity]
     derive -->|ErrWrongPIN| warn[show attempts left, STOP]
@@ -132,11 +135,11 @@ flowchart TD
 2. **Silent credential probe**: among same-model candidates, perform an assertion
    with `UP=false`, no PIN, and no extensions, passing the stored `CredentialID`.
    The owning device answers (`nil` / `user presence required`); a non-owning
-   device returns a no-credentials error. This is how two same-model keys are
-   disambiguated. The probe requires **no touch and never decrements the PIN
-   retry counter**. If the probe is inconclusive but exactly one same-model
-   candidate exists, it is used; with several, *confcrypt* refuses rather than
-   guess.
+   device explicitly rejects the credential. This is how two same-model keys
+   are disambiguated. The probe requires **no touch and never decrements the PIN
+   retry counter**. A rejection eliminates that candidate. If exactly one
+   candidate remains inconclusive, it is used; with several, *confcrypt*
+   refuses rather than guess.
 3. **PIN prompt** (only if the device requires one).
 4. **Re-derivation** (`getHMACSecret(salt)` -> `DeriveAgeKeyPair`): the derived
    public key is compared against the stored `PubKey`; a mismatch means the wrong
