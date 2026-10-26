@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/maurice2k/confcrypt/internal/config"
+	"github.com/maurice2k/confcrypt/internal/doc"
 	"github.com/maurice2k/confcrypt/internal/format"
 )
 
@@ -184,74 +185,86 @@ func matchPath(pattern []string, absolute bool, path []string) bool {
 type MatchResult struct {
 	Path      []string // Full path to the key
 	KeyName   string   // Name of the key
-	Value     interface{}
-	Encrypted bool // Whether the value is already encrypted
+	Value     string   // Textual value (empty for containers)
+	Encrypted bool     // Whether the value is already encrypted
 }
 
-// FindMatchingKeys traverses a data structure and finds all keys that should be encrypted
-func (m *Matcher) FindMatchingKeys(data interface{}) []MatchResult {
+// FindMatchingKeys walks a document and reports every value the rules
+// select, encrypted or not. Aliases are only followed when their key
+// matched, mirroring the encryption walk.
+func (m *Matcher) FindMatchingKeys(root doc.Node) []MatchResult {
 	var results []MatchResult
-	m.traverse(data, nil, &results)
+	m.traverse(root, nil, &results)
 	return results
 }
 
-// traverse recursively walks the data structure
-func (m *Matcher) traverse(data interface{}, path []string, results *[]MatchResult) {
-	switch v := data.(type) {
-	case map[string]interface{}:
-		for key, val := range v {
+func (m *Matcher) traverse(node doc.Node, path []string, results *[]MatchResult) {
+	if node == nil {
+		return
+	}
+	switch node.Kind() {
+	case doc.Mapping:
+		for i := 0; i < node.Len(); i++ {
+			key := node.Key(i)
+			value := node.Item(i)
 			currentPath := clonePath(path, key)
+			matched := m.ShouldEncrypt(key, currentPath)
 
-			// Check if this is a leaf value that should be encrypted
-			if IsLeafValue(val) {
-				if m.ShouldEncrypt(key, currentPath) {
-					encrypted := false
-					if s, ok := val.(string); ok {
-						encrypted = format.IsEncrypted(s)
-					}
+			if value.IsAlias() {
+				if !matched {
+					continue
+				}
+				value = value.Target()
+			}
+
+			switch {
+			case value.Kind() == doc.Scalar:
+				if matched {
 					*results = append(*results, MatchResult{
 						Path:      currentPath,
 						KeyName:   key,
-						Value:     val,
-						Encrypted: encrypted,
+						Value:     value.Value(),
+						Encrypted: format.IsEncrypted(value.Value()),
 					})
 				}
-			} else if arr, ok := val.([]interface{}); ok && m.ShouldEncrypt(key, currentPath) {
+			case matched && value.Kind() == doc.Sequence:
 				// A matched key whose value is a list: report the leaf items
-				m.traverseMatchedSlice(arr, path, key, results)
-			} else {
-				// Recurse into nested structures
-				m.traverse(val, currentPath, results)
+				m.traverseMatchedSequence(value, path, key, results)
+			default:
+				m.traverse(value, currentPath, results)
 			}
 		}
 
-	case []interface{}:
-		for _, item := range v {
-			// For arrays, we don't add to path for matching purposes
-			// but we do recurse into objects within arrays
+	case doc.Sequence:
+		for i := 0; i < node.Len(); i++ {
+			item := node.Item(i)
+			if item.IsAlias() {
+				continue
+			}
+			// Lists don't add to the path, but mappings inside them are visited
 			m.traverse(item, path, results)
 		}
 	}
 }
 
-// traverseMatchedSlice reports the leaf items of a list whose key matched
-func (m *Matcher) traverseMatchedSlice(arr []interface{}, parentPath []string, key string, results *[]MatchResult) {
-	for i, item := range arr {
-		switch nested := item.(type) {
-		case []interface{}:
-			m.traverseMatchedSlice(nested, parentPath, fmt.Sprintf("%s[%d]", key, i), results)
-		case map[string]interface{}:
-			m.traverse(nested, clonePath(parentPath, key), results)
+// traverseMatchedSequence reports the leaf items of a list whose key matched
+func (m *Matcher) traverseMatchedSequence(node doc.Node, parentPath []string, key string, results *[]MatchResult) {
+	for i := 0; i < node.Len(); i++ {
+		item := node.Item(i)
+		if item.IsAlias() {
+			continue
+		}
+		switch item.Kind() {
+		case doc.Sequence:
+			m.traverseMatchedSequence(item, parentPath, fmt.Sprintf("%s[%d]", key, i), results)
+		case doc.Mapping:
+			m.traverse(item, clonePath(parentPath, key), results)
 		default:
-			encrypted := false
-			if s, ok := item.(string); ok {
-				encrypted = format.IsEncrypted(s)
-			}
 			*results = append(*results, MatchResult{
 				Path:      clonePath(parentPath, fmt.Sprintf("%s[%d]", key, i)),
 				KeyName:   key,
-				Value:     item,
-				Encrypted: encrypted,
+				Value:     item.Value(),
+				Encrypted: format.IsEncrypted(item.Value()),
 			})
 		}
 	}
@@ -263,14 +276,4 @@ func clonePath(path []string, key string) []string {
 	copy(currentPath, path)
 	currentPath[len(path)] = key
 	return currentPath
-}
-
-// IsLeafValue checks if a value is a leaf (not a map or slice)
-func IsLeafValue(v interface{}) bool {
-	switch v.(type) {
-	case map[string]interface{}, []interface{}:
-		return false
-	default:
-		return true
-	}
 }

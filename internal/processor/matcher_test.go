@@ -1,9 +1,11 @@
 package processor
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/maurice2k/confcrypt/internal/config"
+	"github.com/maurice2k/confcrypt/internal/doc"
 )
 
 func TestExactMatch(t *testing.T) {
@@ -151,6 +153,15 @@ func TestExcludeRules(t *testing.T) {
 	}
 }
 
+func jsonRoot(t *testing.T, src string) doc.Node {
+	t.Helper()
+	d, err := doc.ParseJSON([]byte(src))
+	if err != nil {
+		t.Fatalf("ParseJSON: %v", err)
+	}
+	return d.Root()
+}
+
 func TestFindMatchingKeys(t *testing.T) {
 	include := []config.KeyRule{
 		{Key: "/password$/", Type: "regex"},
@@ -162,38 +173,20 @@ func TestFindMatchingKeys(t *testing.T) {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
 
-	data := map[string]interface{}{
-		"db": map[string]interface{}{
-			"password": "secret123",
-			"host":     "localhost",
-		},
-		"api_key": "key123",
-		"name":    "test",
-	}
-
-	results := matcher.FindMatchingKeys(data)
+	results := matcher.FindMatchingKeys(jsonRoot(t, `{
+		"db": {"password": "secret123", "host": "localhost"},
+		"api_key": "ENC[AES256_GCM,data:x,iv:y,tag:z,type:str]",
+		"name": "test"
+	}`))
 
 	if len(results) != 2 {
-		t.Errorf("Expected 2 matching keys, got %d", len(results))
+		t.Fatalf("Expected 2 matching keys, got %d", len(results))
 	}
-
-	// Check that we found the right keys
-	foundPassword := false
-	foundApiKey := false
-	for _, r := range results {
-		if r.KeyName == "password" {
-			foundPassword = true
-		}
-		if r.KeyName == "api_key" {
-			foundApiKey = true
-		}
+	if results[0].KeyName != "password" || results[0].Value != "secret123" || results[0].Encrypted {
+		t.Errorf("unexpected first result: %+v", results[0])
 	}
-
-	if !foundPassword {
-		t.Error("Expected to find 'password' key")
-	}
-	if !foundApiKey {
-		t.Error("Expected to find 'api_key' key")
+	if results[1].KeyName != "api_key" || !results[1].Encrypted {
+		t.Errorf("unexpected second result: %+v", results[1])
 	}
 }
 
@@ -205,27 +198,14 @@ func TestFindMatchingKeysNested(t *testing.T) {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
 
-	data := map[string]interface{}{
-		"level1": map[string]interface{}{
-			"level2": map[string]interface{}{
-				"level3": map[string]interface{}{
-					"password": "deep_secret",
-				},
-			},
-		},
-	}
-
-	results := matcher.FindMatchingKeys(data)
+	results := matcher.FindMatchingKeys(jsonRoot(t, `{"level1": {"level2": {"level3": {"password": "deep_secret"}}}}`))
 
 	if len(results) != 1 {
-		t.Errorf("Expected 1 matching key, got %d", len(results))
+		t.Fatalf("Expected 1 matching key, got %d", len(results))
 	}
-
-	if len(results) > 0 {
-		expectedPath := []string{"level1", "level2", "level3", "password"}
-		if len(results[0].Path) != len(expectedPath) {
-			t.Errorf("Path length mismatch: got %v, expected %v", results[0].Path, expectedPath)
-		}
+	expectedPath := []string{"level1", "level2", "level3", "password"}
+	if strings.Join(results[0].Path, ".") != strings.Join(expectedPath, ".") {
+		t.Errorf("Path mismatch: got %v, expected %v", results[0].Path, expectedPath)
 	}
 }
 
@@ -237,23 +217,32 @@ func TestFindMatchingKeysInArray(t *testing.T) {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
 
-	data := map[string]interface{}{
-		"users": []interface{}{
-			map[string]interface{}{
-				"name":     "user1",
-				"password": "pass1",
-			},
-			map[string]interface{}{
-				"name":     "user2",
-				"password": "pass2",
-			},
-		},
-	}
-
-	results := matcher.FindMatchingKeys(data)
+	results := matcher.FindMatchingKeys(jsonRoot(t, `{"users": [
+		{"name": "user1", "password": "pass1"},
+		{"name": "user2", "password": "pass2"}
+	]}`))
 
 	if len(results) != 2 {
 		t.Errorf("Expected 2 matching keys (one per user), got %d", len(results))
+	}
+}
+
+func TestFindMatchingKeysMatchedList(t *testing.T) {
+	include := []config.KeyRule{{Key: "secrets", Type: "exact"}}
+
+	matcher, err := NewMatcher(include, nil)
+	if err != nil {
+		t.Fatalf("NewMatcher failed: %v", err)
+	}
+
+	results := matcher.FindMatchingKeys(jsonRoot(t, `{"secrets": ["a", ["b"], {"secrets": "c"}]}`))
+	var paths []string
+	for _, r := range results {
+		paths = append(paths, strings.Join(r.Path, "."))
+	}
+	want := "secrets[0] secrets[1][0] secrets.secrets"
+	if got := strings.Join(paths, " "); got != want {
+		t.Errorf("paths: got %q, want %q", got, want)
 	}
 }
 

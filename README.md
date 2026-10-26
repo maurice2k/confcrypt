@@ -11,7 +11,7 @@ A command-line tool for encrypting sensitive values in YAML and JSON configurati
 - **SSH key support**: Use existing SSH keys (ed25519, RSA) alongside native age keys
 - **FIDO2 support**: Derive keys from FIDO2 hmac-secret extension (requires CGO build)
 - **YubiKey support**: Derive keys from YubiKey HMAC challenge-response (OTP slot)
-- **Format preservation**: Maintains YAML/JSON structure and comments
+- **Format preservation**: YAML keeps comments and structure; JSON is rewritten losslessly (key order, indentation, comments and trailing commas in JSONC files all survive)
 - **In-place editing**: `edit` opens a decrypted copy in your editor and re-encrypts on save, keeping untouched ciphertexts stable
 - **Flexible key matching**: Exact names, regex patterns, or JSON paths
 - **Idempotent**: Re-running encryption leaves already-encrypted values unchanged
@@ -455,7 +455,7 @@ When using `--output-tar`:
 
 ### File format overrides
 
-By default, *confcrypt* detects file formats by extension (`.yml`/`.yaml` = YAML, `.json` = JSON, `.env` = env). You can override this by appending a format suffix to file patterns:
+By default, *confcrypt* detects file formats by extension (`.yml`/`.yaml` = YAML, `.json`/`.jsonc` = JSON, `.env` = env). You can override this by appending a format suffix to file patterns:
 
 ```yaml
 files:
@@ -466,6 +466,8 @@ files:
 ```
 
 Supported format overrides: `:full`, `:yaml`, `:json`, `:env`.
+
+**JSON files are rewritten losslessly.** Only the values that are encrypted or decrypted change; key order, indentation, spacing, string escapes and number formatting are copied from the original. Comments (`//` and `/* */`) and trailing commas are accepted and preserved, so VS Code style `.jsonc` files work as-is. Files with duplicate object keys are rejected, since the duplicates could not be matched or encrypted unambiguously.
 
 **Full-file encryption** encrypts the entire file contents (not individual keys). This is useful for binary or opaque content like private keys, certificates, and keystores. Encrypted files use a chunked base64 format with a `$CONFCRYPT_ENCRYPTED;` header.
 
