@@ -24,7 +24,7 @@ func TestPerformRekeyRotatesKeyAndReencryptsFiles(t *testing.T) {
 	}
 	oldSecret := cfg.Confcrypt.Store[0].Secret
 
-	rekeyedFiles, err := performRekey(cfg, []age.Identity{identity})
+	rekeyedFiles, err := performRekey(cfg, []age.Identity{identity}, nil)
 	if err != nil {
 		t.Fatalf("performRekey failed: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestPerformRekeyWithoutEncryptedFilesRotatesKeyOnly(t *testing.T) {
 		t.Fatalf("Failed to write plain file: %v", err)
 	}
 
-	rekeyedFiles, err := performRekey(cfg, []age.Identity{identity})
+	rekeyedFiles, err := performRekey(cfg, []age.Identity{identity}, nil)
 	if err != nil {
 		t.Fatalf("performRekey failed: %v", err)
 	}

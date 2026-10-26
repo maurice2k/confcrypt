@@ -140,7 +140,7 @@ api_key: myapikey
 	}
 }
 
-func TestAddMissingStoreRecipients(t *testing.T) {
+func TestAddStoreRecipients(t *testing.T) {
 	dir := t.TempDir()
 
 	alice, _ := crypto.GenerateAgeKeypair()
@@ -167,9 +167,9 @@ func TestAddMissingStoreRecipients(t *testing.T) {
 	}
 	proc2, _ := NewProcessor(cfg, identityLoader)
 
-	added, err := proc2.AddMissingStoreRecipients()
+	added, err := proc2.AddStoreRecipients([]string{bob.Recipient().String()})
 	if err != nil {
-		t.Fatalf("AddMissingStoreRecipients: %v", err)
+		t.Fatalf("AddStoreRecipients: %v", err)
 	}
 	if len(added) != 1 || added[0] != bob.Recipient().String() {
 		t.Fatalf("expected Bob added, got %v", added)
@@ -189,14 +189,142 @@ func TestAddMissingStoreRecipients(t *testing.T) {
 		t.Fatalf("Bob could not decrypt key after being added: %v", err)
 	}
 
-	// Calling again with no new recipients is a no-op.
+	// Calling again for a recipient already in the store is a no-op.
 	proc3, _ := NewProcessor(cfg, identityLoader)
-	added2, err := proc3.AddMissingStoreRecipients()
+	added2, err := proc3.AddStoreRecipients([]string{bob.Recipient().String()})
 	if err != nil {
-		t.Fatalf("AddMissingStoreRecipients (2nd): %v", err)
+		t.Fatalf("AddStoreRecipients (2nd): %v", err)
 	}
 	if len(added2) != 0 {
 		t.Fatalf("expected no additions on second run, got %v", added2)
+	}
+
+	// A key that is not a configured recipient is rejected.
+	carol, _ := crypto.GenerateAgeKeypair()
+	if _, err := proc3.AddStoreRecipients([]string{carol.Recipient().String()}); err == nil {
+		t.Fatal("expected error for unconfigured recipient")
+	}
+}
+
+func TestEncryptStoreEntriesExcludesRecipients(t *testing.T) {
+	dir := t.TempDir()
+
+	alice, _ := crypto.GenerateAgeKeypair()
+	bob, _ := crypto.GenerateAgeKeypair()
+	cfg := createTestConfig(t, dir, []config.RecipientConfig{
+		{Name: "Alice", Age: alice.Recipient().String()},
+		{Name: "Bob", Age: bob.Recipient().String()},
+	})
+	proc, _ := NewProcessor(cfg, nil)
+	if err := proc.SetupEncryption(); err != nil {
+		t.Fatalf("setup encryption: %v", err)
+	}
+	if err := proc.SaveEncryptedSecrets(bob.Recipient().String()); err != nil {
+		t.Fatalf("save secrets: %v", err)
+	}
+
+	cfg, _ = config.Load(cfg.ConfigPath())
+	if len(cfg.Confcrypt.Store) != 1 || cfg.Confcrypt.Store[0].Recipient != alice.Recipient().String() {
+		t.Fatalf("expected only Alice in store, got %+v", cfg.Confcrypt.Store)
+	}
+	procBob, _ := NewProcessor(cfg, nil)
+	if _, err := procBob.SetupDecryption([]age.Identity{bob}); err == nil {
+		t.Fatal("excluded recipient must not be able to decrypt the key")
+	}
+}
+
+func TestCiphertextReuseKeepsUntouchedValuesStable(t *testing.T) {
+	dir := t.TempDir()
+
+	identity, _ := crypto.GenerateAgeKeypair()
+	cfg := createTestConfig(t, dir, []config.RecipientConfig{
+		{Name: "test", Age: identity.Recipient().String()},
+	})
+
+	original := []byte(`db:
+  password: secret123
+  port: 5432
+api_key: myapikey
+secret:
+  - one
+  - one
+`)
+	proc, _ := NewProcessor(cfg, nil)
+	if err := proc.SetupEncryption(); err != nil {
+		t.Fatalf("setup encryption: %v", err)
+	}
+	encrypted, _, err := proc.ProcessContent(original, "test.yml", true, FormatYAML)
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	if err := proc.SaveEncryptedSecrets(); err != nil {
+		t.Fatalf("save secrets: %v", err)
+	}
+
+	// Round-trip through a fresh processor with reuse enabled: decrypt,
+	// change one value, encrypt again
+	cfg, _ = config.Load(cfg.ConfigPath())
+	proc2, _ := NewProcessor(cfg, nil)
+	if err := proc2.SetupEncryptionWithIdentities([]age.Identity{identity}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	proc2.EnableCiphertextReuse()
+	plaintext, _, err := proc2.ProcessContent(encrypted, "test.yml", false, FormatYAML)
+	if err != nil {
+		t.Fatalf("decrypt: %v", err)
+	}
+	edited := strings.Replace(string(plaintext), "myapikey", "newapikey", 1)
+	reencrypted, _, err := proc2.ProcessContent([]byte(edited), "test.yml", true, FormatYAML)
+	if err != nil {
+		t.Fatalf("re-encrypt: %v", err)
+	}
+
+	encLines := strings.Split(string(encrypted), "\n")
+	reLines := strings.Split(string(reencrypted), "\n")
+	if len(encLines) != len(reLines) {
+		t.Fatalf("line count differs:\n%s\n---\n%s", encrypted, reencrypted)
+	}
+	for i := range encLines {
+		changed := encLines[i] != reLines[i]
+		isAPIKey := strings.HasPrefix(encLines[i], "api_key:")
+		if isAPIKey && !changed {
+			t.Errorf("edited value should have fresh ciphertext: %s", reLines[i])
+		}
+		if !isAPIKey && changed {
+			t.Errorf("untouched line %d changed:\n  %s\n  %s", i, encLines[i], reLines[i])
+		}
+	}
+
+	// Duplicate list items are each reused once, so both keep their own
+	// original ciphertext rather than collapsing onto a shared one
+	if reLines[5] == reLines[6] {
+		t.Errorf("duplicate list items must not share ciphertext:\n%s", reencrypted)
+	}
+
+	// The re-encrypted file still decrypts to the edited plaintext
+	proc3, _ := NewProcessor(cfg, nil)
+	if _, err := proc3.SetupDecryption([]age.Identity{identity}); err != nil {
+		t.Fatalf("setup decryption: %v", err)
+	}
+	roundTrip, _, err := proc3.ProcessContent(reencrypted, "test.yml", false, FormatYAML)
+	if err != nil {
+		t.Fatalf("decrypt re-encrypted: %v", err)
+	}
+	if string(roundTrip) != edited {
+		t.Errorf("round trip mismatch:\n%s\n---\n%s", roundTrip, edited)
+	}
+
+	// Without reuse, every ciphertext is fresh
+	proc4, _ := NewProcessor(cfg, nil)
+	if err := proc4.SetupEncryptionWithIdentities([]age.Identity{identity}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	fresh, _, err := proc4.ProcessContent(plaintext, "test.yml", true, FormatYAML)
+	if err != nil {
+		t.Fatalf("encrypt without reuse: %v", err)
+	}
+	if string(fresh) == string(encrypted) {
+		t.Error("expected fresh ciphertexts without reuse enabled")
 	}
 }
 

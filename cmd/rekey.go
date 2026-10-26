@@ -47,6 +47,9 @@ func runRekey(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
+	// Hand-added recipients only get the new key once confirmed (or with --grant)
+	_, denied := confirmPendingGrants(cfg)
+
 	// Load identities to decrypt current values
 	identities, err := LoadDecryptionIdentity(cfg, rekeyAgeKeyFile, rekeySSHKeyFile, rekeyYubiKeyFlag, rekeyFIDO2Flag)
 	if err != nil {
@@ -54,7 +57,7 @@ func runRekey(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	rekeyedFiles, err := performRekey(cfg, identities)
+	rekeyedFiles, err := performRekey(cfg, identities, denied)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)

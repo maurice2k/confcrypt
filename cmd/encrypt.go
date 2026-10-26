@@ -143,10 +143,13 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 	// Check if secrets already exist (we'll reuse the key, no need to re-save secrets)
 	hadSecrets := cfg.HasSecrets()
 
-	// Recipients added by hand-editing .confcrypt.yml are wrapped with the
-	// existing AES key and appended to the store (see store sync below).
-	missingRecipients := missingStoreRecipients(cfg)
-	willSyncStore := hadSecrets && len(missingRecipients) > 0 && !toStdout
+	// Recipients added by hand-editing .confcrypt.yml only get the existing
+	// AES key once confirmed (or with --grant); see store sync below.
+	var grantList []string
+	if hadSecrets && !toStdout {
+		grantList, _ = confirmPendingGrants(cfg)
+	}
+	willSyncStore := len(grantList) > 0
 
 	// Stage all outputs in memory first; nothing is written to disk until
 	// every file processed successfully and the key store is persisted
@@ -207,13 +210,13 @@ func runEncrypt(cmd *cobra.Command, args []string) {
 	}
 
 	if !toStdout {
-		// Sync the store: wrap the existing AES key for recipients that were
-		// added to the config by hand. ensureEncryptionSetup (inside) reuses
-		// the setup already done by the encrypt loop, so this never triggers a
+		// Sync the store: wrap the existing AES key for the confirmed
+		// hand-added recipients. ensureEncryptionSetup (inside) reuses the
+		// setup already done by the encrypt loop, so this never triggers a
 		// second hardware-key prompt.
 		var addedRecipients []string
 		if willSyncStore {
-			addedRecipients, err = proc.AddMissingStoreRecipients()
+			addedRecipients, err = proc.AddStoreRecipients(grantList)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error updating recipient store: %v\n", err)
 				os.Exit(1)

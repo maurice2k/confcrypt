@@ -12,6 +12,7 @@ A command-line tool for encrypting sensitive values in YAML and JSON configurati
 - **FIDO2 support**: Derive keys from FIDO2 hmac-secret extension (requires CGO build)
 - **YubiKey support**: Derive keys from YubiKey HMAC challenge-response (OTP slot)
 - **Format preservation**: Maintains YAML/JSON structure and comments
+- **In-place editing**: `edit` opens a decrypted copy in your editor and re-encrypts on save, keeping untouched ciphertexts stable
 - **Flexible key matching**: Exact names, regex patterns, or JSON paths
 - **Idempotent**: Re-running encryption leaves already-encrypted values unchanged
 - **CI-friendly**: `check` command returns exit code 1 if unencrypted secrets found (also usable as pre-commit hook)
@@ -239,6 +240,7 @@ Commands:
   init            Initialize a new .confcrypt.yml config file
   encrypt         Encrypt matching keys (default)
   decrypt         Decrypt encrypted values
+  edit            Edit a file with its values decrypted, re-encrypting on save
   check           Check for unencrypted keys (exit 1 if found)
   rekey           Rotate the AES-256 key and re-encrypt all values
   recipient add   Add a recipient (public key required, --name optional)
@@ -250,6 +252,7 @@ Global Options:
   --config string      Path to .confcrypt.yml config file (overrides --path)
   --file string        Process a specific file only
   --stdout             Output to stdout instead of modifying files in-place
+  --grant              Grant key access to recipients added to .confcrypt.yml by hand without asking
   -q, --quiet          Reduce output (repeatable: -q, -qq, -qqq)
   --version            Show version
   --help               Show help
@@ -263,6 +266,10 @@ Decrypt Options:
   --output-tar string  Write decrypted files to tar archive (use '-' for stdout)
   --force              Continue decryption even if MAC verification fails
   --clear-secrets      Clear encrypted AES key store after all in-place encrypted values are removed
+
+Edit Options:
+  --editor string      Editor command (default: $VISUAL, $EDITOR, or vi)
+  --force              Edit even if MAC verification fails
 ```
 
 ### Quiet output (`-q`)
@@ -401,6 +408,22 @@ confcrypt decrypt --clear-secrets
 confcrypt decrypt --stdout config.yml
 ```
 
+### Edit a file in place (`edit`)
+
+```bash
+confcrypt edit config.yml
+```
+
+`edit` decrypts the file into a temporary copy in a directory only you can read, opens it in your editor (`--editor`, `$VISUAL`, `$EDITOR`, or `vi`), and writes it back encrypted when the editor exits. The temporary copy is removed afterwards.
+
+- If you make no changes, nothing is written.
+- Values you did not touch keep their exact ciphertext, so `git diff` only shows the values you changed.
+- The MAC is verified first; use `--force` to edit a file that fails verification.
+- A file that was still in plaintext is encrypted (and renamed, if `files_rename` applies) on save, like `confcrypt encrypt` would do.
+- The file must match a pattern in the `files` list. Key selection flags (`--age-key`, `--ssh-key`, `--fido2-key`, `--yubikey-key`) work as for `decrypt`.
+
+Editors that fork and return immediately need their "wait" flag, e.g. `--editor "code --wait"`.
+
 ### Decrypt to a different directory
 
 ```bash
@@ -533,13 +556,23 @@ recipients:
     fido2: age1fido21qpqgzyfh3lf67ksge6gu9j37grr3ru8prs9h8su6rwcya0w8ncz54ajwvz0kzm3gd2p8ng7...
 ```
 
-The next `confcrypt encrypt` detects recipients that are missing from the encrypted key store and wraps the existing AES-256 key for them automatically (no rekey, same key), printing:
+The next `confcrypt encrypt` detects recipients that are missing from the encrypted key store and asks whether to wrap the existing AES-256 key for them (no rekey, same key):
 
 ```text
+Recipient Moritz Fain (age1fido21qpqgzyfh3lf67ksge6gu9j37grr3ru8prs9h8su6...) is listed in .confcrypt.yml but has no access to the encryption key yet.
+Grant access? [y/N] y
 Granted access to new recipient: Moritz Fain (age1fido21qpqgzyfh3lf67ksge6gu9j37grr3ru8prs9h8su6...)
 ```
 
-This runs even when there is nothing new to encrypt. Removing a recipient line is **not** auto-handled: a leftover store entry still grants access to the current key, so `encrypt` only warns about stale entries and leaves real revocation to `confcrypt rekey` (which rotates the key and drops them).
+The confirmation exists because anyone with write access to the repository can append a recipient line; without it, the next teammate's `encrypt` would silently hand them the key. Pass `--grant` to skip the question:
+
+```bash
+confcrypt encrypt --grant
+```
+
+Without a terminal (CI, scripts, askpass-driven runs) nothing is granted unless `--grant` is given; *confcrypt* prints a warning naming the pending recipients and exits normally. The same check applies to `rekey`, `recipient add`, and `recipient rm`, which otherwise would wrap the key for every listed recipient. This runs even when there is nothing new to encrypt.
+
+Removing a recipient line is **not** auto-handled: a leftover store entry still grants access to the current key, so `encrypt` only warns about stale entries and leaves real revocation to `confcrypt rekey` (which rotates the key and drops them).
 
 ### Remove a recipient (`recipient rm`)
 

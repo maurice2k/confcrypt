@@ -110,8 +110,10 @@ func cleanupStaleMACs(cfg *config.Config, stages []stagedWrite) bool {
 // finally drops the old key from the store. An interruption at any point
 // leaves every file decryptable with one of the keys on disk; re-running
 // rekey (or decrypt) recovers automatically. Plaintext is never written to
-// disk. Returns the config-relative paths of the rekeyed files.
-func performRekey(cfg *config.Config, identities []age.Identity) ([]string, error) {
+// disk. Recipients listed in excludeRecipients (hand-added ones whose access
+// was not granted) do not receive the new key. Returns the config-relative
+// paths of the rekeyed files.
+func performRekey(cfg *config.Config, identities []age.Identity, excludeRecipients []string) ([]string, error) {
 	identityLoader := func() ([]age.Identity, error) {
 		return LoadDecryptionIdentity(cfg, "", "", false, false)
 	}
@@ -168,7 +170,7 @@ func performRekey(cfg *config.Config, identities []age.Identity) ([]string, erro
 		cfg.Confcrypt.Store = oldStore
 		return nil, fmt.Errorf("setting up encryption with new key: %w", err)
 	}
-	newSecrets, err := proc2.EncryptStoreEntries()
+	newSecrets, err := proc2.EncryptStoreEntries(excludeRecipients...)
 	if err != nil {
 		cfg.Confcrypt.Store = oldStore
 		return nil, err

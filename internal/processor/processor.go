@@ -44,6 +44,50 @@ type Processor struct {
 	identities      []age.Identity
 	identityLoader  IdentityLoader
 	encryptionReady bool
+
+	// reuse, when non-nil, maps (path, type, tag, plaintext) to ciphertexts
+	// recorded while decrypting; see EnableCiphertextReuse
+	reuse map[string][]*format.EncryptedValue
+}
+
+// EnableCiphertextReuse makes the processor remember every value it decrypts
+// from now on, and reuse that exact ciphertext when it later encrypts the same
+// plaintext at the same path with the same type. Each recorded ciphertext is
+// handed out at most once, in the order it was recorded. This keeps
+// untouched values byte-identical across a decrypt/edit/encrypt round-trip
+// (stable diffs) without ever reusing an IV for different plaintext.
+func (p *Processor) EnableCiphertextReuse() {
+	p.reuse = make(map[string][]*format.EncryptedValue)
+}
+
+func reuseKey(path []string, valueType format.ValueType, yamlTag string, plaintext []byte) string {
+	return strings.Join(path, "\x00") + "\x01" + string(valueType) + "\x01" + yamlTag + "\x01" + string(plaintext)
+}
+
+func (p *Processor) recordCiphertext(path []string, plaintext []byte, ev *format.EncryptedValue) {
+	if p.reuse == nil {
+		return
+	}
+	k := reuseKey(path, ev.Type, ev.YAMLTag, plaintext)
+	p.reuse[k] = append(p.reuse[k], ev)
+}
+
+func (p *Processor) takeCiphertext(path []string, valueType format.ValueType, yamlTag string, plaintext []byte) *format.EncryptedValue {
+	if p.reuse == nil {
+		return nil
+	}
+	k := reuseKey(path, valueType, yamlTag, plaintext)
+	list := p.reuse[k]
+	if len(list) == 0 {
+		return nil
+	}
+	ev := list[0]
+	if len(list) == 1 {
+		delete(p.reuse, k)
+	} else {
+		p.reuse[k] = list[1:]
+	}
+	return ev
 }
 
 // NewProcessor creates a new Processor
@@ -212,13 +256,22 @@ func (p *Processor) decryptAESGCM(data, iv, tag []byte) ([]byte, error) {
 
 // EncryptStoreEntries wraps the current AES key for every configured
 // recipient and returns the entries as a pubkey -> encrypted secret map.
-func (p *Processor) EncryptStoreEntries() (map[string]string, error) {
+// Recipients listed in exclude are skipped (used for hand-added recipients
+// whose access has not been granted; see cmd/grant.go).
+func (p *Processor) EncryptStoreEntries(exclude ...string) (map[string]string, error) {
 	secrets := make(map[string]string)
+	excluded := make(map[string]bool, len(exclude))
+	for _, k := range exclude {
+		excluded[k] = true
+	}
 
 	for _, r := range p.config.Recipients {
 		pubKey := r.GetPublicKey()
 		if pubKey == "" {
 			return nil, fmt.Errorf("recipient %q has no public key", r.Name)
+		}
+		if excluded[pubKey] {
+			continue
 		}
 
 		recipient, err := crypto.ParseRecipient(pubKey)
@@ -237,15 +290,19 @@ func (p *Processor) EncryptStoreEntries() (map[string]string, error) {
 	return secrets, nil
 }
 
-// AddMissingStoreRecipients wraps the current AES key for every configured
-// recipient that is not yet present in the store and appends those entries,
-// leaving existing entries untouched (stale entries are preserved, never
-// pruned, since dropping them does not actually revoke access without a
-// rekey). ensureEncryptionSetup loads identities to decrypt the existing key,
-// which may prompt a hardware key, but only if setup has not already happened.
+// AddStoreRecipients wraps the current AES key for the given configured
+// recipients and appends those entries to the store, leaving existing
+// entries untouched (stale entries are preserved, never pruned, since
+// dropping them does not actually revoke access without a rekey).
+// Recipients that already have a store entry are skipped.
+// ensureEncryptionSetup loads identities to decrypt the existing key, which
+// may prompt a hardware key, but only if setup has not already happened.
 // The config is mutated in memory; the caller is responsible for saving.
 // Returns the public keys that were added.
-func (p *Processor) AddMissingStoreRecipients() ([]string, error) {
+func (p *Processor) AddStoreRecipients(pubKeys []string) ([]string, error) {
+	if len(pubKeys) == 0 {
+		return nil, nil
+	}
 	if err := p.ensureEncryptionSetup(); err != nil {
 		return nil, err
 	}
@@ -256,13 +313,21 @@ func (p *Processor) AddMissingStoreRecipients() ([]string, error) {
 			inStore[entry.Recipient] = true
 		}
 	}
+	configured := make(map[string]bool)
+	for _, r := range p.config.Recipients {
+		if pubKey := r.GetPublicKey(); pubKey != "" {
+			configured[pubKey] = true
+		}
+	}
 
 	secrets := make(map[string]string)
 	var added []string
-	for _, r := range p.config.Recipients {
-		pubKey := r.GetPublicKey()
-		if pubKey == "" || inStore[pubKey] {
+	for _, pubKey := range pubKeys {
+		if inStore[pubKey] {
 			continue
+		}
+		if !configured[pubKey] {
+			return nil, fmt.Errorf("recipient %s is not configured", pubKey)
 		}
 
 		recipient, err := crypto.ParseRecipient(pubKey)
@@ -277,6 +342,7 @@ func (p *Processor) AddMissingStoreRecipients() ([]string, error) {
 
 		secrets[pubKey] = string(encrypted)
 		added = append(added, pubKey)
+		inStore[pubKey] = true
 	}
 
 	if len(secrets) > 0 {
@@ -286,9 +352,10 @@ func (p *Processor) AddMissingStoreRecipients() ([]string, error) {
 	return added, nil
 }
 
-// SaveEncryptedSecrets encrypts the AES key for all recipients and saves to config
-func (p *Processor) SaveEncryptedSecrets() error {
-	secrets, err := p.EncryptStoreEntries()
+// SaveEncryptedSecrets encrypts the AES key for all recipients (except the
+// excluded ones) and saves to config
+func (p *Processor) SaveEncryptedSecrets(exclude ...string) error {
+	secrets, err := p.EncryptStoreEntries(exclude...)
 	if err != nil {
 		return err
 	}
@@ -463,7 +530,7 @@ func (p *Processor) transformYAMLNode(node *yaml.Node, path []string, encrypt bo
 				// Leaf value - check if we should encrypt/decrypt
 				if encrypt {
 					if p.shouldEncryptString(key, currentPath, valueNode.Value) {
-						encrypted, err := p.encryptScalarValue(valueNode.Value, valueNode.Tag)
+						encrypted, err := p.encryptScalarValue(currentPath, valueNode.Value, valueNode.Tag)
 						if err != nil {
 							return false, fmt.Errorf("failed to encrypt %s: %w", strings.Join(currentPath, "."), err)
 						}
@@ -475,7 +542,7 @@ func (p *Processor) transformYAMLNode(node *yaml.Node, path []string, encrypt bo
 				} else {
 					// Decrypt if encrypted
 					if format.IsEncrypted(valueNode.Value) {
-						decrypted, originalTag, err := p.decryptScalarValue(valueNode.Value)
+						decrypted, originalTag, err := p.decryptScalarValue(currentPath, valueNode.Value)
 						if err != nil {
 							return false, fmt.Errorf("failed to decrypt %s: %w", strings.Join(currentPath, "."), err)
 						}
@@ -527,7 +594,7 @@ func (p *Processor) transformYAMLNode(node *yaml.Node, path []string, encrypt bo
 				// Scalar list items are encrypted only under a matched key
 				// (handled above), but any encrypted item must decrypt here
 				if !encrypt && format.IsEncrypted(item.Value) {
-					decrypted, originalTag, err := p.decryptScalarValue(item.Value)
+					decrypted, originalTag, err := p.decryptScalarValue(path, item.Value)
 					if err != nil {
 						return false, fmt.Errorf("failed to decrypt %s: %w", strings.Join(path, "."), err)
 					}
@@ -563,7 +630,7 @@ func (p *Processor) encryptMatchedYAMLSequence(node *yaml.Node, path []string) (
 			if format.IsEncrypted(item.Value) {
 				continue
 			}
-			encrypted, err := p.encryptScalarValue(item.Value, item.Tag)
+			encrypted, err := p.encryptScalarValue(path, item.Value, item.Tag)
 			if err != nil {
 				return false, fmt.Errorf("failed to encrypt %s: %w", strings.Join(path, "."), err)
 			}
@@ -600,7 +667,7 @@ func (p *Processor) encryptMatchedYAMLTarget(target *yaml.Node, path []string) (
 		if format.IsEncrypted(target.Value) {
 			return false, nil
 		}
-		encrypted, err := p.encryptScalarValue(target.Value, target.Tag)
+		encrypted, err := p.encryptScalarValue(path, target.Value, target.Tag)
 		if err != nil {
 			return false, fmt.Errorf("failed to encrypt %s: %w", strings.Join(path, "."), err)
 		}
@@ -616,7 +683,7 @@ func (p *Processor) encryptMatchedYAMLTarget(target *yaml.Node, path []string) (
 }
 
 // encryptScalarValue encrypts a scalar YAML value
-func (p *Processor) encryptScalarValue(value string, tag string) (string, error) {
+func (p *Processor) encryptScalarValue(path []string, value string, tag string) (string, error) {
 	// Determine value type from YAML tag
 	valueType := format.TypeString
 	switch tag {
@@ -630,25 +697,26 @@ func (p *Processor) encryptScalarValue(value string, tag string) (string, error)
 		valueType = format.TypeNull
 	}
 
-	ev, err := p.encryptPlaintext([]byte(value), valueType)
-	if err != nil {
-		return "", err
-	}
-
 	// Preserve tags that cannot be reconstructed from the portable value type.
 	// This keeps timestamps, binary scalars, and application-specific tags exact
 	// while retaining the old ENC format for common scalar types.
+	yamlTag := ""
 	switch tag {
 	case "", "!!str", "!!int", "!!float", "!!bool", "!!null":
 	default:
-		ev.YAMLTag = tag
+		yamlTag = tag
+	}
+
+	ev, err := p.encryptPlaintextTagged(path, []byte(value), valueType, yamlTag)
+	if err != nil {
+		return "", err
 	}
 
 	return format.FormatEncryptedValue(ev), nil
 }
 
 // decryptScalarValue decrypts an ENC[...] value and returns the plaintext and original YAML tag
-func (p *Processor) decryptScalarValue(encStr string) (string, string, error) {
+func (p *Processor) decryptScalarValue(path []string, encStr string) (string, string, error) {
 	ev, err := format.ParseEncryptedValue(encStr)
 	if err != nil {
 		return "", "", err
@@ -658,6 +726,7 @@ func (p *Processor) decryptScalarValue(encStr string) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
+	p.recordCiphertext(path, plaintext, ev)
 
 	// Prefer the exact YAML tag stored by newer ciphertexts. Older ciphertexts
 	// reconstruct the tag from their portable value type as before.
@@ -729,7 +798,7 @@ func (p *Processor) processEnv(content []byte, encrypt bool) (*EnvFile, bool, er
 		if encrypt {
 			if p.shouldEncryptString(key, path, line.Value) {
 				// Encrypt raw value (including quotes if present)
-				ev, err := p.encryptPlaintext([]byte(line.Value), format.TypeString)
+				ev, err := p.encryptPlaintext(path, []byte(line.Value), format.TypeString)
 				if err != nil {
 					return nil, false, fmt.Errorf("failed to encrypt %s: %w", key, err)
 				}
@@ -749,6 +818,7 @@ func (p *Processor) processEnv(content []byte, encrypt bool) (*EnvFile, bool, er
 				if err != nil {
 					return nil, false, fmt.Errorf("failed to decrypt %s: %w", key, err)
 				}
+				p.recordCiphertext(path, plaintext, ev)
 
 				// Decrypted value includes original quotes if they were present
 				envFile.Lines[i].Value = string(plaintext)
@@ -769,7 +839,7 @@ func (p *Processor) processFullFile(content []byte, encrypt bool) ([]byte, bool,
 		}
 
 		// Encrypt the entire content
-		ev, err := p.encryptPlaintext(content, format.TypeBytes)
+		ev, err := p.encryptPlaintext(nil, content, format.TypeBytes)
 		if err != nil {
 			return nil, false, fmt.Errorf("failed to encrypt file: %w", err)
 		}
@@ -809,7 +879,7 @@ func (p *Processor) transformData(data *interface{}, path []string, encrypt bool
 				if encrypt {
 					// Check if should encrypt and not already encrypted
 					if p.shouldEncryptValue(key, currentPath, val) {
-						encrypted, err := p.encryptValue(val)
+						encrypted, err := p.encryptValue(currentPath, val)
 						if err != nil {
 							return false, fmt.Errorf("failed to encrypt %s: %w", strings.Join(currentPath, "."), err)
 						}
@@ -819,7 +889,7 @@ func (p *Processor) transformData(data *interface{}, path []string, encrypt bool
 				} else {
 					// Decrypt if encrypted
 					if s, ok := val.(string); ok && format.IsEncrypted(s) {
-						decrypted, err := p.decryptValue(s)
+						decrypted, err := p.decryptValue(currentPath, s)
 						if err != nil {
 							return false, fmt.Errorf("failed to decrypt %s: %w", strings.Join(currentPath, "."), err)
 						}
@@ -855,7 +925,7 @@ func (p *Processor) transformData(data *interface{}, path []string, encrypt bool
 			// (handled above), but any encrypted item must decrypt here
 			if !encrypt {
 				if s, ok := v[i].(string); ok && format.IsEncrypted(s) {
-					decrypted, err := p.decryptValue(s)
+					decrypted, err := p.decryptValue(path, s)
 					if err != nil {
 						return false, fmt.Errorf("failed to decrypt %s: %w", strings.Join(path, "."), err)
 					}
@@ -905,7 +975,7 @@ func (p *Processor) encryptMatchedSlice(arr []interface{}, path []string) (bool,
 			if s, ok := item.(string); ok && format.IsEncrypted(s) {
 				continue
 			}
-			encrypted, err := p.encryptValue(item)
+			encrypted, err := p.encryptValue(path, item)
 			if err != nil {
 				return false, fmt.Errorf("failed to encrypt %s: %w", strings.Join(path, "."), err)
 			}
@@ -917,11 +987,11 @@ func (p *Processor) encryptMatchedSlice(arr []interface{}, path []string) (bool,
 }
 
 // encryptValue encrypts a single value
-func (p *Processor) encryptValue(val interface{}) (string, error) {
+func (p *Processor) encryptValue(path []string, val interface{}) (string, error) {
 	valueType := format.DetectValueType(val)
 	plaintext := format.ValueToString(val)
 
-	ev, err := p.encryptPlaintext([]byte(plaintext), valueType)
+	ev, err := p.encryptPlaintext(path, []byte(plaintext), valueType)
 	if err != nil {
 		return "", err
 	}
@@ -929,9 +999,20 @@ func (p *Processor) encryptValue(val interface{}) (string, error) {
 	return format.FormatEncryptedValue(ev), nil
 }
 
-func (p *Processor) encryptPlaintext(plaintext []byte, valueType format.ValueType) (*format.EncryptedValue, error) {
+func (p *Processor) encryptPlaintext(path []string, plaintext []byte, valueType format.ValueType) (*format.EncryptedValue, error) {
+	return p.encryptPlaintextTagged(path, plaintext, valueType, "")
+}
+
+// encryptPlaintextTagged encrypts plaintext with a fresh IV, unless ciphertext
+// reuse is enabled and an identical value was decrypted at this path before,
+// in which case that ciphertext is returned verbatim (see EnableCiphertextReuse).
+func (p *Processor) encryptPlaintextTagged(path []string, plaintext []byte, valueType format.ValueType, yamlTag string) (*format.EncryptedValue, error) {
 	if err := p.ensureEncryptionSetup(); err != nil {
 		return nil, err
+	}
+
+	if ev := p.takeCiphertext(path, valueType, yamlTag, plaintext); ev != nil {
+		return ev, nil
 	}
 
 	ciphertext, iv, tag, err := crypto.EncryptAESGCM(p.aesKey, plaintext)
@@ -940,17 +1021,18 @@ func (p *Processor) encryptPlaintext(plaintext []byte, valueType format.ValueTyp
 	}
 
 	ev := &format.EncryptedValue{
-		Data: ciphertext,
-		IV:   iv,
-		Tag:  tag,
-		Type: valueType,
+		Data:    ciphertext,
+		IV:      iv,
+		Tag:     tag,
+		Type:    valueType,
+		YAMLTag: yamlTag,
 	}
 
 	return ev, nil
 }
 
 // decryptValue decrypts a single ENC[...] value
-func (p *Processor) decryptValue(encStr string) (interface{}, error) {
+func (p *Processor) decryptValue(path []string, encStr string) (interface{}, error) {
 	ev, err := format.ParseEncryptedValue(encStr)
 	if err != nil {
 		return nil, err
@@ -960,6 +1042,7 @@ func (p *Processor) decryptValue(encStr string) (interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
+	p.recordCiphertext(path, plaintext, ev)
 
 	return format.StringToValue(string(plaintext), ev.Type)
 }

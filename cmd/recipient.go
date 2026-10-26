@@ -137,6 +137,10 @@ func runRecipientAdd(cmd *cobra.Command, args []string) {
 	default:
 		newRecipient.Age = pubKey
 	}
+	// Other recipients that were added by hand only get access once
+	// confirmed (or with --grant); the one being added here is explicit
+	_, denied := confirmPendingGrants(cfg)
+
 	cfg.Recipients = append(cfg.Recipients, newRecipient)
 
 	// If there are existing encrypted secrets, re-encrypt for all recipients
@@ -160,7 +164,7 @@ func runRecipientAdd(cmd *cobra.Command, args []string) {
 			os.Exit(1)
 		}
 
-		if err := proc.SaveEncryptedSecrets(); err != nil {
+		if err := proc.SaveEncryptedSecrets(denied...); err != nil {
 			fmt.Fprintf(os.Stderr, "Error saving secrets: %v\n", err)
 			os.Exit(1)
 		}
@@ -364,6 +368,9 @@ func runRecipientRm(cmd *cobra.Command, args []string) {
 
 	cfg.Recipients = newRecipients
 
+	// Remaining hand-added recipients only get access once confirmed (or with --grant)
+	_, denied := confirmPendingGrants(cfg)
+
 	// If there are existing encrypted secrets, handle rekey
 	if cfg.HasSecrets() {
 		identities, err := LoadDecryptionIdentity(cfg, "", "", false, false)
@@ -387,13 +394,13 @@ func runRecipientRm(cmd *cobra.Command, args []string) {
 				os.Exit(1)
 			}
 
-			if err := proc.SaveEncryptedSecrets(); err != nil {
+			if err := proc.SaveEncryptedSecrets(denied...); err != nil {
 				fmt.Fprintf(os.Stderr, "Error saving secrets: %v\n", err)
 				os.Exit(1)
 			}
 		} else {
 			// Rekey: decrypt all, generate new key, re-encrypt all
-			rekeyedFiles, err := performRekey(cfg, identities)
+			rekeyedFiles, err := performRekey(cfg, identities, denied)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
