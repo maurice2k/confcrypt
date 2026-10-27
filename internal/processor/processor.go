@@ -526,9 +526,9 @@ func (p *Processor) processEnv(content []byte, encrypt bool) (*EnvFile, bool, er
 	return envFile, modified, nil
 }
 
-// parseRoots parses structured content into document roots (one per YAML
+// ParseRoots parses structured content into document roots (one per YAML
 // document, exactly one for JSON and env files)
-func parseRoots(content []byte, fileFormat FileFormat) ([]doc.Node, error) {
+func ParseRoots(content []byte, fileFormat FileFormat) ([]doc.Node, error) {
 	switch fileFormat {
 	case FormatYAML:
 		docs, err := decodeYAMLDocs(content)
@@ -660,7 +660,7 @@ func (p *Processor) CheckContent(content []byte, fileFormat FileFormat) ([]Match
 		}}, nil
 	}
 
-	roots, err := parseRoots(content, fileFormat)
+	roots, err := ParseRoots(content, fileFormat)
 	if err != nil {
 		return nil, err
 	}
@@ -693,7 +693,7 @@ func (p *Processor) MatchFile(filePath string, formatOverride ...string) ([]Matc
 		}}, nil
 	}
 
-	roots, err := parseRoots(content, fileFormat)
+	roots, err := ParseRoots(content, fileFormat)
 	if err != nil {
 		return nil, err
 	}
@@ -733,7 +733,7 @@ func (p *Processor) ComputeMAC(content []byte, fileFormat FileFormat) ([]byte, e
 		}
 		encryptedValues = collectEncryptedValues(values, nil)
 	} else {
-		roots, err := parseRoots(content, fileFormat)
+		roots, err := ParseRoots(content, fileFormat)
 		if err != nil {
 			return nil, err
 		}
@@ -862,7 +862,7 @@ func (p *Processor) HasEncryptedValuesStrict(content []byte, filePath string, fo
 		return format.IsFullFileEncrypted(content), nil
 	}
 
-	roots, err := parseRoots(content, fileFormat)
+	roots, err := ParseRoots(content, fileFormat)
 	if err != nil {
 		return false, err
 	}

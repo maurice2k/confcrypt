@@ -260,3 +260,28 @@ func collectEncryptedNodeValues(node doc.Node, values []string) []string {
 	}
 	return values
 }
+
+// DecryptSubtree decrypts every ENC[...] value under node in place. The
+// node may itself be a scalar. Aliases are resolved to their target.
+func (p *Processor) DecryptSubtree(node doc.Node, path []string) error {
+	if node == nil {
+		return nil
+	}
+	node = node.Target()
+	if node.Kind() == doc.Scalar {
+		if format.IsEncrypted(node.Value()) {
+			return p.decryptNode(node, path)
+		}
+		return nil
+	}
+	_, err := p.transformNode(node, path, false)
+	return err
+}
+
+// HasEncryptedNodes reports whether any ENC[...] value exists under node.
+func HasEncryptedNodes(node doc.Node) bool {
+	if node == nil {
+		return false
+	}
+	return len(collectEncryptedNodeValues(node.Target(), nil)) > 0
+}

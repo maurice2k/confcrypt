@@ -241,6 +241,7 @@ Commands:
   encrypt         Encrypt matching keys (default)
   decrypt         Decrypt encrypted values
   edit            Edit a file with its values decrypted, re-encrypting on save
+  get             Print one or more values of a file, decrypted
   check           Check for unencrypted keys (exit 1 if found)
   rekey           Rotate the AES-256 key and re-encrypt all values
   recipient add   Add a recipient (public key required, --name optional)
@@ -270,6 +271,12 @@ Decrypt Options:
 Edit Options:
   --editor string      Editor command (default: $VISUAL, $EDITOR, or vi)
   --force              Edit even if MAC verification fails
+
+Get Options:
+  --json               Output as JSON
+  --yaml               Output as YAML
+  --doc int            Document index for multi-document YAML files (0-based)
+  --force              Continue even if MAC verification fails
 ```
 
 ### Quiet output (`-q`)
@@ -423,6 +430,26 @@ confcrypt edit config.yml
 - The file must match a pattern in the `files` list. Key selection flags (`--age-key`, `--ssh-key`, `--fido2-key`, `--yubikey-key`) work as for `decrypt`.
 
 Editors that fork and return immediately need their "wait" flag, e.g. `--editor "code --wait"`.
+
+### Read single values (`get`)
+
+```bash
+confcrypt get config.yml database.password        # one decrypted value
+confcrypt get config.yml database                 # a subtree, in the file's format
+confcrypt get config.yml database.hosts[0].name   # list index
+confcrypt get config.yml db.password api.key --json
+confcrypt get .env API_KEY
+```
+
+Paths use dotted keys and bracketed list indices. A key containing `.`, `[`, `]` or `"` is written in double quotes: `"my.key".password`. For env files the path is the variable name. Use `--doc N` to pick a document in a multi-document YAML file.
+
+- A scalar prints as its raw value, one per line when several paths are given.
+- A map or list prints as a subtree in the file's own format (JSON for JSON files, YAML otherwise); `--json` and `--yaml` override that. With `--json` and several paths, the output is one object keyed by path.
+- Only the requested values are decrypted. If nothing under the path is encrypted, no private key is loaded and no hardware key is touched, so reading non-secret settings in scripts never prompts.
+- The MAC is verified before anything is decrypted (`--force` to override). The file is never modified.
+- Exit code 1 if a path does not exist, with a message naming the missing key.
+
+Status messages go to stderr, so stdout is safe to capture: `PASSWORD=$(confcrypt get config.yml db.password -q)`.
 
 ### Decrypt to a different directory
 
