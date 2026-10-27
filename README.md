@@ -64,13 +64,17 @@ confcrypt init --yubikey-key
 confcrypt
 ```
 
-### 4. Decrypt when needed
+### 4. Read or decrypt when needed
 
 ```bash
-# Decrypt a single file
-confcrypt decrypt config.yml
+# Print a file decrypted (the file on disk stays encrypted)
+confcrypt get config.yml
 
-# Decrypt all matching files
+# Print one value
+confcrypt get config.yml database.password
+
+# Decrypt files in place
+confcrypt decrypt config.yml
 confcrypt decrypt
 ```
 
@@ -252,7 +256,7 @@ Global Options:
   --path string        Base path where .confcrypt.yml is located (default: current directory)
   --config string      Path to .confcrypt.yml config file (overrides --path)
   --file string        Process a specific file only
-  --stdout             Output to stdout instead of modifying files in-place
+  --stdout             Output to stdout instead of modifying files in-place (for reading, prefer 'get')
   --grant              Grant key access to recipients added to .confcrypt.yml by hand without asking
   -q, --quiet          Reduce output (repeatable: -q, -qq, -qqq)
   --version            Show version
@@ -409,11 +413,14 @@ confcrypt decrypt --clear-secrets
 
 `--clear-secrets` is irreversible for any remaining encrypted value unless you can restore the previous `.confcrypt.yml` from git or another backup. It is only allowed for in-place decrypts, not with `--stdout`, `--output-path`, or `--output-tar`. Before clearing, *confcrypt* scans all matching files structurally and also checks for raw encrypted markers like `ENC[AES256_GCM,` and `$CONFCRYPT_ENCRYPTED;`.
 
-### Decrypt to stdout
+### Decrypt to stdout (prefer `get`)
 
 ```bash
-confcrypt decrypt --stdout config.yml
+confcrypt get config.yml              # preferred
+confcrypt decrypt --stdout config.yml # kept for existing scripts
 ```
+
+`decrypt --stdout` is kept for compatibility; `confcrypt get <file>` prints the same decrypted content and additionally reads single values. With several matching files, `decrypt --stdout` concatenates their contents without separators, so use `--output-tar -` or `--output-path` to decrypt many files at once.
 
 ### Edit a file in place (`edit`)
 
@@ -444,7 +451,7 @@ confcrypt get .env                                # whole env file
 confcrypt get .env API_KEY                        # one variable
 ```
 
-Without a path, or with the path `.`, `get` prints the whole file decrypted exactly as it is on disk otherwise, with comments and formatting kept. This works for every format including full-file encrypted files, so it replaces `decrypt --stdout` for a single file.
+Without a path, or with the path `.`, `get` prints the whole file decrypted exactly as it is on disk otherwise, with comments and formatting kept. This works for every format including full-file encrypted files, and is the preferred way to read a file without decrypting it on disk (`decrypt --stdout` remains for existing scripts).
 
 Paths use dotted keys and bracketed list indices. A key containing `.`, `[`, `]` or `"` is written in double quotes: `"my.key".password`. For env files the path is the variable name. Use `--doc N` to pick a document in a multi-document YAML file; without it, `.` prints the whole stream.
 
