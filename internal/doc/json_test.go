@@ -110,6 +110,40 @@ func TestJSONCStructuralEditsKeepTrailingComma(t *testing.T) {
 		t.Errorf("append into commented empty:\n got: %q\nwant: %q", out, want)
 	}
 
+	// Deleting the last entry takes its same-line comment along
+	d = mustParseJSON(t, "{\n  \"a\": 1,\n  \"b\": 2, // b\n}\n")
+	d.Root().Delete("b")
+	if out, want := mustMarshal(t, d), "{\n  \"a\": 1,\n}\n"; out != want {
+		t.Errorf("delete last with trailing comment:\n got: %q\nwant: %q", out, want)
+	}
+	d = mustParseJSON(t, "[\n  1, /* one */\n  2,\n]")
+	d.Root().DeleteItem(0)
+	if out, want := mustMarshal(t, d), "[\n  2,\n]"; out != want {
+		t.Errorf("delete first with block comment:\n got: %q\nwant: %q", out, want)
+	}
+
+	// A same-line comment of the previous entry survives deleting the next one
+	d = mustParseJSON(t, "{\n\t\"password\": \"x\", // rotate\n\t\"port\": 5432,\n}\n")
+	d.Root().Delete("port")
+	if out, want := mustMarshal(t, d), "{\n\t\"password\": \"x\", // rotate\n}\n"; out != want {
+		t.Errorf("delete last keeps previous comment (trailing comma):\n got: %q\nwant: %q", out, want)
+	}
+	d = mustParseJSON(t, "{\n  \"a\": 1, // a\n  \"b\": 2\n}")
+	d.Root().Delete("b")
+	if out, want := mustMarshal(t, d), "{\n  \"a\": 1 // a\n}"; out != want {
+		t.Errorf("delete last keeps previous comment:\n got: %q\nwant: %q", out, want)
+	}
+	d = mustParseJSON(t, "{\n  \"a\": 1, // a\n  \"b\": 2, // b\n  \"c\": 3\n}")
+	d.Root().Delete("b")
+	if out, want := mustMarshal(t, d), "{\n  \"a\": 1, // a\n  \"c\": 3\n}"; out != want {
+		t.Errorf("delete middle keeps previous comment, drops own:\n got: %q\nwant: %q", out, want)
+	}
+	d = mustParseJSON(t, "{ // header\n  \"a\": 1,\n  \"b\": 2\n}")
+	d.Root().Delete("a")
+	if out, want := mustMarshal(t, d), "{ // header\n  \"b\": 2\n}"; out != want {
+		t.Errorf("delete first keeps container comment:\n got: %q\nwant: %q", out, want)
+	}
+
 	// Deleting an entry drops the comment that was attached to it
 	d = mustParseJSON(t, "{\n  // about a\n  \"a\": 1,\n  \"b\": 2,\n}\n")
 	d.Root().Delete("a")
@@ -407,6 +441,25 @@ func TestJSONNodeAccessors(t *testing.T) {
 	}
 	if err := root.Set("k", NewYAMLScalar("v", format.TypeString, "")); err != ErrWrongDocument {
 		t.Errorf("Set with YAML node: got %v, want ErrWrongDocument", err)
+	}
+}
+
+func TestJSONDeleteItem(t *testing.T) {
+	d := mustParseJSON(t, "[\n  1,\n  2, // two\n  3\n]")
+	if !d.Root().DeleteItem(1) || d.Root().DeleteItem(5) || d.Root().Len() != 2 {
+		t.Fatal("DeleteItem semantics")
+	}
+	if out, want := mustMarshal(t, d), "[\n  1,\n  3\n]"; out != want {
+		t.Errorf("delete middle item:\n got: %q\nwant: %q", out, want)
+	}
+	d = mustParseJSON(t, `{"l": [1, 2]}`)
+	l := get(t, d.Root(), "l")
+	l.DeleteItem(0)
+	if out, want := mustMarshal(t, d), `{"l": [2]}`; out != want {
+		t.Errorf("delete first item:\n got: %s\nwant: %s", out, want)
+	}
+	if d.Root().DeleteItem(0) {
+		t.Error("DeleteItem on mapping must be false")
 	}
 }
 

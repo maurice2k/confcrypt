@@ -42,6 +42,7 @@ type jsonNode struct {
 	block         bool   // entries are laid out one per line
 	blockSet      bool   // block was determined from the source
 	trailingComma []byte // bytes before a trailing comma after the last entry (nil if none)
+	tailOverride  []byte // replaces the source bytes before the closing bracket after a deletion
 
 	// source span (src == nil for nodes created after parsing)
 	src       []byte
@@ -432,9 +433,16 @@ func (d *JSONDocument) emit(buf *bytes.Buffer, n *jsonNode, depth int, parentBlo
 			break
 		}
 	}
+	var tail []byte
+	if n.src != nil {
+		tail = n.src[n.tailStart : n.end-1]
+		if n.tailOverride != nil {
+			tail = n.tailOverride
+		}
+	}
 	var trailingSep []byte
-	if n.src != nil && n.trailingComma != nil {
-		trailingSep = n.src[n.tailStart : n.end-1]
+	if n.trailingComma != nil {
+		trailingSep = tail
 	}
 
 	buf.WriteByte(open)
@@ -450,7 +458,7 @@ func (d *JSONDocument) emit(buf *bytes.Buffer, n *jsonNode, depth int, parentBlo
 		switch {
 		case e.sep != nil:
 			sep := e.sep
-			if i == 0 && e.pre != nil {
+			if i == 0 && e.pre != nil && sameLineComment(sep) == nil {
 				// Promoted to first entry: drop the space that followed the comma
 				sep = bytes.TrimLeft(sep, " \t")
 			}
@@ -485,22 +493,14 @@ func (d *JSONDocument) emit(buf *bytes.Buffer, n *jsonNode, depth int, parentBlo
 	switch {
 	case len(n.entries) == 0:
 		// Empty container: "{}" / "[]", keeping any comment that was inside
-		if n.src != nil && n.origEmpty {
-			buf.Write(n.src[n.tailStart : n.end-1])
+		if n.origEmpty {
+			buf.Write(tail)
 		}
 	case n.src == nil || n.origEmpty:
-		var inner []byte
-		if n.src != nil {
-			inner = n.src[n.tailStart : n.end-1]
-		}
-		if bytes.IndexByte(inner, '\n') >= 0 {
-			buf.Write(inner)
-		} else {
-			buf.Write(inner)
-			if block {
-				buf.WriteByte('\n')
-				buf.WriteString(strings.Repeat(d.indent, depth))
-			}
+		buf.Write(tail)
+		if block && bytes.IndexByte(tail, '\n') < 0 {
+			buf.WriteByte('\n')
+			buf.WriteString(strings.Repeat(d.indent, depth))
 		}
 	case n.trailingComma != nil:
 		buf.Write(n.trailingComma)
@@ -511,10 +511,75 @@ func (d *JSONDocument) emit(buf *bytes.Buffer, n *jsonNode, depth int, parentBlo
 			buf.Write(trailingSep[idx:])
 		}
 	default:
-		buf.Write(n.src[n.tailStart : n.end-1])
+		buf.Write(tail)
 	}
 	buf.WriteByte(close)
 	return nil
+}
+
+// removeEntry deletes entry i. Same-line comments are kept with the entry
+// they belong to: the comment after the previous entry's comma (stored at
+// the start of the removed entry's sep) is kept, the comment after the
+// removed entry's own comma (stored at the start of the next entry's sep,
+// or of the closing region) goes away with it.
+func (n *jsonNode) removeEntry(i int) {
+	keep := sameLineComment(n.entries[i].sep)
+	n.entries = append(n.entries[:i], n.entries[i+1:]...)
+	if i < len(n.entries) {
+		next := n.entries[i]
+		next.sep = append(append([]byte{}, keep...), stripSameLineComment(next.sep)...)
+		return
+	}
+	if n.src == nil {
+		return
+	}
+	tail := n.src[n.tailStart : n.end-1]
+	if n.tailOverride != nil {
+		tail = n.tailOverride
+	}
+	if n.trailingComma != nil {
+		tail = stripSameLineComment(tail)
+	}
+	n.tailOverride = append(append([]byte{}, keep...), tail...)
+}
+
+// sameLineComment returns the leading part of b up to the first line break
+// if it consists of a comment (with surrounding blanks), else nil.
+func sameLineComment(b []byte) []byte {
+	i := 0
+	for i < len(b) && (b[i] == ' ' || b[i] == '\t') {
+		i++
+	}
+	rest := b[i:]
+	var end int
+	switch {
+	case bytes.HasPrefix(rest, []byte("//")):
+		end = bytes.IndexByte(rest, '\n')
+		if end < 0 {
+			end = len(rest)
+		}
+	case bytes.HasPrefix(rest, []byte("/*")):
+		close := bytes.Index(rest, []byte("*/"))
+		if close < 0 {
+			return nil
+		}
+		end = close + 2
+		for end < len(rest) && (rest[end] == ' ' || rest[end] == '\t') {
+			end++
+		}
+		if end < len(rest) && rest[end] != '\n' {
+			return nil
+		}
+	default:
+		return nil
+	}
+	return b[:i+end]
+}
+
+// stripSameLineComment removes a leading same-line comment from b, keeping
+// the line break that follows it.
+func stripSameLineComment(b []byte) []byte {
+	return b[len(sameLineComment(b)):]
 }
 
 func writeJSONScalar(buf *bytes.Buffer, value string, typ format.ValueType) error {
@@ -645,7 +710,7 @@ func (n *jsonNode) Delete(key string) bool {
 	}
 	for i, e := range n.entries {
 		if e.key == key {
-			n.entries = append(n.entries[:i], n.entries[i+1:]...)
+			n.removeEntry(i)
 			return true
 		}
 	}
@@ -665,6 +730,14 @@ func (n *jsonNode) SetItem(i int, value Node) error {
 	}
 	n.entries[i].value = v
 	return nil
+}
+
+func (n *jsonNode) DeleteItem(i int) bool {
+	if n.kind != Sequence || i < 0 || i >= len(n.entries) {
+		return false
+	}
+	n.removeEntry(i)
+	return true
 }
 
 func (n *jsonNode) Append(value Node) error {

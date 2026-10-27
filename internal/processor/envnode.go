@@ -42,6 +42,7 @@ func (e *envNode) SetScalar(string, format.ValueType, string) {}
 func (e *envNode) Len() int                                   { return len(e.keyValueLines()) }
 func (e *envNode) SetItem(int, doc.Node) error                { return doc.ErrUnsupported }
 func (e *envNode) Append(doc.Node) error                      { return doc.ErrUnsupported }
+func (e *envNode) DeleteItem(int) bool                        { return false }
 
 func (e *envNode) Key(i int) string {
 	lines := e.keyValueLines()
@@ -113,3 +114,4 @@ func (v *envValue) Set(string, doc.Node) error  { return doc.ErrUnsupported }
 func (v *envValue) Delete(string) bool          { return false }
 func (v *envValue) SetItem(int, doc.Node) error { return doc.ErrUnsupported }
 func (v *envValue) Append(doc.Node) error       { return doc.ErrUnsupported }
+func (v *envValue) DeleteItem(int) bool         { return false }

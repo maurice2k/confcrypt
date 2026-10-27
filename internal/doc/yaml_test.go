@@ -144,6 +144,12 @@ func TestYAMLMutators(t *testing.T) {
 		t.Errorf("unexpected output:\n got: %q\nwant: %q", out, want)
 	}
 
+	if !list.DeleteItem(0) || list.DeleteItem(9) || list.Len() != 1 || list.Item(0).Value() != "y" {
+		t.Error("DeleteItem semantics")
+	}
+	if root.DeleteItem(0) {
+		t.Error("DeleteItem on mapping must be false")
+	}
 	if !root.Delete("b") || root.Delete("b") {
 		t.Error("Delete must remove once and report absence afterwards")
 	}

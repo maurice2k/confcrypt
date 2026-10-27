@@ -246,6 +246,8 @@ Commands:
   decrypt         Decrypt encrypted values
   edit            Edit a file with its values decrypted, re-encrypting on save
   get             Print a file or values of it, decrypted
+  set             Set one value in a file, encrypting it if its key matches the rules
+  unset           Remove one key or list item from a file
   check           Check for unencrypted keys (exit 1 if found)
   rekey           Rotate the AES-256 key and re-encrypt all values
   recipient add   Add a recipient (public key required, --name optional)
@@ -280,6 +282,15 @@ Get Options:
   --json               Output as JSON
   --yaml               Output as YAML
   --doc int            Document index for multi-document YAML files (0-based)
+  --force              Continue even if MAC verification fails
+
+Set Options:
+  --value string       The value (default: read from stdin)
+  --from-file string   Read the value from this file, verbatim
+  --type string        Value type: string, int, float, bool or null (default: string)
+  --delete             Remove the key or list item instead of setting it
+  --doc int            Document index for multi-document YAML files (0-based)
+  --dry-run            Print the resulting file to stdout instead of writing it
   --force              Continue even if MAC verification fails
 ```
 
@@ -462,6 +473,29 @@ Paths use dotted keys and bracketed list indices. A key containing `.`, `[`, `]`
 - Exit code 1 if a path does not exist, with a message naming the missing key.
 
 Status messages go to stderr, so stdout is safe to capture: `PASSWORD=$(confcrypt get config.yml db.password -q)`.
+
+### Change single values (`set`, `unset`)
+
+```bash
+printf '%s' "$NEW_PASSWORD" | confcrypt set config.yml database.password   # value from stdin
+confcrypt set config.yml database.port --value 5433 --type int
+confcrypt set config.yml database.hosts[+] --value db2.internal           # append to a list
+confcrypt set config.yml cache.redis.password                             # creates cache.redis, asks for the value on a terminal
+confcrypt set server.pem . --from-file new-server.pem                     # replace a full-file encrypted file
+confcrypt unset config.yml database.legacy_password                       # same as set --delete
+```
+
+`set` changes exactly one value and writes the file back; everything else keeps its bytes, so the diff is one line. Setting a value that is already there changes nothing.
+
+- **The value comes from stdin by default**, with one trailing newline dropped, so secrets stay out of shell history and process lists. On a terminal it is asked for without echo. `--value` and `--from-file` (verbatim, no trimming) are the alternatives.
+- **Encryption follows the key rules.** If the key matches `keys_include` the value is stored encrypted, otherwise in plaintext, exactly as `confcrypt encrypt` would decide. There is no flag to override this.
+- **Types are explicit.** Values are strings unless `--type int|float|bool|null` says otherwise; `yes`, `0777` and `1e3` stay strings. Invalid literals are rejected.
+- **Structure is created as needed.** Missing map keys are created, `[n]` must exist, `[+]` appends to a list (also in the middle of a path: `servers[+].name`). New JSON entries follow their container's style; comments and trailing commas in JSONC files stay where they are.
+- **Only what is touched needs the key.** Setting or deleting a plaintext key loads no identity and leaves the MAC alone. Changing an encrypted value verifies the MAC first (`--force` to override) and updates it afterwards. The first secret in a repository creates the key store and applies `files_rename`, like `encrypt`.
+- `--dry-run` prints the resulting file to stdout without writing. Exit code 1 on a missing path, a bad index or an invalid typed value.
+- In zsh, quote paths containing brackets (`'hosts[+]'`, `'hosts[0]'`), otherwise the shell treats them as globs.
+
+This is the easiest way for scripts and automation (including LLM agents) to change one secret: pipe the value in, check with `get`, done.
 
 ### Decrypt to a different directory
 

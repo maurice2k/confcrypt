@@ -79,4 +79,5 @@ type Node interface {
 	// Sequence mutators.
 	SetItem(i int, value Node) error
 	Append(value Node) error
+	DeleteItem(i int) bool
 }

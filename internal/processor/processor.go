@@ -529,34 +529,11 @@ func (p *Processor) processEnv(content []byte, encrypt bool) (*EnvFile, bool, er
 // ParseRoots parses structured content into document roots (one per YAML
 // document, exactly one for JSON and env files)
 func ParseRoots(content []byte, fileFormat FileFormat) ([]doc.Node, error) {
-	switch fileFormat {
-	case FormatYAML:
-		docs, err := decodeYAMLDocs(content)
-		if err != nil {
-			return nil, err
-		}
-		roots := make([]doc.Node, 0, len(docs))
-		for _, d := range docs {
-			if root := doc.FromYAML(d); root != nil {
-				roots = append(roots, root)
-			}
-		}
-		return roots, nil
-	case FormatJSON:
-		d, err := doc.ParseJSON(content)
-		if err != nil {
-			return nil, err
-		}
-		return []doc.Node{d.Root()}, nil
-	case FormatEnv:
-		envFile, err := ParseEnvFile(content)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse .env file: %w", err)
-		}
-		return []doc.Node{envDoc(envFile)}, nil
-	default:
-		return nil, fmt.Errorf("unsupported file format")
+	d, err := ParseDocument(content, fileFormat)
+	if err != nil {
+		return nil, err
 	}
+	return d.Roots(), nil
 }
 
 // processFullFile processes a file for full file encryption/decryption

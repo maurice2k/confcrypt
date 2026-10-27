@@ -83,3 +83,20 @@ func loadYubiKeyIdentities(cfg *config.Config) ([]age.Identity, error) {
 
 	return identities, nil
 }
+
+// requireMatchingFile checks that file is selected by the config's file
+// patterns and returns its format override.
+func requireMatchingFile(cfg *config.Config, file string) (string, error) {
+	format, matches, err := cfg.MatchesFileWithFormat(file)
+	if err != nil {
+		return "", fmt.Errorf("checking file pattern: %w", err)
+	}
+	if !matches {
+		relPath, _ := filepath.Rel(cfg.ConfigDir(), file)
+		if relPath == "" || strings.HasPrefix(relPath, "..") {
+			return "", fmt.Errorf("file %s is outside config directory %s", file, cfg.ConfigDir())
+		}
+		return "", fmt.Errorf("file %q does not match any pattern in files list; add it to the 'files' section in %s", relPath, cfg.ConfigPath())
+	}
+	return format, nil
+}

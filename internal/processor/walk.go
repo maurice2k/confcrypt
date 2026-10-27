@@ -278,6 +278,24 @@ func (p *Processor) DecryptSubtree(node doc.Node, path []string) error {
 	return err
 }
 
+// EncryptScalar encrypts a plaintext scalar node in place; an already
+// encrypted value is left untouched.
+func (p *Processor) EncryptScalar(n doc.Node, path []string) error {
+	n = n.Target()
+	if n.Kind() != doc.Scalar {
+		return fmt.Errorf("%s is not a scalar", strings.Join(path, "."))
+	}
+	if format.IsEncrypted(n.Value()) {
+		return nil
+	}
+	return p.encryptNode(n, path)
+}
+
+// ShouldEncrypt reports whether the configured rules select keyName at path.
+func (p *Processor) ShouldEncrypt(keyName string, path []string) bool {
+	return p.matcher.ShouldEncrypt(keyName, path)
+}
+
 // HasEncryptedNodes reports whether any ENC[...] value exists under node.
 func HasEncryptedNodes(node doc.Node) bool {
 	if node == nil {

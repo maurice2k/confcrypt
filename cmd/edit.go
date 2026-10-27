@@ -127,16 +127,9 @@ type editResult struct {
 // file path as its last argument. Nothing touches the working tree until
 // the edited content has been encrypted and the key store persisted.
 func performEdit(cfg *config.Config, file string, identityLoader processor.IdentityLoader, editor string, force bool) (*editResult, error) {
-	format, matches, err := cfg.MatchesFileWithFormat(file)
+	format, err := requireMatchingFile(cfg, file)
 	if err != nil {
-		return nil, fmt.Errorf("checking file pattern: %w", err)
-	}
-	if !matches {
-		relPath, _ := filepath.Rel(cfg.ConfigDir(), file)
-		if relPath == "" || strings.HasPrefix(relPath, "..") {
-			return nil, fmt.Errorf("file %s is outside config directory %s", file, cfg.ConfigDir())
-		}
-		return nil, fmt.Errorf("file %q does not match any pattern in files list; add it to the 'files' section in %s", relPath, cfg.ConfigPath())
+		return nil, err
 	}
 
 	content, err := os.ReadFile(file)
@@ -192,51 +185,68 @@ func performEdit(cfg *config.Config, file string, identityLoader processor.Ident
 		return nil, fmt.Errorf("encrypting edited content: %w", err)
 	}
 
-	// A file that was plaintext before gets the encrypt rename, like
-	// `confcrypt encrypt` would do; an already-encrypted file keeps its name
-	if modified && !wasEncrypted {
+	res.outputPath, err = commitOutput(cfg, proc, file, format, output, modified, wasEncrypted, hadSecrets, true)
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// commitOutput writes new content for file: it stages the write, applies the
+// encrypt rename when the file was plaintext before and now holds encrypted
+// values (encryptedNow), persists the key store before the file when the
+// store was just created, and updates the MAC. macDirty says the set of
+// ciphertexts changed, so the MAC must be recomputed (which needs the AES
+// key to be set up on proc); otherwise the stored MAC is kept, or dropped
+// when no encrypted values remain. Returns the path written.
+func commitOutput(cfg *config.Config, proc *processor.Processor, file, format string, output []byte, encryptedNow, wasEncrypted, hadSecrets, macDirty bool) (string, error) {
+	outputPath := file
+	if encryptedNow && !wasEncrypted {
 		renamed, err := cfg.GetEncryptRename(file)
 		if err != nil {
-			return nil, fmt.Errorf("computing rename: %w", err)
+			return "", fmt.Errorf("computing rename: %w", err)
 		}
-		res.outputPath = renamed
+		outputPath = renamed
 	}
 
 	stages := []stagedWrite{{
 		originalPath: file,
-		outputPath:   res.outputPath,
+		outputPath:   outputPath,
 		content:      output,
 		format:       format,
 	}}
 
 	relPath, _ := filepath.Rel(cfg.ConfigDir(), file)
-	if proc.HasEncryptedValues(output, res.outputPath, format) {
-		if err := stageMACs(proc, stages); err != nil {
-			return nil, err
+	switch {
+	case !proc.HasEncryptedValues(output, outputPath, format):
+		if relPath != "" {
+			cfg.RemoveMAC(relPath)
 		}
-	} else if relPath != "" {
-		cfg.RemoveMAC(relPath)
+	case macDirty || outputPath != file:
+		if err := stageMACs(proc, stages); err != nil {
+			return "", err
+		}
 	}
-	if res.outputPath != file && relPath != "" {
+	if outputPath != file && relPath != "" {
 		cfg.RemoveMAC(relPath)
 	}
 
 	// Persist the key store (and MACs) before writing the file, so no
 	// ciphertext ever reaches disk under a key that exists only in memory
-	if !hadSecrets && modified {
+	var err error
+	if !hadSecrets && encryptedNow {
 		err = proc.SaveEncryptedSecrets()
 	} else {
 		err = cfg.Save()
 	}
 	if err != nil {
-		return nil, fmt.Errorf("saving config: %w", err)
+		return "", fmt.Errorf("saving config: %w", err)
 	}
 
 	if err := writeStagedFiles(proc, stages, nil); err != nil {
-		return nil, err
+		return "", err
 	}
-
-	return res, nil
+	return outputPath, nil
 }
 
 // runEditor writes plaintext to a private temporary file, runs the editor

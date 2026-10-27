@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"os"
-	"path/filepath"
-	"strings"
 
 	"filippo.io/age"
 	"github.com/spf13/cobra"
@@ -122,16 +120,9 @@ type getOptions struct {
 // is encrypted. The root path ("." or no path) prints the decrypted file
 // as it is on disk, which for full-file formats is the only valid path.
 func performGet(cfg *config.Config, file string, paths []string, opts getOptions, identityLoader processor.IdentityLoader) ([]byte, error) {
-	formatOverride, matches, err := cfg.MatchesFileWithFormat(file)
+	formatOverride, err := requireMatchingFile(cfg, file)
 	if err != nil {
-		return nil, fmt.Errorf("checking file pattern: %w", err)
-	}
-	if !matches {
-		relPath, _ := filepath.Rel(cfg.ConfigDir(), file)
-		if relPath == "" || strings.HasPrefix(relPath, "..") {
-			return nil, fmt.Errorf("file %s is outside config directory %s", file, cfg.ConfigDir())
-		}
-		return nil, fmt.Errorf("file %q does not match any pattern in files list; add it to the 'files' section in %s", relPath, cfg.ConfigPath())
+		return nil, err
 	}
 	fileFormat := processor.DetectFormat(file, formatOverride)
 

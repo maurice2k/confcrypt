@@ -236,6 +236,14 @@ func (y *yamlNode) SetItem(i int, value Node) error {
 	return nil
 }
 
+func (y *yamlNode) DeleteItem(i int) bool {
+	if y.n.Kind != yaml.SequenceNode || i < 0 || i >= len(y.n.Content) {
+		return false
+	}
+	y.n.Content = append(y.n.Content[:i], y.n.Content[i+1:]...)
+	return true
+}
+
 func (y *yamlNode) Append(value Node) error {
 	if y.n.Kind != yaml.SequenceNode {
 		return ErrUnsupported
