@@ -198,6 +198,84 @@ func TestGetRefusesTamperedFileWithoutForce(t *testing.T) {
 	}
 }
 
+func TestGetRootPrintsDecryptedFileVerbatim(t *testing.T) {
+	cfg, identity, testFile := createEncryptedYAMLFixture(t)
+	loader := identityLoaderFor(identity)
+	want := "database:\n  host: localhost\n  password: secret123\napi_key: myapikey\n"
+	if got := mustGet(t, cfg, testFile, loader, getOptions{Doc: -1}, "."); got != want {
+		t.Errorf("root: got %q", got)
+	}
+	// Mixed with other paths, the root still prints the whole file
+	if got := mustGet(t, cfg, testFile, loader, getOptions{Doc: -1}, "api_key", "."); got != "myapikey\n"+want {
+		t.Errorf("root with others: got %q", got)
+	}
+	// --json re-renders the tree instead
+	if got := mustGet(t, cfg, testFile, loader, getOptions{Doc: -1, JSON: true}, "."); !strings.HasPrefix(got, "{\n  \"database\": {") {
+		t.Errorf("root json: got %q", got)
+	}
+
+	// JSONC keeps comments and layout byte for byte
+	dir := t.TempDir()
+	cfg2 := createTestConfigWithFiles(t, dir, identity, "*.jsonc")
+	file := filepath.Join(dir, "s.jsonc")
+	src := "// settings\n{\n\t\"password\": \"p\", // c\n\t\"n\": 1,\n}\n"
+	_ = os.WriteFile(file, []byte(src), 0644)
+	encryptFixtureFile(t, cfg2, file)
+	if got := mustGet(t, cfg2, file, loader, getOptions{Doc: -1}, "."); got != src {
+		t.Errorf("jsonc root:\n got: %q\nwant: %q", got, src)
+	}
+	// A plaintext file prints as-is without loading a key
+	plain := filepath.Join(dir, "plain.jsonc")
+	_ = os.WriteFile(plain, []byte("{\"n\": 1}"), 0644)
+	if got := mustGet(t, cfg2, plain, noIdentity(t), getOptions{Doc: -1}, "."); got != "{\"n\": 1}\n" {
+		t.Errorf("plain root: got %q", got)
+	}
+
+	// env files: whole file, and single variables
+	cfg3 := createTestConfigWithFiles(t, dir, identity, ".env")
+	env := filepath.Join(dir, ".env")
+	envSrc := "# db\nexport DB_PASSWORD=one\nPLAIN=x\n"
+	_ = os.WriteFile(env, []byte(envSrc), 0644)
+	encryptFixtureFile(t, cfg3, env)
+	if got := mustGet(t, cfg3, env, loader, getOptions{Doc: -1}, "."); got != envSrc {
+		t.Errorf("env root:\n got: %q\nwant: %q", got, envSrc)
+	}
+	if got := mustGet(t, cfg3, env, loader, getOptions{Doc: -1}, "DB_PASSWORD", "PLAIN"); got != "one\nx\n" {
+		t.Errorf("env values: got %q", got)
+	}
+}
+
+func TestGetFullFile(t *testing.T) {
+	dir := t.TempDir()
+	identity, _ := age.GenerateX25519Identity()
+	cfg := createTestConfigWithFiles(t, dir, identity, "*.pem")
+	file := filepath.Join(dir, "k.pem")
+	src := "-----BEGIN KEY-----\nabc\n-----END KEY-----\n"
+	_ = os.WriteFile(file, []byte(src), 0600)
+
+	// Plaintext full file: printed as-is, no key needed
+	if got := mustGet(t, cfg, file, noIdentity(t), getOptions{Doc: -1}, "."); got != src {
+		t.Errorf("plain pem: got %q", got)
+	}
+
+	encryptFixtureFile(t, cfg, file)
+	loader := identityLoaderFor(identity)
+	if got := mustGet(t, cfg, file, loader, getOptions{Doc: -1}, "."); got != src {
+		t.Errorf("encrypted pem: got %q", got)
+	}
+	if _, err := performGet(cfg, file, []string{"some.path"}, getOptions{Doc: -1}, loader); err == nil || !strings.Contains(err.Error(), "has no paths") {
+		t.Errorf("path on full file: got %v", err)
+	}
+
+	// Tampered full file is refused without --force
+	enc, _ := os.ReadFile(file)
+	tampered := strings.Replace(string(enc), "tag:", "tag:A", 1)
+	_ = os.WriteFile(file, []byte(tampered), 0600)
+	if _, err := performGet(cfg, file, []string{"."}, getOptions{Doc: -1}, loader); err == nil || !strings.Contains(err.Error(), "MAC") {
+		t.Errorf("tampered pem: got %v", err)
+	}
+}
+
 func TestGetMultiDocumentYAML(t *testing.T) {
 	dir := t.TempDir()
 	identity, _ := age.GenerateX25519Identity()
@@ -216,6 +294,14 @@ func TestGetMultiDocumentYAML(t *testing.T) {
 	}
 	if got := mustGet(t, cfg, file, loader, getOptions{}, "password"); got != "one\n" {
 		t.Errorf("doc 0 password: got %q", got)
+	}
+	// Root without --doc prints the whole decrypted stream; with --doc only that document
+	whole := "name: first\npassword: one\n---\nname: second\npassword: two\n"
+	if got := mustGet(t, cfg, file, loader, getOptions{Doc: -1}, "."); got != whole {
+		t.Errorf("whole stream: got %q", got)
+	}
+	if got := mustGet(t, cfg, file, loader, getOptions{Doc: 1}, "."); got != "name: second\npassword: two\n" {
+		t.Errorf("doc 1 root: got %q", got)
 	}
 }
 

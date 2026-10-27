@@ -50,7 +50,7 @@ func TestParsePathAndString(t *testing.T) {
 
 func TestParsePathErrors(t *testing.T) {
 	for _, in := range []string{
-		"", "   ", ".", "a.", ".a", "a..b", "a[", "a[x]", "a[-1]", "a[+1]", `"unterminated`, `"dangling\`,
+		"", "   ", "..", "a.", ".a", "a..b", "a[", "a[x]", "a[-1]", "a[+1]", `"unterminated`, `"dangling\`,
 		"a]b", `a"b`, "a[0]b", "a[0]]",
 	} {
 		if _, err := ParsePath(in); err == nil {
@@ -85,9 +85,16 @@ func TestResolve(t *testing.T) {
 	if err != nil || n != root {
 		t.Errorf("empty path must resolve to root")
 	}
+	dot, err := ParsePath(".")
+	if err != nil || len(dot) != 0 || dot.String() != "." {
+		t.Errorf("\".\" must parse to the empty path, got %v %v", dot, err)
+	}
+	if n, err := Resolve(root, dot); err != nil || n != root {
+		t.Errorf("\".\" must resolve to root")
+	}
 
 	for in, wantErr := range map[string]string{
-		"missing":            `key "missing" not found in document root`,
+		"missing":            `key "missing" not found in the document root`,
 		"db.nope":            `key "nope" not found in db`,
 		"db.hosts[5]":        "db.hosts has 2 item(s), index 5 is out of range",
 		"db[0]":              "db is not a list",

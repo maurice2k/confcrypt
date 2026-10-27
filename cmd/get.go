@@ -28,9 +28,13 @@ var (
 )
 
 var getCmd = &cobra.Command{
-	Use:   "get <file> <path>...",
-	Short: "Print one or more values of a file, decrypted",
-	Long: `Print the value at a path inside a config file, decrypting it if needed.
+	Use:   "get <file> [path...]",
+	Short: "Print a file or values of it, decrypted",
+	Long: `Print a config file, or the values at paths inside it, decrypted.
+
+Without a path (or with the path "."), the whole file is printed decrypted,
+exactly as it is on disk otherwise: comments and formatting are kept. This
+also works for full-file encrypted files such as keys and certificates.
 
 Paths use dotted keys and bracketed list indices, e.g. db.password or
 db.hosts[0].password; keys containing '.', '[' or '"' are double-quoted.
@@ -44,14 +48,14 @@ by path with --json.
 Only the requested values are decrypted: if nothing under the path is
 encrypted, no key is loaded and no hardware key is touched. The exit code
 is 1 when a path does not exist.`,
-	Args: cobra.MinimumNArgs(2),
+	Args: cobra.MinimumNArgs(1),
 	Run:  runGet,
 }
 
 func init() {
 	getCmd.Flags().BoolVar(&getJSON, "json", false, "Output as JSON")
 	getCmd.Flags().BoolVar(&getYAML, "yaml", false, "Output as YAML")
-	getCmd.Flags().IntVar(&getDocIndex, "doc", 0, "Document index for multi-document YAML files (0-based)")
+	getCmd.Flags().IntVar(&getDocIndex, "doc", -1, "Document index for multi-document YAML files (0-based; default: first, or the whole stream for the root path)")
 	getCmd.Flags().BoolVar(&getForce, "force", false, "Continue even if MAC verification fails")
 	getCmd.Flags().StringVar(&getAgeKeyFile, "age-key", "", "Path to age private key file (use without value to force age auto-detect)")
 	getCmd.Flags().StringVar(&getSSHKeyFile, "ssh-key", "", "Path to SSH private key file (use without value to force SSH auto-detect)")
@@ -94,7 +98,11 @@ func runGet(cmd *cobra.Command, args []string) {
 	loader := func() ([]age.Identity, error) {
 		return LoadDecryptionIdentity(cfg, getAgeKeyFile, getSSHKeyFile, getYubiKeyFlag, getFIDO2Flag)
 	}
-	out, err := performGet(cfg, singleFile, args[1:], getOptions{JSON: getJSON, YAML: getYAML, Doc: getDocIndex, Force: getForce}, loader)
+	paths := args[1:]
+	if len(paths) == 0 {
+		paths = []string{"."}
+	}
+	out, err := performGet(cfg, singleFile, paths, getOptions{JSON: getJSON, YAML: getYAML, Doc: getDocIndex, Force: getForce}, loader)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -105,13 +113,14 @@ func runGet(cmd *cobra.Command, args []string) {
 type getOptions struct {
 	JSON  bool
 	YAML  bool
-	Doc   int
+	Doc   int // document index for multi-document YAML; negative means unspecified
 	Force bool
 }
 
 // performGet resolves the paths in file, decrypts what they address, and
 // renders the values. Identities are only loaded when an addressed value
-// is encrypted.
+// is encrypted. The root path ("." or no path) prints the decrypted file
+// as it is on disk, which for full-file formats is the only valid path.
 func performGet(cfg *config.Config, file string, paths []string, opts getOptions, identityLoader processor.IdentityLoader) ([]byte, error) {
 	formatOverride, matches, err := cfg.MatchesFileWithFormat(file)
 	if err != nil {
@@ -125,32 +134,84 @@ func performGet(cfg *config.Config, file string, paths []string, opts getOptions
 		return nil, fmt.Errorf("file %q does not match any pattern in files list; add it to the 'files' section in %s", relPath, cfg.ConfigPath())
 	}
 	fileFormat := processor.DetectFormat(file, formatOverride)
-	if fileFormat == processor.FormatFull {
-		return nil, fmt.Errorf("%s is a full-file encrypted file; use 'confcrypt decrypt --stdout' instead", displayPath(file))
-	}
 
 	content, err := os.ReadFile(file)
 	if err != nil {
 		return nil, fmt.Errorf("reading %s: %w", file, err)
 	}
 
-	roots, err := processor.ParseRoots(content, fileFormat)
-	if err != nil {
-		return nil, err
-	}
-	if opts.Doc < 0 || opts.Doc >= len(roots) {
-		return nil, fmt.Errorf("document index %d out of range: %s has %d document(s)", opts.Doc, displayPath(file), len(roots))
-	}
-	root := roots[opts.Doc]
-
 	parsed := make([]doc.Path, len(paths))
-	nodes := make([]doc.Node, len(paths))
-	needDecrypt := false
 	for i, p := range paths {
 		parsed[i], err = doc.ParsePath(p)
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	proc, err := processor.NewProcessor(cfg, identityLoader)
+	if err != nil {
+		return nil, err
+	}
+
+	// setupDecryption loads identities and verifies the MAC, once
+	decryptionReady := false
+	setupDecryption := func() error {
+		if decryptionReady {
+			return nil
+		}
+		identities, err := identityLoader()
+		if err != nil {
+			return fmt.Errorf("loading identities: %w", err)
+		}
+		if _, err := proc.SetupDecryption(identities); err != nil {
+			return err
+		}
+		if err := proc.VerifyMAC(file, content, formatOverride); err != nil {
+			if !opts.Force {
+				return fmt.Errorf("%s: %w (use --force to read anyway)", displayPath(file), err)
+			}
+			fmt.Fprintf(os.Stderr, "Warning: %s: %v (continuing due to --force)\n", displayPath(file), err)
+		}
+		decryptionReady = true
+		return nil
+	}
+
+	// Full-file formats have no structure: only the root path is valid
+	if fileFormat == processor.FormatFull {
+		for _, p := range parsed {
+			if len(p) > 0 {
+				return nil, fmt.Errorf("%s is a full-file encrypted file and has no paths; use 'confcrypt get %s' for its content", displayPath(file), displayPath(file))
+			}
+		}
+		if !proc.HasEncryptedValues(content, file, formatOverride) {
+			return content, nil
+		}
+		if err := setupDecryption(); err != nil {
+			return nil, err
+		}
+		out, _, err := proc.ProcessContent(content, file, false, fileFormat)
+		if err != nil {
+			return nil, fmt.Errorf("decrypting %s: %w", displayPath(file), err)
+		}
+		return out, nil
+	}
+
+	roots, err := processor.ParseRoots(content, fileFormat)
+	if err != nil {
+		return nil, err
+	}
+	docIndex := opts.Doc
+	if docIndex < 0 {
+		docIndex = 0
+	}
+	if docIndex >= len(roots) {
+		return nil, fmt.Errorf("document index %d out of range: %s has %d document(s)", docIndex, displayPath(file), len(roots))
+	}
+	root := roots[docIndex]
+
+	nodes := make([]doc.Node, len(paths))
+	needDecrypt := false
+	for i := range parsed {
 		nodes[i], err = doc.Resolve(root, parsed[i])
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", displayPath(file), err)
@@ -161,22 +222,8 @@ func performGet(cfg *config.Config, file string, paths []string, opts getOptions
 	}
 
 	if needDecrypt {
-		proc, err := processor.NewProcessor(cfg, identityLoader)
-		if err != nil {
+		if err := setupDecryption(); err != nil {
 			return nil, err
-		}
-		identities, err := identityLoader()
-		if err != nil {
-			return nil, fmt.Errorf("loading identities: %w", err)
-		}
-		if _, err := proc.SetupDecryption(identities); err != nil {
-			return nil, err
-		}
-		if err := proc.VerifyMAC(file, content, formatOverride); err != nil {
-			if !opts.Force {
-				return nil, fmt.Errorf("%s: %w (use --force to read anyway)", displayPath(file), err)
-			}
-			fmt.Fprintf(os.Stderr, "Warning: %s: %v (continuing due to --force)\n", displayPath(file), err)
 		}
 		for i, n := range nodes {
 			if err := proc.DecryptSubtree(n, keyPathOf(parsed[i])); err != nil {
@@ -185,7 +232,26 @@ func performGet(cfg *config.Config, file string, paths []string, opts getOptions
 		}
 	}
 
-	return renderGet(nodes, parsed, fileFormat, opts)
+	// The root in the file's own format is the decrypted file as it is on
+	// disk (comments and formatting kept), unless a single document of a
+	// multi-document stream was requested
+	var wholeFile []byte
+	if !opts.JSON && !opts.YAML && opts.Doc < 0 {
+		for _, p := range parsed {
+			if len(p) == 0 {
+				wholeFile, _, err = proc.ProcessContent(content, file, false, fileFormat)
+				if err != nil {
+					return nil, fmt.Errorf("decrypting %s: %w", displayPath(file), err)
+				}
+				if len(wholeFile) > 0 && wholeFile[len(wholeFile)-1] != '\n' {
+					wholeFile = append(wholeFile, '\n')
+				}
+				break
+			}
+		}
+	}
+
+	return renderGet(nodes, parsed, fileFormat, opts, wholeFile)
 }
 
 // keyPathOf returns the mapping keys of a path (indices skipped), the form
@@ -200,7 +266,7 @@ func keyPathOf(p doc.Path) []string {
 	return keys
 }
 
-func renderGet(nodes []doc.Node, paths []doc.Path, fileFormat processor.FileFormat, opts getOptions) ([]byte, error) {
+func renderGet(nodes []doc.Node, paths []doc.Path, fileFormat processor.FileFormat, opts getOptions, wholeFile []byte) ([]byte, error) {
 	var buf bytes.Buffer
 
 	if len(nodes) > 1 && opts.JSON {
@@ -224,7 +290,11 @@ func renderGet(nodes []doc.Node, paths []doc.Path, fileFormat processor.FileForm
 		return buf.Bytes(), nil
 	}
 
-	for _, n := range nodes {
+	for i, n := range nodes {
+		if len(paths[i]) == 0 && wholeFile != nil {
+			buf.Write(wholeFile)
+			continue
+		}
 		out, err := renderGetValue(n, fileFormat, opts)
 		if err != nil {
 			return nil, err

@@ -241,7 +241,7 @@ Commands:
   encrypt         Encrypt matching keys (default)
   decrypt         Decrypt encrypted values
   edit            Edit a file with its values decrypted, re-encrypting on save
-  get             Print one or more values of a file, decrypted
+  get             Print a file or values of it, decrypted
   check           Check for unencrypted keys (exit 1 if found)
   rekey           Rotate the AES-256 key and re-encrypt all values
   recipient add   Add a recipient (public key required, --name optional)
@@ -431,17 +431,22 @@ confcrypt edit config.yml
 
 Editors that fork and return immediately need their "wait" flag, e.g. `--editor "code --wait"`.
 
-### Read single values (`get`)
+### Read files and single values (`get`)
 
 ```bash
+confcrypt get config.yml                          # the whole file, decrypted, formatting kept
+confcrypt get server.pem                          # also for full-file encrypted files
 confcrypt get config.yml database.password        # one decrypted value
 confcrypt get config.yml database                 # a subtree, in the file's format
 confcrypt get config.yml database.hosts[0].name   # list index
 confcrypt get config.yml db.password api.key --json
-confcrypt get .env API_KEY
+confcrypt get .env                                # whole env file
+confcrypt get .env API_KEY                        # one variable
 ```
 
-Paths use dotted keys and bracketed list indices. A key containing `.`, `[`, `]` or `"` is written in double quotes: `"my.key".password`. For env files the path is the variable name. Use `--doc N` to pick a document in a multi-document YAML file.
+Without a path, or with the path `.`, `get` prints the whole file decrypted exactly as it is on disk otherwise, with comments and formatting kept. This works for every format including full-file encrypted files, so it replaces `decrypt --stdout` for a single file.
+
+Paths use dotted keys and bracketed list indices. A key containing `.`, `[`, `]` or `"` is written in double quotes: `"my.key".password`. For env files the path is the variable name. Use `--doc N` to pick a document in a multi-document YAML file; without it, `.` prints the whole stream.
 
 - A scalar prints as its raw value, one per line when several paths are given.
 - A map or list prints as a subtree in the file's own format (JSON for JSON files, YAML otherwise); `--json` and `--yaml` override that. With `--json` and several paths, the output is one object keyed by path.

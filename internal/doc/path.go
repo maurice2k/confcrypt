@@ -20,10 +20,14 @@ type Segment struct {
 // '.', '[', ']' or '"' is written in double quotes with \" and \\ escapes.
 type Path []Segment
 
-// ParsePath parses the textual form of a Path.
+// ParsePath parses the textual form of a Path. "." denotes the document
+// root (an empty path).
 func ParsePath(s string) (Path, error) {
 	if strings.TrimSpace(s) == "" {
 		return nil, fmt.Errorf("empty path")
+	}
+	if s == "." {
+		return Path{}, nil
 	}
 	var path Path
 	i := 0
@@ -110,8 +114,12 @@ func parseQuotedSegment(s string, start int) (string, int, error) {
 	return "", 0, fmt.Errorf("invalid path %q: unterminated quote", s)
 }
 
-// String renders the path in the form ParsePath accepts.
+// String renders the path in the form ParsePath accepts; the empty path
+// renders as ".".
 func (p Path) String() string {
+	if len(p) == 0 {
+		return "."
+	}
 	var sb strings.Builder
 	for i, seg := range p {
 		switch {
@@ -143,7 +151,7 @@ func Resolve(root Node, path Path) (Node, error) {
 	}
 	cur := root.Target()
 	for i, seg := range path {
-		where := "document root"
+		where := "the document root"
 		if i > 0 {
 			where = path[:i].String()
 		}
