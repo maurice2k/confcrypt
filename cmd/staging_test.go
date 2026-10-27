@@ -135,3 +135,31 @@ func TestPerformRekeyWithoutEncryptedFilesRotatesKeyOnly(t *testing.T) {
 		t.Errorf("Plain file modified by rekey: %s", content)
 	}
 }
+
+func TestPerformRekeyExcludesDeniedRecipients(t *testing.T) {
+	cfg, identity, _ := createEncryptedYAMLFixture(t)
+	bob, _ := age.GenerateX25519Identity()
+	cfg.Recipients = append(cfg.Recipients, config.RecipientConfig{Name: "Bob", Age: bob.Recipient().String()})
+
+	if _, err := performRekey(cfg, []age.Identity{identity}, []string{bob.Recipient().String()}); err != nil {
+		t.Fatalf("performRekey: %v", err)
+	}
+	reloaded, _ := config.Load(cfg.ConfigPath())
+	if len(reloaded.Confcrypt.Store) != 1 {
+		t.Fatalf("expected only the original recipient in the store, got %d entries", len(reloaded.Confcrypt.Store))
+	}
+	proc, _ := processor.NewProcessor(reloaded, nil)
+	if _, err := proc.SetupDecryption([]age.Identity{bob}); err == nil {
+		t.Error("denied recipient must not be able to decrypt the new key")
+	}
+
+	// Granted (not excluded) on the next rekey, Bob gets access
+	if _, err := performRekey(reloaded, []age.Identity{identity}, nil); err != nil {
+		t.Fatalf("second performRekey: %v", err)
+	}
+	reloaded, _ = config.Load(cfg.ConfigPath())
+	proc, _ = processor.NewProcessor(reloaded, nil)
+	if _, err := proc.SetupDecryption([]age.Identity{bob}); err != nil {
+		t.Errorf("granted recipient could not decrypt after rekey: %v", err)
+	}
+}

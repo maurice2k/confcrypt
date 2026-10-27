@@ -233,3 +233,67 @@ func TestEnvNodeAdapter(t *testing.T) {
 		t.Errorf("unexpected env output:\n got: %q\nwant: %q", got, want)
 	}
 }
+
+func reuseRoundTrip(t *testing.T, name string, fileFormat FileFormat, original, replaceOld, replaceNew string) (encrypted, reencrypted string) {
+	t.Helper()
+	proc, identity, cfg := newJSONProcessor(t)
+	enc, _, err := proc.ProcessContent([]byte(original), name, true, fileFormat)
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	proc2, _ := NewProcessor(cfg, nil)
+	if err := proc2.SetupEncryptionWithIdentities([]age.Identity{identity}); err != nil {
+		t.Fatal(err)
+	}
+	proc2.EnableCiphertextReuse()
+	plain, _, err := proc2.ProcessContent(enc, name, false, fileFormat)
+	if err != nil {
+		t.Fatalf("decrypt: %v", err)
+	}
+	if string(plain) != original {
+		t.Fatalf("decrypt mismatch:\n got: %q\nwant: %q", plain, original)
+	}
+	edited := strings.Replace(string(plain), replaceOld, replaceNew, 1)
+	re, _, err := proc2.ProcessContent([]byte(edited), name, true, fileFormat)
+	if err != nil {
+		t.Fatalf("re-encrypt: %v", err)
+	}
+	return string(enc), string(re)
+}
+
+// assertOnlyLineChanged checks that exactly the lines containing marker
+// differ between a and b.
+func assertOnlyLineChanged(t *testing.T, a, b, marker string) {
+	t.Helper()
+	al, bl := strings.Split(a, "\n"), strings.Split(b, "\n")
+	if len(al) != len(bl) {
+		t.Fatalf("line count differs:\n%s\n---\n%s", a, b)
+	}
+	for i := range al {
+		changed := al[i] != bl[i]
+		if strings.Contains(al[i], marker) != changed {
+			t.Errorf("line %d: changed=%v but marker=%v:\n  %s\n  %s", i, changed, strings.Contains(al[i], marker), al[i], bl[i])
+		}
+	}
+}
+
+func TestCiphertextReuseJSON(t *testing.T) {
+	src := "{\n  \"password\": \"a\",\n  \"api_key\": \"b\",\n  \"int_secret\": 7,\n  \"list_secret\": [\"x\", \"y\"]\n}\n"
+	enc, re := reuseRoundTrip(t, "c.json", FormatJSON, src, `"api_key": "b"`, `"api_key": "B"`)
+	assertOnlyLineChanged(t, enc, re, "api_key")
+}
+
+func TestCiphertextReuseEnv(t *testing.T) {
+	src := "DB_PASSWORD=one\nAPI_KEY=\"two\"\nPLAIN=3\n"
+	enc, re := reuseRoundTrip(t, ".env", FormatEnv, src, "API_KEY=\"two\"", "API_KEY=\"TWO\"")
+	assertOnlyLineChanged(t, enc, re, "API_KEY")
+}
+
+func TestCiphertextReuseYAMLTaggedValues(t *testing.T) {
+	src := "password: !!binary aGVsbG8=\napi_key: 2024-01-02\nint_secret: 42\nfloat_secret: 1.5\nbool_secret: true\n"
+	enc, re := reuseRoundTrip(t, "t.yml", FormatYAML, src, "int_secret: 42", "int_secret: 43")
+	assertOnlyLineChanged(t, enc, re, "int_secret")
+	if !strings.Contains(enc, "yaml_tag:") {
+		t.Errorf("expected tagged ciphertext for !!binary value:\n%s", enc)
+	}
+}
