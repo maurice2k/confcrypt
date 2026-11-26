@@ -13,10 +13,8 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: macos-14      # Apple Silicon runner
+          - os: macos-15      # Apple Silicon runner
             arch: arm64
-          # - os: macos-13    # Intel runner (disabled)
-          #   arch: amd64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
